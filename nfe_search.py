@@ -1,21 +1,17 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-nfe_search.py -- Busca distribuições de NF-e e consulta de protocolo para status.
-Com validação de XML por XSD (NF-e 4.00) antes de enviar ou processar.
-"""
+# Bibliotecas padrão
 import os
 import gzip
+import re
 import base64
 import logging
 import sqlite3
+import time
 from pathlib import Path
 from datetime import datetime
 
+# Bibliotecas de terceiros
 import requests
 import requests_pkcs12
-import time
-from datetime import datetime
 from requests.exceptions import RequestException
 from zeep import Client
 from zeep.transports import Transport
@@ -78,6 +74,8 @@ def ciclo_nsu(db, parser, intervalo=3600):
                             continue
                         chave = infnfe.attrib.get('Id','')[-44:]
                         db.registrar_xml(chave, cnpj)
+                        # ---- Salva o XML em disco, na pasta xmls/<CNPJ/CPF>/<ano-mes> ----
+                        salvar_xml_por_certificado(xml, cnpj)
                     except Exception:
                         logger.exception("Erro ao processar docZip")
 
@@ -90,83 +88,153 @@ def ciclo_nsu(db, parser, intervalo=3600):
 
         logger.info(f"Busca de NSU finalizada. Dormindo por {intervalo/60:.0f} minutos...")
         time.sleep(intervalo)
+
+# -------------------------------------------------------------------
+# Salvar XML na pasta
+# -------------------------------------------------------------------
+def sanitize_filename(s: str) -> str:
+    """Remove caracteres inválidos para nomes de arquivos/pastas."""
+    return re.sub(r'[\\/*?:"<>|]', "_", s).strip()
+
+def format_cnpj_cpf(doc: str) -> str:
+    """
+    Formata CNPJ/CPF: 
+    - CPF: 000.000.000-00 
+    - CNPJ: 00.000.000/0000-00
+    Se não bater tamanho, retorna como veio.
+    """
+    if len(doc) == 11:  # CPF
+        return f"{doc[:3]}.{doc[3:6]}.{doc[6:9]}-{doc[9:]}"
+    elif len(doc) == 14:  # CNPJ
+        return f"{doc[:2]}.{doc[2:5]}.{doc[5:8]}/{doc[8:12]}-{doc[12:]}"
+    else:
+        return doc
+
+def salvar_xml_por_certificado(xml, cnpj_cpf, pasta_base="xmls"):
+    """
+    Salva o XML em uma pasta separada por certificado e ano-mês de emissão.
+    Exemplo: xmls/123.456.789-94/2025-07/00123-EMPRESA.xml
+    """
+    try:
+        # Formata CNPJ/CPF para nome de pasta
+        cnpj_cpf_fmt = format_cnpj_cpf(cnpj_cpf)
+
+        # Parseia o XML
+        root = etree.fromstring(xml.encode("utf-8") if isinstance(xml, str) else xml)
+        # Tenta pegar a tag 'ide' (identificação da nota)
+        ide = root.find('.//{http://www.portalfiscal.inf.br/nfe}ide')
+        # Ano-mês
+        if ide is not None:
+            dEmi = ide.findtext('{http://www.portalfiscal.inf.br/nfe}dEmi')
+            dhEmi = ide.findtext('{http://www.portalfiscal.inf.br/nfe}dhEmi')
+            data_raw = dEmi or dhEmi
+            if data_raw:
+                data_part = data_raw.split("T")[0]
+                ano_mes = data_part[:7] if len(data_part) >= 7 else "SEM_DATA"
+            else:
+                ano_mes = "SEM_DATA"
+        else:
+            ano_mes = "SEM_DATA"
+        # Número da NF
+        nNF = ide.findtext('{http://www.portalfiscal.inf.br/nfe}nNF') if ide is not None else "SEM_NUMERO"
+        # Nome do emitente
+        emit = root.find('.//{http://www.portalfiscal.inf.br/nfe}emit')
+        xNome = emit.findtext('{http://www.portalfiscal.inf.br/nfe}xNome') if emit is not None else "SEM_NOME"
+
+        # Monta pasta de destino
+        pasta_dest = os.path.join(
+            pasta_base, cnpj_cpf_fmt, ano_mes
+        )
+        os.makedirs(pasta_dest, exist_ok=True)
+
+        # Nome do arquivo: NUMERO-NOME.xml
+        nome_arquivo = f"{sanitize_filename(nNF)}-{sanitize_filename(xNome)}.xml"
+        caminho_xml = os.path.join(pasta_dest, nome_arquivo)
+
+        # Salva o XML
+        with open(caminho_xml, "w", encoding="utf-8") as f:
+            f.write(xml)
+        print(f"[SALVO] {caminho_xml}")
+
+    except Exception as e:
+        print(f"[ERRO ao salvar XML de {cnpj_cpf}]: {e}")
 # -------------------------------------------------------------------
 # Validação de XML com XSD
 # -------------------------------------------------------------------
-def find_xsd(xsd_name, base_dir=None):
+def validar_xml_auto(xml, default_xsd):
     """
-    Busca recursiva pelo XSD pelo nome em base_dir e subpastas.
-    Retorna o Path ou None.
+    Valida um XML contra o XSD correspondente, resolvendo includes/imports corretamente.
+    Procura os XSDs na pasta do arquivo principal, mudando temporariamente o diretório.
+    Lança Exception detalhada em caso de erro.
     """
-    if base_dir is None:
-        base_dir = Path(__file__).parent
-    base_dir = Path(base_dir)
-    for p in base_dir.rglob(xsd_name):
-        if p.exists():
-            logging.debug(f"XSD encontrado: {p}")
-            return p
-    logging.debug(f"XSD não encontrado: {xsd_name} em {base_dir}")
-    return None
+    # Mostra XML para debug
+    print("\n--- XML sendo validado ---\n", xml, "\n-------------------------\n")
 
-def validar_xml_auto(xml_string, prefer_xsd=None):
-    """
-    Valida um XML string usando o XSD mais adequado:
-      - tenta prefer_xsd se informado,
-      - senão tenta pelo nome do elemento raiz (usando mapeamento padrão),
-      - busca o XSD no diretório do script e em subpastas,
-      - registra todas tentativas e erros.
-    """
-    parser = etree.XMLParser(remove_blank_text=True)
-    doc = etree.fromstring(xml_string.encode("utf-8"), parser)
-    root = doc.tag.split("}")[-1]  # Remove namespace, pega só o nome
-
-    # Mapeamento padrão de elemento raiz para XSD
-    root2xsd = {
-        "consSitNFe": "consSitNFe_v4.00.xsd",
-        "retConsSitNFe": "retConsSitNFe_v4.00.xsd",
-        "NFe": "leiauteNFe_v4.00.xsd",
-        "enviNFe": "leiauteNFe_v4.00.xsd",
-        "procNFe": "leiauteNFe_v4.00.xsd",
-        "distDFeInt": "distDFeInt_v1.01.xsd",
-        "retDistDFeInt": "retDistDFeInt_v1.01.xsd",
+    # Mapeamento padrão
+    ROOT_XSD_MAP = {
+        "nfeProc":      "procNFe_v4.00.xsd",
+        "NFe":          "leiauteNFe_v4.00.xsd",
+        "procEventoNFe":"procEventoNFe_v1.00.xsd",
+        "resNFe":       "resNFe_v1.01.xsd",
+        "resEvento":    "resEvento_v1.01.xsd",
+        "retConsReciNFe":"retConsReciNFe_v4.00.xsd",
+        "enviNFe":      "enviNFe_v4.00.xsd",
+        "distDFeInt":   "distDFeInt_v1.01.xsd",
+        "inutNFe":      "inutNFe_v4.00.xsd",
+        "procInutNFe":  "procInutNFe_v4.00.xsd",
+        # Outros se necessário
     }
 
+    # Descobre tag raiz
+    try:
+        tree = etree.fromstring(xml.encode('utf-8') if isinstance(xml, str) else xml)
+        root_tag = tree.tag
+        if '}' in root_tag:
+            root_tag = root_tag.split('}', 1)[1]
+    except Exception as e:
+        raise Exception(f"Erro ao fazer parse do XML: {e}")
 
-    tried = []
-    # 1) Tentar prefer_xsd se informado
-    if prefer_xsd:
-        path = find_xsd(prefer_xsd)
-        tried.append(str(path) if path else prefer_xsd)
-        if path and path.exists():
-            try:
-                with open(path, "rb") as f:
-                    schema_doc = etree.parse(f, parser)
-                schema = etree.XMLSchema(schema_doc)
-                schema.assertValid(doc)
-                logging.debug(f"XML validado com sucesso contra {prefer_xsd} ({path})")
-                return True
-            except Exception as e:
-                logging.error(f"Erro ao validar XML com XSD {prefer_xsd}: {e}")
+    # Descobre nome do XSD correto
+    xsd_file = ROOT_XSD_MAP.get(root_tag, default_xsd)
 
-    # 2) Tentar pelo elemento raiz
-    xsd_name = root2xsd.get(root)
-    if xsd_name:
-        path = find_xsd(xsd_name)
-        tried.append(str(path) if path else xsd_name)
-        if path and path.exists():
-            try:
-                with open(path, "rb") as f:
-                    schema_doc = etree.parse(f, parser)
-                schema = etree.XMLSchema(schema_doc)
-                schema.assertValid(doc)
-                logging.debug(f"XML validado com sucesso contra {xsd_name} ({path})")
-                return True
-            except Exception as e:
-                logging.error(f"Erro ao validar XML com XSD {xsd_name}: {e}")
+    # Busca o XSD no projeto (recursivo)
+    def find_xsd(xsd_name, base_dir=None):
+        from pathlib import Path
+        if base_dir is None:
+            base_dir = os.path.dirname(os.path.abspath(__file__))
+        base_dir = Path(base_dir)
+        for p in base_dir.rglob(xsd_name):
+            if p.exists():
+                print(f"[XSD] Encontrado: {p}")
+                return str(p)
+        print(f"[XSD] NÃO encontrado: {xsd_name} em {base_dir}")
+        return None
 
-    # 3) Debug extra: registrar tentativas e o root do XML
-    logging.debug(f"Tentativas de XSD para root '{root}': {tried}")
-    raise Exception(f"Não foi possível validar o XML. Elemento raiz: {root}. XSDs tentados: {tried}")
+    xsd_path = find_xsd(xsd_file)
+    if not xsd_path:
+        raise FileNotFoundError(f"Arquivo XSD não encontrado: {xsd_file} (procure inclusive em subpastas)")
+
+    # PREVENÇÃO: Muda para pasta do XSD antes de validar (corrige problemas de includes)
+    xsd_dir = os.path.dirname(xsd_path)
+    cwd = os.getcwd()
+    try:
+        os.chdir(xsd_dir)
+        # Usa só o nome do arquivo pois está na pasta
+        with open(os.path.basename(xsd_path), 'rb') as f:
+            schema_root = etree.XML(f.read())
+        schema = etree.XMLSchema(schema_root)
+        if not schema.validate(tree):
+            errors = "\n".join([str(e) for e in schema.error_log])
+            raise Exception(f"Erro ao validar XML com XSD {xsd_file}:\n{errors}")
+    except etree.XMLSchemaParseError as e:
+        raise Exception(f"[DEBUG] Falha ao validar XML (parse XSD): {e}")
+    except etree.XMLSyntaxError as e:
+        raise Exception(f"[DEBUG] Falha ao validar XML (syntax XSD): {e}")
+    except Exception as e:
+        raise Exception(f"[DEBUG] Falha ao validar XML: {e}")
+    finally:
+        os.chdir(cwd)
+    return True
 # -------------------------------------------------------------------
 # URLs dos serviços
 # -------------------------------------------------------------------
