@@ -1,0 +1,23 @@
+# Interface Dependencies
+PyQt6>=6.10.0
+flet>=0.28.3
+
+# Certificate Management
+cryptography>=46.0.0
+
+# NFe Search Dependencies
+requests>=2.31.0
+requests-pkcs12>=1.20
+zeep>=4.2.1
+lxml>=4.9.0
+
+# Optional HTTP client alternatives
+httpx>=0.28.0
+
+# PDF generation (DANFE/DACTE)
+brazil-fiscal-report>=0.1.0
+qrcode[pil]>=7.4
+reportlab>=4.2
+
+# Standard libraries (usually included with Python)
+# pathlib, sqlite3, datetime, logging, base64, gzip, re, os, time

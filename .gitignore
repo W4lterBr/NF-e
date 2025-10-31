@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+.pytest_cache/
+
+# Virtual env
+.venv/
+venv/
+env/
+
+# VS Code
+.vscode/
+
+# Databases / local artifacts
+*.db
+*.sqlite
+*.sqlite3
+
+# Local XML caches (contêm dados sensíveis)
+xmls/
+xmls_chave/
+xmls_nfce/
+xml_NFs/
+xml_envio/
+xml_resposta_sefaz/
+xml_extraidos/
+consChNFe.xml
+consNSU.xml
+distNSU.xml
+
+# OS
+Thumbs.db
+*.DS_Store

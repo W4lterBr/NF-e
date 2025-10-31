@@ -1,0 +1,44 @@
+{
+  "certificates": [
+    {
+      "file_path": "C:/Arquivo Walter - Empresas/Certificados/CERTIFICADO DIGITAL MATPARCG.pfx",
+      "alias": "MATPARCG",
+      "password": "96738500Azx$@",
+      "cn": "MATPARCG INDUSTRIA E COMERCIO DE ESTRUTURAS PRE-F:33251845000109",
+      "cnpj": "33251845000109",
+      "cpf": "",
+      "not_valid_after": "2026-02-25T12:24:00+00:00",
+      "is_valid": true,
+      "fingerprint": "01881fc92c7d32ce59a742875276a0801b28e3d0fafbcfb50af1ab9928551f59",
+      "added_at": "2025-10-30T14:37:57.212864",
+      "days_until_expiry": 117
+    },
+    {
+      "file_path": "C:/Arquivo Walter - Empresas/Certificados/CERTIFICADO DIGITAL PARTNESS FUTURA valido ate 21 07 2026.pfx",
+      "alias": "PARTNESS",
+      "password": "96738500Azx$@",
+      "cn": "PARTNESS FUTURA DISTRIBUIDORA LTDA:47539664000197",
+      "cnpj": "47539664000197",
+      "cpf": "",
+      "not_valid_after": "2026-07-21T12:58:18+00:00",
+      "is_valid": true,
+      "fingerprint": "a192a963fbd63ba82526dd7070ae2c5ffaf13bfb09cfc47f52e6c14fc0a77346",
+      "added_at": "2025-10-30T14:38:45.094520",
+      "days_until_expiry": 263
+    },
+    {
+      "file_path": "C:/Arquivo Walter - Empresas/Certificados/CERTIFICADO DIGITAL ALFA COMPUTADORES.pfx",
+      "alias": "Alfa",
+      "password": "96738500Azx$@",
+      "cn": "ALFA COMPUTADORES LTDA:01773924000193",
+      "cnpj": "01773924000193",
+      "cpf": "",
+      "not_valid_after": "2025-12-10T13:13:07+00:00",
+      "is_valid": true,
+      "fingerprint": "2c7b480a98afcd56187e1d0305818d8cd2ed971ceca3804080f3d5fc0759c948",
+      "added_at": "2025-10-30T15:16:58.619032",
+      "days_until_expiry": 40
+    }
+  ],
+  "active_certificate": "C:/Arquivo Walter - Empresas/Certificados/CERTIFICADO DIGITAL PARTNESS FUTURA valido ate 21 07 2026.pfx"
+}
