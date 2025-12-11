@@ -1518,15 +1518,15 @@ class MainWindow(QMainWindow):
                     if found_xml:
                         pdf_path = found_xml.with_suffix('.pdf')
                     else:
-                        # Use temp folder
-                        tmp_dir = os.environ.get("TEMP") or os.environ.get("TMP") or str(BASE_DIR)
-                        tmp = Path(tmp_dir) if sys.platform == "win32" else Path("/tmp")
+                        # Use temp folder - SEMPRE usar pasta temp do Windows
+                        import tempfile
+                        tmp = Path(tempfile.gettempdir()) / "BOT_Busca_NFE_PDFs"
                         tmp.mkdir(parents=True, exist_ok=True)
                         pdf_path = tmp / f"{(item.get('tipo') or 'NFe')}-{chave}.pdf"
                 else:
-                    # Use temp folder
-                    tmp_dir = os.environ.get("TEMP") or os.environ.get("TMP") or str(BASE_DIR)
-                    tmp = Path(tmp_dir) if sys.platform == "win32" else Path("/tmp")
+                    # Use temp folder - SEMPRE usar pasta temp do Windows
+                    import tempfile
+                    tmp = Path(tempfile.gettempdir()) / "BOT_Busca_NFE_PDFs"
                     tmp.mkdir(parents=True, exist_ok=True)
                     pdf_path = tmp / f"{(item.get('tipo') or 'NFe')}-{item.get('chave','')}.pdf"
             
@@ -1534,12 +1534,17 @@ class MainWindow(QMainWindow):
             if pdf_path.exists():
                 self.set_status("Abrindo PDF existente", 1000)
                 try:
+                    pdf_str = str(pdf_path.absolute())
+                    # Garantir que é um arquivo PDF
+                    if not pdf_str.lower().endswith('.pdf'):
+                        QMessageBox.warning(self, "Erro", f"Arquivo não é PDF: {pdf_str}")
+                        return
                     if sys.platform == "win32":
-                        os.startfile(str(pdf_path))  # type: ignore[attr-defined]
+                        os.startfile(pdf_str)  # type: ignore[attr-defined]
                     else:
-                        subprocess.Popen(["xdg-open", str(pdf_path)])
-                except Exception:
-                    pass
+                        subprocess.Popen(["xdg-open", pdf_str])
+                except Exception as e:
+                    QMessageBox.warning(self, "Erro ao abrir PDF", f"Erro: {e}")
                 return
             
             # Generate PDF if not exists
@@ -1554,15 +1559,23 @@ class MainWindow(QMainWindow):
             }
             res = sandbox.run_task("generate_pdf", payload, timeout=240)
             if res.get("ok"):
-                p = str(pdf_path)
+                pdf_str = str(pdf_path.absolute())
+                # Garantir que o PDF foi criado
+                if not pdf_path.exists():
+                    QMessageBox.warning(self, "Erro", "PDF não foi gerado")
+                    return
+                # Garantir que é um arquivo PDF
+                if not pdf_str.lower().endswith('.pdf'):
+                    QMessageBox.warning(self, "Erro", f"Arquivo gerado não é PDF: {pdf_str}")
+                    return
                 self.set_status("PDF gerado com sucesso", 2000)
                 try:
                     if sys.platform == "win32":
-                        os.startfile(p)  # type: ignore[attr-defined]
+                        os.startfile(pdf_str)  # type: ignore[attr-defined]
                     else:
-                        subprocess.Popen(["xdg-open", p])
-                except Exception:
-                    pass
+                        subprocess.Popen(["xdg-open", pdf_str])
+                except Exception as e:
+                    QMessageBox.warning(self, "Erro ao abrir PDF", f"Erro: {e}")
             else:
                 self.set_status("")
                 QMessageBox.critical(self, "PDF", f"Falha ao gerar PDF: {res.get('error')}")

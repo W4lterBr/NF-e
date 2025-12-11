@@ -1,5 +1,19 @@
 # Changelog - BOT Busca NFE
 
+## [1.0.16] - 2025-12-11
+
+### Corrigido
+- 🚫 **BUG CRÍTICO**: Duplo clique não abre mais nova interface
+- Forçado uso de pasta temp do Windows para PDFs temporários
+- Validação rigorosa: só abre arquivos .pdf
+- Tratamento de erro ao abrir PDF com mensagens claras
+
+### Melhorado
+- PDFs temporários salvos em %TEMP%\BOT_Busca_NFE_PDFs
+- Mensagens de erro mais descritivas
+
+👍 Duplo clique agora só abre PDF!
+
 ## [1.0.15] - 2025-12-11
 
 ### Corrigido
