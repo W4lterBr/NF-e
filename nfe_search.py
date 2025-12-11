@@ -1748,6 +1748,8 @@ def run_single_cycle():
             except Exception as e:
                 logger.exception(f"Erro geral ao processar CT-e para {inf}: {e}")
         
+        logger.info("✅ Todos os certificados processados, iniciando consulta de protocolos...")
+        
         # 2) Consulta de Protocolo
         faltam = db.get_chaves_missing_status()
         if not faltam:
