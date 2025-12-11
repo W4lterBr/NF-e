@@ -1767,9 +1767,10 @@ class MainWindow(QMainWindow):
         except Exception as e:
             print(f"[DEBUG] Erro ao atualizar timestamp: {e}")
         
-        dlg = SearchDialog(self)
-        dlg.show()
-        QApplication.processEvents()
+        # Janela de debug desabilitada - usando apenas status bar
+        # dlg = SearchDialog(self)
+        # dlg.show()
+        # QApplication.processEvents()
 
         def on_progress(line: str):
             if not line:
@@ -1835,23 +1836,11 @@ class MainWindow(QMainWindow):
                     print("[DEBUG] Não foi possível extrair tempo de espera")
                     self.set_status("Busca finalizada. Aguardando próxima...", 0)
                 
-                # Fecha o diálogo após 2 segundos
-                QTimer.singleShot(2000, lambda: dlg.close() if dlg else None)
+                # Diálogo removido - usando apenas status bar
                 return
             
-            # extract percentage
-            p = None
-            try:
-                parts = line.replace(":", " ").split(" ")
-                for part in parts:
-                    if part.isdigit():
-                        p = int(part)
-                        break
-            except Exception:
-                pass
-            if p is not None:
-                dlg.set_percent(p)
-            dlg.append(line)
+            # Linha de progresso é exibida apenas nos logs (não mais em janela)
+            # Mantém apenas para compatibilidade com código existente
 
         # Worker thread para não travar a interface
         class SearchWorker(QThread):
@@ -1873,9 +1862,10 @@ class MainWindow(QMainWindow):
         def on_finished(res: Dict[str, Any]):
             try:
                 if not res.get("ok"):
-                    dlg.append(f"\nErro: {res.get('error') or res.get('message')}")
+                    error = res.get('error') or res.get('message')
+                    print(f"\nErro na busca: {error}")
                     self._search_in_progress = False
-                # Não fecha o diálogo aqui - será fechado automaticamente por on_progress
+                    self.search_summary_label.setText(f"❌ Erro: {error[:50]}...")
                 self.refresh_all()
                 self._search_worker = None
                 
@@ -1891,8 +1881,8 @@ class MainWindow(QMainWindow):
         def on_error(error_msg: str):
             try:
                 print(f"[ERRO] {error_msg}")
-                dlg.append(f"\n❌ ERRO FATAL:\n{error_msg}")
                 self._search_in_progress = False
+                self.search_summary_label.setText(f"❌ Erro fatal")
                 QMessageBox.critical(self, "Erro Fatal na Busca", error_msg)
             except Exception as e:
                 print(f"Erro ao processar on_error: {e}")

@@ -1,4 +1,19 @@
 # Changelog - BOT Busca NFE
+## [1.0.21] - 2025-12-11
+
+### Removido
+- ❌ **Janela popup de busca removida (SearchDialog)**
+- Não abre mais janela de debug durante busca SEFAZ
+
+### Melhorado
+- ✨ Interface mais limpa - apenas barra de status
+- 📊 Resumo em tempo real direto na interface principal
+- Progress bar compacta na barra de status
+- Sem janelas popup intrusivas
+- Tudo visível sem abrir nada
+- Não interrompe mais o fluxo de trabalho
+
+🧼 Busca silenciosa e eficiente!
 
 ## [1.0.20] - 2025-12-11
 
