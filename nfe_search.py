@@ -24,12 +24,34 @@ from zeep.exceptions import Fault
 from lxml import etree
 
 # -------------------------------------------------------------------
+# Diretório de Dados
+# -------------------------------------------------------------------
+def get_data_dir():
+    """Retorna o diretório de dados do aplicativo."""
+    import sys
+    import os
+    
+    # Se estiver executando como executável PyInstaller
+    if getattr(sys, 'frozen', False):
+        # Usa AppData do usuário
+        app_data = Path(os.environ.get('APPDATA', Path.home()))
+        data_dir = app_data / "BOT Busca NFE"
+    else:
+        # Desenvolvimento: usa pasta local
+        data_dir = Path(__file__).parent
+    
+    # Garante que o diretório existe
+    data_dir.mkdir(parents=True, exist_ok=True)
+    return data_dir
+
+BASE = get_data_dir()
+
+# -------------------------------------------------------------------
 # Configuração de logs
 # -------------------------------------------------------------------
 def setup_logger():
     """Configura logger com saída para console e arquivo na pasta logs."""
-    BASE_DIR = Path(__file__).parent
-    LOGS_DIR = BASE_DIR / "logs"
+    LOGS_DIR = BASE / "logs"
     
     # Cria pasta de logs se não existir
     LOGS_DIR.mkdir(exist_ok=True)
@@ -67,26 +89,6 @@ def setup_logger():
 
 logger = setup_logger()
 logger.debug("Iniciando nfe_search.py")
-
-def get_data_dir():
-    """Retorna o diretório de dados do aplicativo."""
-    import sys
-    import os
-    
-    # Se estiver executando como executável PyInstaller
-    if getattr(sys, 'frozen', False):
-        # Usa AppData do usuário
-        app_data = Path(os.environ.get('APPDATA', Path.home()))
-        data_dir = app_data / "BOT Busca NFE"
-    else:
-        # Desenvolvimento: usa pasta local
-        data_dir = Path(__file__).parent
-    
-    # Garante que o diretório existe
-    data_dir.mkdir(parents=True, exist_ok=True)
-    return data_dir
-
-BASE = get_data_dir()
 # -------------------------------------------------------------------
 # Fluxo NSU
 # -------------------------------------------------------------------

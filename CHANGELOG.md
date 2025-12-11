@@ -1,5 +1,18 @@
 # Changelog - BOT Busca NFE
 
+## [1.0.3] - 2025-12-11
+
+### Corrigido
+- 🔒 **CRÍTICO**: Erro de permissão ao criar logs em Program Files
+- setup_logger() agora usa get_data_dir() corretamente
+- Logs criados em %APPDATA%\BOT Busca NFE\logs ao invés de Program Files
+- Ordem correta de inicialização no nfe_search.py
+
+### Garantido
+- ✅ Sistema funciona sem permissão de administrador
+- ✅ Logs sempre gravados com sucesso
+- ✅ Nenhum erro de acesso negado
+
 ## [1.0.2] - 2025-12-11
 
 ### Corrigido

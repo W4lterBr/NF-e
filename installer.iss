@@ -2,7 +2,7 @@
 ; Gera instalador profissional para Windows
 
 #define MyAppName "BOT Busca NFE"
-#define MyAppVersion "1.0.2"
+#define MyAppVersion "1.0.3"
 #define MyAppPublisher "DWM System Developer"
 #define MyAppURL "https://dwmsystems.up.railway.app/"
 #define MyAppExeName "BOT Busca NFE.exe"
