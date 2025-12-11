@@ -70,11 +70,27 @@ class GitHubUpdater:
         """
         files_to_update = [
             "nfe_search.py",
+            "interface_pyqt5.py",
+            "modules/__init__.py",
             "modules/database.py",
             "modules/cte_service.py",
             "modules/updater.py",
             "modules/sandbox_worker.py",
-            "modules/__init__.py",
+            "modules/sandbox_task.py",
+            "modules/certificate_manager.py",
+            "modules/certificate_dialog.py",
+            "modules/sefaz_integration.py",
+            "modules/sefaz_config_dialog.py",
+            "modules/pdf_generator.py",
+            "modules/pdf_simple.py",
+            "modules/pdf_cli_worker.py",
+            "modules/qt_components.py",
+            "modules/ui_components.py",
+            "modules/utils.py",
+            "modules/monitor.py",
+            "modules/deps_checker.py",
+            "modules/download_completo.py",
+            "modules/_temp_runner.py",
         ]
         return files_to_update
     
