@@ -1,5 +1,20 @@
 # Changelog - BOT Busca NFE
 
+## [1.0.5] - 2025-12-11
+
+### Corrigido
+- 🔒 **CRÍTICO**: AttributeError ao redirecionar stdout em executável compilado
+- `old_stdout` agora usa `sys.__stdout__` como fallback garantido
+- ProgressCapture protegido contra stdout None
+- Tratamento robusto de erros na captura de progresso
+
+### Melhorado
+- Sistema de captura de progresso funciona em qualquer ambiente
+- Proteção contra falhas no redirecionamento de stdout
+- Melhor compatibilidade com PyInstaller (console=False)
+
+🎯 Busca executa sem erros de stdout agora!
+
 ## [1.0.4] - 2025-12-11
 
 ### Corrigido

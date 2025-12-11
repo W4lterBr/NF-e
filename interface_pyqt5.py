@@ -104,7 +104,10 @@ def ensure_logs_dir():
 
 def run_search(progress_cb: Optional[Callable[[str], None]] = None) -> Dict[str, Any]:
     """Executa a busca de NFe/CTe na SEFAZ."""
+    # Usa sys.__stdout__ que é garantido ser o stdout original
+    original_stdout = sys.__stdout__ if hasattr(sys, '__stdout__') else sys.stdout
     old_stdout = sys.stdout
+    
     try:
         # Adiciona BASE_DIR ao sys.path para importação
         if str(BASE_DIR) not in sys.path:
@@ -124,15 +127,23 @@ def run_search(progress_cb: Optional[Callable[[str], None]] = None) -> Dict[str,
         class ProgressCapture:
             def write(self, text):
                 try:
-                    old_stdout.write(text)  # Mantém output no console
+                    # Usa original_stdout que nunca é None
+                    if original_stdout:
+                        original_stdout.write(text)
                     if progress_cb and text.strip():
                         progress_cb(text.rstrip())
                 except Exception as e:
-                    old_stdout.write(f"[ERRO ProgressCapture] {e}\n")
+                    # Fallback: tenta imprimir no console de qualquer forma
+                    try:
+                        if original_stdout:
+                            original_stdout.write(f"[ERRO ProgressCapture] {e}\n")
+                    except:
+                        pass  # Silenciosamente ignora se nem isso funcionar
                     
             def flush(self):
                 try:
-                    old_stdout.flush()
+                    if original_stdout:
+                        original_stdout.flush()
                 except Exception:
                     pass
         
@@ -147,22 +158,26 @@ def run_search(progress_cb: Optional[Callable[[str], None]] = None) -> Dict[str,
         except Exception as e:
             import traceback
             error_msg = f"Erro durante execução do nfe_search: {str(e)}\n{traceback.format_exc()}"
-            sys.stdout = old_stdout
+            sys.stdout = old_stdout if old_stdout else original_stdout
             return {"ok": False, "error": error_msg}
         
         # Restaura stdout
-        sys.stdout = old_stdout
+        sys.stdout = old_stdout if old_stdout else original_stdout
         
         return {"ok": True, "message": "Busca concluída"}
         
     except Exception as e:
-        sys.stdout = old_stdout
+        sys.stdout = old_stdout if old_stdout else original_stdout
         import traceback
         error_msg = f"Erro na busca: {str(e)}\n{traceback.format_exc()}"
         print(error_msg)  # Log no console
         return {"ok": False, "error": error_msg}
     finally:
         # Garante que stdout sempre será restaurado
+        try:
+            sys.stdout = old_stdout if old_stdout else original_stdout
+        except:
+            sys.stdout = original_stdout
         sys.stdout = old_stdout
 
 
