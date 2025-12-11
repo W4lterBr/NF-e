@@ -1,5 +1,20 @@
 # Changelog - BOT Busca NFE
 
+## [1.0.9] - 2025-12-11
+
+### Corrigido
+- 🔒 **CRÍTICO**: Erro ao gerar PDF pelo duplo clique na tabela
+- FileNotFoundError: '_temp_runner.py' não encontrado em executável compilado
+- Criado sandbox_task_runner.py permanente no projeto
+- PDFs agora são gerados corretamente via duplo clique
+
+### Melhorado
+- Sandbox worker mais robusto e confiável
+- Melhor tratamento de erros com traceback completo
+- Sistema de geração de PDF mais estável
+
+🎯 Duplo clique em CTe/NFe funciona perfeitamente!
+
 ## [1.0.8] - 2025-12-11
 
 ### Corrigido
