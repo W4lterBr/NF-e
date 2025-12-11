@@ -1,5 +1,19 @@
 # Changelog - BOT Busca NFE
 
+## [1.0.8] - 2025-12-11
+
+### Corrigido
+- 🔒 **CRÍTICO**: Erro ao gerar PDF de CTe (usando Danfe em vez de Dacte)
+- AttributeError 'NoneType' object has no attribute 'attrib' ao processar CTe
+- Agora usa Dacte para CTe e Danfe para NFe corretamente
+
+### Melhorado
+- Detecção automática do tipo de documento (NFe vs CTe)
+- Geração de DACTE (Documento Auxiliar de CTe) correta
+- Mensagens de log mais específicas por tipo de documento
+
+🎯 PDFs de CTe gerados corretamente agora!
+
 ## [1.0.7] - 2025-12-11
 
 ### Corrigido

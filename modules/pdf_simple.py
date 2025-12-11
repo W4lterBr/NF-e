@@ -7,7 +7,7 @@ from typing import Optional
 
 def generate_danfe_pdf(xml_text: str, out_path: str, tipo: str = "NFe") -> bool:
     """
-    Generate DANFE PDF from XML.
+    Generate DANFE/DACTE PDF from XML.
     
     Args:
         xml_text: XML content
@@ -18,21 +18,30 @@ def generate_danfe_pdf(xml_text: str, out_path: str, tipo: str = "NFe") -> bool:
         True if successful
     """
     try:
-        # Try using BrazilFiscalReport (recommended - full DANFE)
+        # Try using BrazilFiscalReport (recommended - full DANFE/DACTE)
         try:
-            from brazilfiscalreport.danfe import Danfe
             import sys
-            print("[PDF] Tentando gerar DANFE com BrazilFiscalReport...", file=sys.stderr)
             
-            # BrazilFiscalReport aceita tanto string quanto bytes
+            # Prepare XML
             if isinstance(xml_text, str):
                 xml_bytes = xml_text.encode('utf-8')
             else:
                 xml_bytes = xml_text
             
-            danfe = Danfe(xml=xml_bytes)
-            danfe.output(str(out_path))
-            print(f"[PDF] DANFE completo gerado com sucesso: {out_path}", file=sys.stderr)
+            # Select correct class based on document type
+            if tipo.upper() == "CTE":
+                from brazilfiscalreport.dacte import Dacte
+                print("[PDF] Tentando gerar DACTE com BrazilFiscalReport...", file=sys.stderr)
+                doc = Dacte(xml=xml_bytes)
+                doc.output(str(out_path))
+                print(f"[PDF] DACTE completo gerado com sucesso: {out_path}", file=sys.stderr)
+            else:  # NFe or default
+                from brazilfiscalreport.danfe import Danfe
+                print("[PDF] Tentando gerar DANFE com BrazilFiscalReport...", file=sys.stderr)
+                doc = Danfe(xml=xml_bytes)
+                doc.output(str(out_path))
+                print(f"[PDF] DANFE completo gerado com sucesso: {out_path}", file=sys.stderr)
+            
             return True
         except ImportError as e:
             import sys
