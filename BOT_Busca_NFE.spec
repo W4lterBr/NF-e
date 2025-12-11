@@ -80,6 +80,9 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
     icon='Icone\\app_icon.ico' if os.path.exists('Icone\\app_icon.ico') else None,
+    manifest='app.manifest',  # Manifest para executar como administrador
+    uac_admin=True,  # Solicita privilégios de administrador
+    uac_uiaccess=False,
 )
 
 # Modo ONEDIR: mantém .py externos para facilitar atualizações
