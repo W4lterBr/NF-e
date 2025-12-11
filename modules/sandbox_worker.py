@@ -25,10 +25,26 @@ def run_task(task_name: str, payload: Dict[str, Any], timeout: int = 240) -> Dic
         Dict with 'ok' (bool) and task-specific results
     """
     try:
-        worker_script = BASE_DIR / "modules" / "sandbox_task_runner.py"
-        if not worker_script.exists():
-            # Fallback: create inline runner
-            worker_script = BASE_DIR / "modules" / "_temp_runner.py"
+        # Tenta encontrar o sandbox_task_runner.py em várias localizações
+        possible_paths = [
+            BASE_DIR / "modules" / "sandbox_task_runner.py",
+            BASE_DIR / "sandbox_task_runner.py",
+            Path(sys.executable).parent / "modules" / "sandbox_task_runner.py",
+            Path(sys.executable).parent / "sandbox_task_runner.py",
+        ]
+        
+        worker_script = None
+        for path in possible_paths:
+            if path.exists():
+                worker_script = path
+                break
+        
+        if not worker_script:
+            # Fallback: create inline runner in temp folder
+            import tempfile
+            temp_dir = Path(tempfile.gettempdir()) / "BOT_Busca_NFE"
+            temp_dir.mkdir(parents=True, exist_ok=True)
+            worker_script = temp_dir / "_temp_runner.py"
             _create_temp_runner(worker_script)
         
         # Prepare JSON payload

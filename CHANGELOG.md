@@ -1,5 +1,20 @@
 # Changelog - BOT Busca NFE
 
+## [1.0.11] - 2025-12-11
+
+### Corrigido
+- 🔒 **CRÍTICO**: Erro "No such file or directory: _temp_runner.py" em executável compilado
+- sandbox_worker agora busca sandbox_task_runner.py em múltiplas localizações
+- Fallback usa pasta temporária do sistema (evita permissão negada)
+- PDFs de CTe/NFe gerados corretamente via duplo clique
+
+### Melhorado
+- Busca inteligente de arquivos em 4 possíveis caminhos
+- Usa tempfile.gettempdir() para evitar problemas de permissão
+- Mais robusto em ambiente compilado PyInstaller
+
+🎯 Duplo clique funciona em qualquer cenário agora!
+
 ## [1.0.10] - 2025-12-11
 
 ### Adicionado
