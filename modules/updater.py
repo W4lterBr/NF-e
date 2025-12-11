@@ -1,0 +1,223 @@
+"""
+Sistema de Atualização Automática via GitHub
+Desenvolvido por: DWM System Developer
+"""
+
+import requests
+import json
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+import shutil
+import logging
+
+logger = logging.getLogger(__name__)
+
+class GitHubUpdater:
+    """Gerenciador de atualizações via GitHub."""
+    
+    def __init__(self, repo: str, base_dir: Path):
+        """
+        Args:
+            repo: Repositório no formato 'usuario/repo'
+            base_dir: Diretório base da aplicação
+        """
+        self.repo = repo
+        self.base_dir = Path(base_dir)
+        self.api_url = f"https://api.github.com/repos/{repo}"
+        self.raw_url = f"https://raw.githubusercontent.com/{repo}/main"
+        self.version_file = self.base_dir / "version.txt"
+        
+    def get_current_version(self) -> str:
+        """Retorna a versão atual instalada."""
+        if self.version_file.exists():
+            return self.version_file.read_text(encoding='utf-8').strip()
+        return "0.0.0"
+    
+    def get_remote_version(self) -> Optional[str]:
+        """Busca a versão mais recente no GitHub."""
+        try:
+            response = requests.get(
+                f"{self.raw_url}/version.txt",
+                timeout=10
+            )
+            if response.status_code == 200:
+                return response.text.strip()
+            return None
+        except Exception as e:
+            logger.error(f"Erro ao buscar versão remota: {e}")
+            return None
+    
+    def check_for_updates(self) -> Tuple[bool, str, str]:
+        """
+        Verifica se há atualizações disponíveis.
+        
+        Returns:
+            (tem_atualizacao, versao_atual, versao_remota)
+        """
+        current = self.get_current_version()
+        remote = self.get_remote_version()
+        
+        if remote is None:
+            return False, current, "Erro ao conectar"
+        
+        has_update = remote != current
+        return has_update, current, remote
+    
+    def get_file_list(self) -> List[str]:
+        """
+        Retorna lista de arquivos Python para atualizar.
+        Busca recursivamente no repositório.
+        """
+        files_to_update = [
+            "nfe_search.py",
+            "modules/database.py",
+            "modules/cte_service.py",
+            "modules/updater.py",
+            "modules/sandbox_worker.py",
+            "modules/__init__.py",
+        ]
+        return files_to_update
+    
+    def download_file(self, remote_path: str) -> Optional[bytes]:
+        """
+        Baixa um arquivo do GitHub.
+        
+        Args:
+            remote_path: Caminho relativo no repositório (ex: 'modules/database.py')
+            
+        Returns:
+            Conteúdo do arquivo em bytes ou None se falhar
+        """
+        try:
+            url = f"{self.raw_url}/{remote_path}"
+            logger.info(f"Baixando: {url}")
+            response = requests.get(url, timeout=30)
+            
+            if response.status_code == 200:
+                return response.content
+            else:
+                logger.warning(f"Arquivo não encontrado: {remote_path} (status {response.status_code})")
+                return None
+                
+        except Exception as e:
+            logger.error(f"Erro ao baixar {remote_path}: {e}")
+            return None
+    
+    def backup_file(self, file_path: Path) -> bool:
+        """Cria backup de um arquivo antes de sobrescrever."""
+        if not file_path.exists():
+            return True
+            
+        backup_dir = self.base_dir / "backups"
+        backup_dir.mkdir(exist_ok=True)
+        
+        try:
+            backup_path = backup_dir / f"{file_path.name}.bak"
+            shutil.copy2(file_path, backup_path)
+            logger.info(f"Backup criado: {backup_path}")
+            return True
+        except Exception as e:
+            logger.error(f"Erro ao criar backup de {file_path}: {e}")
+            return False
+    
+    def apply_update(self, progress_callback=None) -> Dict[str, any]:
+        """
+        Aplica atualização baixando e substituindo arquivos.
+        
+        Args:
+            progress_callback: Função callback(message: str) para reportar progresso
+            
+        Returns:
+            Dict com resultado: {'success': bool, 'message': str, 'updated_files': list}
+        """
+        updated_files = []
+        errors = []
+        
+        def log_progress(msg):
+            if progress_callback:
+                progress_callback(msg)
+            logger.info(msg)
+        
+        try:
+            # Verifica se há atualizações
+            has_update, current, remote = self.check_for_updates()
+            
+            if not has_update:
+                return {
+                    'success': False,
+                    'message': f'Você já está na versão mais recente ({current})',
+                    'updated_files': []
+                }
+            
+            log_progress(f"📥 Atualizando de {current} para {remote}...")
+            
+            # Baixa lista de arquivos
+            files = self.get_file_list()
+            total = len(files)
+            
+            for idx, file_path in enumerate(files, 1):
+                log_progress(f"[{idx}/{total}] Baixando {file_path}...")
+                
+                # Baixa arquivo
+                content = self.download_file(file_path)
+                
+                if content is None:
+                    errors.append(f"Falha ao baixar: {file_path}")
+                    continue
+                
+                # Prepara caminho local
+                local_path = self.base_dir / file_path
+                local_path.parent.mkdir(parents=True, exist_ok=True)
+                
+                # Faz backup se arquivo existir
+                if local_path.exists():
+                    if not self.backup_file(local_path):
+                        errors.append(f"Falha no backup: {file_path}")
+                        continue
+                
+                # Escreve novo arquivo
+                try:
+                    local_path.write_bytes(content)
+                    updated_files.append(file_path)
+                    log_progress(f"✅ Atualizado: {file_path}")
+                except Exception as e:
+                    errors.append(f"Erro ao escrever {file_path}: {e}")
+            
+            # Baixa e atualiza version.txt
+            version_content = self.download_file("version.txt")
+            if version_content:
+                self.version_file.write_bytes(version_content)
+                log_progress(f"✅ Versão atualizada para {remote}")
+            
+            # Resultado final
+            if errors:
+                error_msg = "\n".join(errors)
+                return {
+                    'success': False,
+                    'message': f'Atualização parcial. Erros:\n{error_msg}',
+                    'updated_files': updated_files
+                }
+            else:
+                return {
+                    'success': True,
+                    'message': f'✅ Atualização concluída!\n{len(updated_files)} arquivos atualizados para versão {remote}',
+                    'updated_files': updated_files
+                }
+                
+        except Exception as e:
+            logger.error(f"Erro na atualização: {e}")
+            return {
+                'success': False,
+                'message': f'Erro na atualização: {str(e)}',
+                'updated_files': updated_files
+            }
+    
+    def get_changelog(self) -> Optional[str]:
+        """Busca changelog do GitHub (se existir)."""
+        try:
+            response = requests.get(f"{self.raw_url}/CHANGELOG.md", timeout=10)
+            if response.status_code == 200:
+                return response.text
+            return None
+        except:
+            return None

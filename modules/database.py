@@ -1,575 +1,295 @@
-# modules/database.py
-"""
-Gerenciador de banco de dados para o sistema BOT NFe
-"""
+from __future__ import annotations
 
 import sqlite3
-import logging
 from pathlib import Path
-from datetime import datetime, timedelta
-from typing import List, Dict, Any, Optional, Tuple
+from typing import Dict, Any, List, Optional
+from datetime import datetime
 
-logger = logging.getLogger(__name__)
 
 class DatabaseManager:
-    """Gerenciador do banco de dados SQLite"""
+    """Database manager for NFe system - UI compatible."""
     
     def __init__(self, db_path: Path):
-        self.db_path = db_path
-        self._ensure_tables()
+        self.db_path = Path(db_path)
+        self._initialize()
     
-    def _ensure_tables(self):
-        """Garante que todas as tabelas necessárias existam"""
-        try:
-            with sqlite3.connect(self.db_path) as conn:
-                # Tabela de certificados
-                conn.execute('''
-                    CREATE TABLE IF NOT EXISTS certificados (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        cnpj_cpf TEXT NOT NULL,
-                        caminho TEXT NOT NULL,
-                        senha TEXT NOT NULL,
-                        informante TEXT NOT NULL,
-                        cUF_autor TEXT NOT NULL,
-                        criado_em DATETIME DEFAULT CURRENT_TIMESTAMP,
-                        ativo BOOLEAN DEFAULT 1
-                    )
-                ''')
-                
-                # Tabela de notas detalhadas
-                conn.execute('''
-                    CREATE TABLE IF NOT EXISTS notas_detalhadas (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        chave TEXT UNIQUE NOT NULL,
-                        numero TEXT,
-                        data_emissao TEXT,
-                        cnpj_emitente TEXT,
-                        nome_emitente TEXT,
-                        cnpj_destinatario TEXT,
-                        nome_destinatario TEXT,
-                        valor TEXT,
-                        cfop TEXT,
-                        tipo TEXT DEFAULT 'NFe',
-                        vencimento TEXT,
-                        status TEXT DEFAULT 'Pendente',
-                        natureza TEXT,
-                        ie_tomador TEXT,
-                        uf TEXT,
-                        -- Campos adicionais para gerenciamento de resumo/completo e origem
-                        xml_status TEXT DEFAULT 'RESUMO', -- RESUMO | COMPLETO
-                        informante TEXT,                  -- CNPJ do certificado que trouxe o documento
-                        nsu TEXT,                         -- NSU do documento (se disponível)
-                        atualizado_em DATETIME DEFAULT CURRENT_TIMESTAMP,
-                        criado_em DATETIME DEFAULT CURRENT_TIMESTAMP
-                    )
-                ''')
-                
-                # Tabela de NSU
-                conn.execute('''
-                    CREATE TABLE IF NOT EXISTS nsu (
-                        informante TEXT PRIMARY KEY,
-                        ult_nsu TEXT NOT NULL,
-                        atualizado_em DATETIME DEFAULT CURRENT_TIMESTAMP
-                    )
-                ''')
-                
-                # Tabela de XMLs baixados
-                conn.execute('''
-                    CREATE TABLE IF NOT EXISTS xmls_baixados (
-                        chave TEXT PRIMARY KEY,
-                        cnpj_cpf TEXT NOT NULL,
-                        caminho_arquivo TEXT,
-                        baixado_em DATETIME DEFAULT CURRENT_TIMESTAMP
-                    )
-                ''')
-                
-                # Tabela de status das NF-e
-                conn.execute('''
-                    CREATE TABLE IF NOT EXISTS nf_status (
-                        chNFe TEXT PRIMARY KEY,
-                        cStat TEXT,
-                        xMotivo TEXT,
-                        atualizado_em DATETIME DEFAULT CURRENT_TIMESTAMP
-                    )
-                ''')
-                
-                # Índices para melhor performance
-                conn.execute('CREATE INDEX IF NOT EXISTS idx_notas_chave ON notas_detalhadas(chave)')
-                conn.execute('CREATE INDEX IF NOT EXISTS idx_notas_data ON notas_detalhadas(data_emissao)')
-                conn.execute('CREATE INDEX IF NOT EXISTS idx_notas_cnpj_emit ON notas_detalhadas(cnpj_emitente)')
-                conn.execute('CREATE INDEX IF NOT EXISTS idx_certificados_informante ON certificados(informante)')
-                
-                conn.commit()
-                logger.info("Estrutura do banco de dados verificada/criada com sucesso")
-                
-        except Exception as e:
-            logger.error(f"Erro ao criar estrutura do banco: {e}")
-            raise
-
-        # Migrações leves: adiciona colunas se faltarem
-        try:
-            with sqlite3.connect(self.db_path) as conn:
-                def ensure_col(table: str, col: str, ddl: str):
-                    try:
-                        conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {ddl}")
-                        conn.commit()
-                        logger.debug(f"Coluna adicionada: {table}.{col}")
-                    except sqlite3.OperationalError:
-                        # Já existe
-                        pass
-
-                ensure_col('notas_detalhadas', 'xml_status', "TEXT DEFAULT 'RESUMO'")
-                ensure_col('notas_detalhadas', 'informante', 'TEXT')
-                ensure_col('notas_detalhadas', 'nsu', 'TEXT')
-                # Garante colunas novas em xmls_baixados (compatibilidade com esquema antigo)
-                ensure_col('xmls_baixados', 'caminho_arquivo', 'TEXT')
-                ensure_col('xmls_baixados', 'baixado_em', 'DATETIME DEFAULT CURRENT_TIMESTAMP')
-        except Exception as e:
-            logger.warning(f"Falha ao aplicar migrações leves: {e}")
+    def _connect(self):
+        return sqlite3.connect(str(self.db_path))
     
-    def load_notes(self, limit: Optional[int] = None) -> List[Dict[str, Any]]:
-        """
-        Carrega notas do banco de dados
-        
-        Args:
-            limit: Limite de registros a retornar (None para todos)
+    def _initialize(self):
+        """Initialize database tables."""
+        with self._connect() as conn:
+            conn.execute('''CREATE TABLE IF NOT EXISTS certificados (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                cnpj_cpf TEXT,
+                caminho TEXT,
+                senha TEXT,
+                informante TEXT,
+                cUF_autor TEXT,
+                ativo INTEGER DEFAULT 1
+            )''')
             
-        Returns:
-            Lista de dicionários com dados das notas
-        """
-        notes = []
-        seen_keys = set()
-        
-        try:
-            with sqlite3.connect(self.db_path) as conn:
-                conn.row_factory = sqlite3.Row  # Para acessar colunas por nome
-                
-                query = "SELECT * FROM notas_detalhadas ORDER BY data_emissao DESC"
-                if limit:
-                    query += f" LIMIT {limit}"
-                
-                cursor = conn.execute(query)
-                
-                for row in cursor.fetchall():
-                    chave = row['chave']
-                    if not chave or chave in seen_keys:
-                        continue
-                    seen_keys.add(chave)
-                    
-                    # Converte Row para dict
-                    note_dict = dict(row)
-                    notes.append(note_dict)
-                
-                logger.info(f"Carregadas {len(notes)} notas do banco")
-                
-        except Exception as e:
-            logger.error(f"Erro ao carregar notas: {e}")
-            raise
-        
-        return notes
+            # Adiciona coluna criado_em se não existir (migração)
+            try:
+                conn.execute("ALTER TABLE certificados ADD COLUMN criado_em TEXT")
+                conn.commit()
+            except Exception:
+                # Coluna já existe, ignora
+                pass
+            
+            conn.execute('''CREATE TABLE IF NOT EXISTS xmls_baixados (
+                chave TEXT PRIMARY KEY,
+                cnpj_cpf TEXT,
+                caminho_arquivo TEXT,
+                baixado_em TEXT
+            )''')
+            conn.execute('''CREATE TABLE IF NOT EXISTS nf_status (
+                chNFe TEXT PRIMARY KEY,
+                cStat TEXT,
+                xMotivo TEXT
+            )''')
+            conn.execute('''CREATE TABLE IF NOT EXISTS nsu (
+                informante TEXT PRIMARY KEY,
+                ult_nsu TEXT
+            )''')
+            conn.execute('''CREATE TABLE IF NOT EXISTS nsu_cte (
+                informante TEXT PRIMARY KEY,
+                ult_nsu TEXT
+            )''')
+            conn.execute('''CREATE TABLE IF NOT EXISTS erro_656 (
+                informante TEXT PRIMARY KEY,
+                ultimo_erro TIMESTAMP,
+                nsu_bloqueado TEXT
+            )''')
+            conn.execute('''CREATE TABLE IF NOT EXISTS config (
+                chave TEXT PRIMARY KEY,
+                valor TEXT
+            )''')
+            conn.execute('''CREATE TABLE IF NOT EXISTS notas_detalhadas (
+                chave TEXT PRIMARY KEY,
+                ie_tomador TEXT,
+                nome_emitente TEXT,
+                cnpj_emitente TEXT,
+                numero TEXT,
+                data_emissao TEXT,
+                tipo TEXT,
+                valor TEXT,
+                cfop TEXT,
+                vencimento TEXT,
+                ncm TEXT,
+                status TEXT,
+                natureza TEXT,
+                uf TEXT,
+                base_icms TEXT,
+                valor_icms TEXT,
+                informante TEXT,
+                xml_status TEXT,
+                atualizado_em TEXT
+            )''')
+            conn.commit()
+    
+    def load_notes(self, limit: int = 1000) -> List[Dict[str, Any]]:
+        """Load notes from database."""
+        with self._connect() as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.execute(
+                "SELECT * FROM notas_detalhadas ORDER BY data_emissao DESC LIMIT ?",
+                (limit,)
+            )
+            return [dict(row) for row in cursor.fetchall()]
     
     def load_certificates(self) -> List[Dict[str, Any]]:
-        """
-        Carrega certificados ativos do banco
-        
-        Returns:
-            Lista de dicionários com dados dos certificados
-        """
-        certificates = []
-        
-        try:
-            with sqlite3.connect(self.db_path) as conn:
-                conn.row_factory = sqlite3.Row
-                
-                cursor = conn.execute('''
-                    SELECT * FROM certificados 
-                    WHERE ativo = 1 
-                    ORDER BY criado_em DESC
-                ''')
-                
-                for row in cursor.fetchall():
-                    cert_dict = dict(row)
-                    certificates.append(cert_dict)
-                
-                logger.info(f"Carregados {len(certificates)} certificados ativos")
-                
-        except Exception as e:
-            logger.error(f"Erro ao carregar certificados: {e}")
-            raise
-        
-        return certificates
+        """Load certificates from database."""
+        with self._connect() as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.execute("SELECT * FROM certificados ORDER BY informante")
+            return [dict(row) for row in cursor.fetchall()]
     
-    def save_note(self, note_data: Dict[str, Any]) -> bool:
-        """
-        Salva ou atualiza uma nota no banco
-        
-        Args:
-            note_data: Dicionário com dados da nota
-            
-        Returns:
-            True se salvou com sucesso, False caso contrário
-        """
+    def save_certificate(self, data: Dict[str, Any]) -> bool:
+        """Save certificate to database. Returns True if successful."""
         try:
-            with sqlite3.connect(self.db_path) as conn:
-                # Verifica se já existe
+            with self._connect() as conn:
+                # Check for duplicates by informante
                 existing = conn.execute(
-                    "SELECT id FROM notas_detalhadas WHERE chave = ?",
-                    (note_data.get('chave'),)
+                    "SELECT id, informante, caminho FROM certificados WHERE informante = ?",
+                    (data.get('informante'),)
                 ).fetchone()
                 
-                note_data['atualizado_em'] = datetime.now().isoformat()
+                if existing and not data.get('id'):
+                    # Sempre remove o registro antigo se for tentativa de novo cadastro
+                    print(f"[DEBUG] Removendo registro existente do certificado: {existing[1]}")
+                    conn.execute("DELETE FROM certificados WHERE id = ?", (existing[0],))
+                    conn.commit()
+                    # Agora pode inserir o novo normalmente
                 
-                if existing:
-                    # Atualiza registro existente
-                    set_clause = ', '.join([f"{k} = ?" for k in note_data.keys() if k != 'chave'])
-                    values = [v for k, v in note_data.items() if k != 'chave']
-                    values.append(note_data['chave'])
-                    
-                    conn.execute(
-                        f"UPDATE notas_detalhadas SET {set_clause} WHERE chave = ?",
-                        values
+                if data.get('id'):
+                    # Update existing
+                    conn.execute('''UPDATE certificados 
+                        SET cnpj_cpf = ?, caminho = ?, senha = ?, 
+                            cUF_autor = ?, ativo = ?
+                        WHERE id = ?''',
+                        (data.get('cnpj_cpf'), data.get('caminho'), 
+                         data.get('senha'), data.get('cUF_autor'),
+                         data.get('ativo', 1), data.get('id'))
                     )
-                    logger.debug(f"Nota atualizada: {note_data.get('chave')}")
                 else:
-                    # Insere novo registro
-                    note_data['criado_em'] = datetime.now().isoformat()
-                    columns = ', '.join(note_data.keys())
-                    placeholders = ', '.join(['?' for _ in note_data])
-                    
-                    conn.execute(
-                        f"INSERT INTO notas_detalhadas ({columns}) VALUES ({placeholders})",
-                        list(note_data.values())
+                    # Insert new
+                    conn.execute('''INSERT INTO certificados 
+                        (informante, cnpj_cpf, caminho, senha, cUF_autor, ativo, criado_em)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)''',
+                        (data.get('informante'), data.get('cnpj_cpf'),
+                         data.get('caminho'), data.get('senha'),
+                         data.get('cUF_autor'), data.get('ativo', 1),
+                         datetime.now().isoformat())
                     )
-                    logger.debug(f"Nova nota inserida: {note_data.get('chave')}")
-                
                 conn.commit()
                 return True
-                
         except Exception as e:
-            logger.error(f"Erro ao salvar nota: {e}")
+            print(f"[DEBUG] Erro ao salvar certificado: {e}")
+            import traceback
+            traceback.print_exc()
             return False
-
-    def update_xml_status(self, chave: str, status: str) -> bool:
-        """
-        Atualiza o status do XML (RESUMO/COMPLETO) para a nota informada.
-        """
-        try:
-            with sqlite3.connect(self.db_path) as conn:
-                conn.execute(
-                    "UPDATE notas_detalhadas SET xml_status = ?, atualizado_em = ? WHERE chave = ?",
-                    (status, datetime.now().isoformat(), chave)
-                )
-                conn.commit()
-                logger.debug(f"xml_status atualizado para {chave}: {status}")
-                return True
-        except Exception as e:
-            logger.error(f"Erro ao atualizar xml_status: {e}")
-            return False
-
-    def get_note_by_chave(self, chave: str) -> Optional[Dict[str, Any]]:
-        """
-        Retorna os dados da nota pela chave.
-        """
-        try:
-            with sqlite3.connect(self.db_path) as conn:
-                conn.row_factory = sqlite3.Row
-                row = conn.execute(
-                    "SELECT * FROM notas_detalhadas WHERE chave = ?",
-                    (chave,)
-                ).fetchone()
-                return dict(row) if row else None
-        except Exception as e:
-            logger.error(f"Erro ao buscar nota por chave: {e}")
-            return None
     
-    def save_certificate(self, cert_data: Dict[str, Any]) -> bool:
-        """
-        Salva um novo certificado no banco
-        
-        Args:
-            cert_data: Dicionário com dados do certificado
-            
-        Returns:
-            True se salvou com sucesso, False se já existe ou erro
-        """
+    def save_note(self, data: Dict[str, Any]) -> bool:
+        """Save note to database with anti-downgrade logic."""
         try:
-            with sqlite3.connect(self.db_path) as conn:
-                # Verifica se já existe certificado para este informante
-                existing = conn.execute(
-                    "SELECT id FROM certificados WHERE informante = ? AND ativo = 1",
-                    (cert_data.get('informante'),)
-                ).fetchone()
-                
-                if existing:
-                    logger.warning(f"Certificado já existe para informante: {cert_data.get('informante')}")
+            with self._connect() as conn:
+                chave = data.get('chave')
+                if not chave:
                     return False
                 
-                # Insere novo certificado
-                cert_data['criado_em'] = datetime.now().isoformat()
-                cert_data['ativo'] = 1
+                new_status = (data.get('xml_status') or 'RESUMO').upper()
                 
-                columns = ', '.join(cert_data.keys())
-                placeholders = ', '.join(['?' for _ in cert_data])
+                # Validação: não salvar resumos/eventos sem dados essenciais
+                if new_status in ['RESUMO', 'EVENTO']:
+                    numero = data.get('numero') or ''
+                    nome = data.get('nome_emitente') or ''
+                    if not numero.strip() and not nome.strip():
+                        # Resumo/evento sem dados válidos - não salva
+                        return False
                 
-                conn.execute(
-                    f"INSERT INTO certificados ({columns}) VALUES ({placeholders})",
-                    list(cert_data.values())
-                )
-                
-                conn.commit()
-                logger.info(f"Certificado salvo: {cert_data.get('informante')}")
-                return True
-                
-        except Exception as e:
-            logger.error(f"Erro ao salvar certificado: {e}")
-            return False
-    
-    def get_last_nsu(self, informante: str) -> str:
-        """
-        Obtém o último NSU para um informante
-        
-        Args:
-            informante: CNPJ/CPF do informante
-            
-        Returns:
-            Último NSU ou '000000000000000' se não encontrado
-        """
-        try:
-            with sqlite3.connect(self.db_path) as conn:
-                result = conn.execute(
-                    "SELECT ult_nsu FROM nsu WHERE informante = ?",
-                    (informante,)
-                ).fetchone()
-                
-                return result[0] if result else "000000000000000"
-                
-        except Exception as e:
-            logger.error(f"Erro ao obter último NSU: {e}")
-            return "000000000000000"
-    
-    def set_last_nsu(self, informante: str, nsu: str) -> bool:
-        """
-        Define o último NSU para um informante
-        
-        Args:
-            informante: CNPJ/CPF do informante
-            nsu: Valor do NSU
-            
-        Returns:
-            True se salvou com sucesso
-        """
-        try:
-            with sqlite3.connect(self.db_path) as conn:
-                conn.execute(
-                    '''INSERT OR REPLACE INTO nsu (informante, ult_nsu, atualizado_em) 
-                       VALUES (?, ?, ?)''',
-                    (informante, nsu, datetime.now().isoformat())
-                )
-                conn.commit()
-                logger.debug(f"NSU atualizado para {informante}: {nsu}")
-                return True
-                
-        except Exception as e:
-            logger.error(f"Erro ao definir último NSU: {e}")
-            return False
-    
-    def get_nf_status(self, chave: str) -> Optional[Tuple[str, str]]:
-        """
-        Obtém status de uma NF-e
-        
-        Args:
-            chave: Chave da NF-e
-            
-        Returns:
-            Tupla (cStat, xMotivo) ou None se não encontrado
-        """
-        try:
-            with sqlite3.connect(self.db_path) as conn:
-                result = conn.execute(
-                    "SELECT cStat, xMotivo FROM nf_status WHERE chNFe = ?",
+                # Check existing status
+                existing = conn.execute(
+                    "SELECT xml_status FROM notas_detalhadas WHERE chave = ?",
                     (chave,)
                 ).fetchone()
                 
-                return result if result else None
-                
-        except Exception as e:
-            logger.error(f"Erro ao obter status da NF-e: {e}")
+                if existing:
+                    old_status = (existing[0] or 'RESUMO').upper()
+                    # Anti-downgrade: don't replace COMPLETO with RESUMO
+                    if old_status == 'COMPLETO' and new_status == 'RESUMO':
+                        return False
+                    
+                    # Update
+                    conn.execute('''UPDATE notas_detalhadas 
+                        SET ie_tomador = ?, nome_emitente = ?, cnpj_emitente = ?,
+                            numero = ?, data_emissao = ?, tipo = ?, valor = ?,
+                            cfop = ?, vencimento = ?, ncm = ?, status = ?,
+                            natureza = ?, uf = ?, base_icms = ?, valor_icms = ?,
+                            informante = ?, xml_status = ?, atualizado_em = ?
+                        WHERE chave = ?''',
+                        (data.get('ie_tomador'), data.get('nome_emitente'),
+                         data.get('cnpj_emitente'), data.get('numero'),
+                         data.get('data_emissao'), data.get('tipo'),
+                         data.get('valor'), data.get('cfop'),
+                         data.get('vencimento'), data.get('ncm'),
+                         data.get('status'), data.get('natureza'),
+                         data.get('uf'), data.get('base_icms'),
+                         data.get('valor_icms'), data.get('informante'),
+                         new_status, datetime.now().isoformat(), chave)
+                    )
+                else:
+                    # Insert
+                    conn.execute('''INSERT INTO notas_detalhadas
+                        (chave, ie_tomador, nome_emitente, cnpj_emitente,
+                         numero, data_emissao, tipo, valor, cfop, vencimento,
+                         ncm, status, natureza, uf, base_icms, valor_icms,
+                         informante, xml_status, atualizado_em)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                        (chave, data.get('ie_tomador'), data.get('nome_emitente'),
+                         data.get('cnpj_emitente'), data.get('numero'),
+                         data.get('data_emissao'), data.get('tipo'),
+                         data.get('valor'), data.get('cfop'),
+                         data.get('vencimento'), data.get('ncm'),
+                         data.get('status'), data.get('natureza'),
+                         data.get('uf'), data.get('base_icms'),
+                         data.get('valor_icms'), data.get('informante'),
+                         new_status, datetime.now().isoformat())
+                    )
+                conn.commit()
+                return True
+        except Exception:
+            return False
+    
+    def deletar_nota_detalhada(self, chave: str) -> bool:
+        """Delete note from notas_detalhadas table."""
+        try:
+            with self._connect() as conn:
+                conn.execute("DELETE FROM notas_detalhadas WHERE chave = ?", (chave,))
+                conn.commit()
+                return True
+        except Exception:
+            return False
+    
+    def register_xml_download(self, chave: str, caminho: str, cnpj_cpf: str = "") -> bool:
+        """Register downloaded XML in xmls_baixados table."""
+        try:
+            with self._connect() as conn:
+                conn.execute('''INSERT OR REPLACE INTO xmls_baixados
+                    (chave, cnpj_cpf, caminho_arquivo, baixado_em)
+                    VALUES (?, ?, ?, ?)''',
+                    (chave, cnpj_cpf, caminho, datetime.now().isoformat())
+                )
+                conn.commit()
+                return True
+        except Exception:
+            return False
+    
+    def get_last_search_time(self) -> Optional[str]:
+        """Get the last search execution time."""
+        try:
+            with self._connect() as conn:
+                row = conn.execute(
+                    "SELECT valor FROM config WHERE chave = 'ultima_busca'"
+                ).fetchone()
+                return row[0] if row else None
+        except Exception:
             return None
     
-    def set_nf_status(self, chave: str, cstat: str, xmotivo: str) -> bool:
-        """
-        Define status de uma NF-e
-        
-        Args:
-            chave: Chave da NF-e
-            cstat: Código de status
-            xmotivo: Motivo/descrição
-            
-        Returns:
-            True se salvou com sucesso
-        """
+    def set_last_search_time(self, timestamp: str) -> bool:
+        """Set the last search execution time."""
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            with self._connect() as conn:
                 conn.execute(
-                    '''INSERT OR REPLACE INTO nf_status (chNFe, cStat, xMotivo, atualizado_em) 
-                       VALUES (?, ?, ?, ?)''',
-                    (chave, cstat, xmotivo, datetime.now().isoformat())
+                    '''INSERT OR REPLACE INTO config (chave, valor)
+                       VALUES ('ultima_busca', ?)''',
+                    (timestamp,)
                 )
                 conn.commit()
-                logger.debug(f"Status atualizado para {chave}: {cstat}")
                 return True
-                
-        except Exception as e:
-            logger.error(f"Erro ao definir status da NF-e: {e}")
+        except Exception:
             return False
     
-    def register_xml_download(self, chave: str, cnpj: str, arquivo_path: Optional[str] = None) -> bool:
-        """
-        Registra download de XML com detecção dinâmica das colunas disponíveis,
-        para compatibilidade com bancos antigos sem colunas novas.
-
-        Args:
-            chave: Chave da NF-e
-            cnpj: CNPJ/CPF relacionado
-            arquivo_path: Caminho do arquivo salvo
-
-        Returns:
-            True se registrou com sucesso
-        """
+    def atualizar_status_por_evento(self, chave: str, novo_status: str) -> bool:
+        """Atualiza o status de uma nota baseado em evento (cancelamento, etc)."""
         try:
-            with sqlite3.connect(self.db_path) as conn:
-                # Descobre colunas existentes na tabela
-                cols = {row[1] for row in conn.execute("PRAGMA table_info(xmls_baixados)")}
-
-                fields = ["chave", "cnpj_cpf"]
-                values = [chave, cnpj]
-                if "caminho_arquivo" in cols:
-                    fields.append("caminho_arquivo")
-                    values.append(arquivo_path)
-                if "baixado_em" in cols:
-                    fields.append("baixado_em")
-                    values.append(datetime.now().isoformat())
-
-                placeholders = ", ".join(["?"] * len(fields))
-                sql = f"INSERT OR REPLACE INTO xmls_baixados ({', '.join(fields)}) VALUES ({placeholders})"
-                conn.execute(sql, values)
+            with self._connect() as conn:
+                conn.execute(
+                    "UPDATE notas_detalhadas SET status = ? WHERE chave = ?",
+                    (novo_status, chave)
+                )
                 conn.commit()
-                logger.debug(f"Download registrado: {chave}")
                 return True
-
-        except Exception as e:
-            logger.error(f"Erro ao registrar download: {e}")
+        except Exception:
             return False
     
-    def get_missing_status_keys(self) -> List[Tuple[str, str]]:
-        """
-        Obtém chaves que ainda não têm status consultado
-        
-        Returns:
-            Lista de tuplas (chave, cnpj_cpf)
-        """
+    def get_next_search_interval(self) -> Optional[int]:
+        """Get the search interval in minutes (default 65)."""
         try:
-            with sqlite3.connect(self.db_path) as conn:
-                cursor = conn.execute('''
-                    SELECT x.chave, x.cnpj_cpf
-                    FROM xmls_baixados x
-                    LEFT JOIN nf_status n ON x.chave = n.chNFe
-                    WHERE n.chNFe IS NULL
-                ''')
-                
-                return cursor.fetchall()
-                
-        except Exception as e:
-            logger.error(f"Erro ao obter chaves sem status: {e}")
-            return []
-    
-    def get_statistics(self) -> Dict[str, Any]:
-        """
-        Obtém estatísticas do banco de dados
-        
-        Returns:
-            Dicionário com estatísticas
-        """
-        stats = {
-            'total_notas': 0,
-            'notas_autorizadas': 0,
-            'notas_canceladas': 0,
-            'notas_rejeitadas': 0,
-            'certificados_ativos': 0,
-            'ultimo_update': None
-        }
-        
-        try:
-            with sqlite3.connect(self.db_path) as conn:
-                # Total de notas
-                result = conn.execute("SELECT COUNT(*) FROM notas_detalhadas").fetchone()
-                stats['total_notas'] = result[0] if result else 0
-                
-                # Notas por status
-                result = conn.execute(
-                    "SELECT COUNT(*) FROM notas_detalhadas WHERE status LIKE '%autorizado%'"
+            with self._connect() as conn:
+                row = conn.execute(
+                    "SELECT valor FROM config WHERE chave = 'intervalo_busca'"
                 ).fetchone()
-                stats['notas_autorizadas'] = result[0] if result else 0
-                
-                result = conn.execute(
-                    "SELECT COUNT(*) FROM notas_detalhadas WHERE status LIKE '%cancelad%'"
-                ).fetchone()
-                stats['notas_canceladas'] = result[0] if result else 0
-                
-                result = conn.execute(
-                    "SELECT COUNT(*) FROM notas_detalhadas WHERE status LIKE '%rejeitad%'"
-                ).fetchone()
-                stats['notas_rejeitadas'] = result[0] if result else 0
-                
-                # Certificados ativos
-                result = conn.execute("SELECT COUNT(*) FROM certificados WHERE ativo = 1").fetchone()
-                stats['certificados_ativos'] = result[0] if result else 0
-                
-                # Última atualização
-                result = conn.execute(
-                    "SELECT MAX(atualizado_em) FROM notas_detalhadas"
-                ).fetchone()
-                stats['ultimo_update'] = result[0] if result and result[0] else None
-                
-        except Exception as e:
-            logger.error(f"Erro ao obter estatísticas: {e}")
-        
-        return stats
-    
-    def cleanup_old_data(self, days: int = 365) -> int:
-        """
-        Remove dados antigos do banco
-        
-        Args:
-            days: Número de dias para manter os dados
-            
-        Returns:
-            Número de registros removidos
-        """
-        removed_count = 0
-        
-        try:
-            cutoff_date = (datetime.now() - timedelta(days=days)).isoformat()
-            
-            with sqlite3.connect(self.db_path) as conn:
-                # Remove notas antigas
-                cursor = conn.execute(
-                    "DELETE FROM notas_detalhadas WHERE criado_em < ?",
-                    (cutoff_date,)
-                )
-                removed_count += cursor.rowcount
-                
-                # Remove XMLs baixados antigos
-                cursor = conn.execute(
-                    "DELETE FROM xmls_baixados WHERE baixado_em < ?",
-                    (cutoff_date,)
-                )
-                removed_count += cursor.rowcount
-                
-                conn.commit()
-                logger.info(f"Removidos {removed_count} registros antigos (>{days} dias)")
-                
-        except Exception as e:
-            logger.error(f"Erro ao limpar dados antigos: {e}")
-        
-        return removed_count
+                return int(row[0]) if row else 65
+        except Exception:
+            return 65

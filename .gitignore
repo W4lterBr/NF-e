@@ -1,36 +1,73 @@
-# Python
+# Build artifacts - IMPORTANTE: Não versionar executáveis
+dist/
+build/
+Output/
+*.spec.backup
+
+# Python bytecode
 __pycache__/
 *.py[cod]
+*$py.class
+*.so
+.Python
 *.pyo
 *.pyd
 *.egg-info/
 .pytest_cache/
 
-# Virtual env
-.venv/
+# Virtual environments
 venv/
+.venv/
 env/
+ENV/
 
-# VS Code
-.vscode/
-
-# Databases / local artifacts
+# Database files (dados locais do usuário)
 *.db
+*.db-journal
 *.sqlite
 *.sqlite3
 
-# Local XML caches (contêm dados sensíveis)
+# Log files
+logs/
+*.log
+
+# XML data directories (contêm dados sensíveis dos usuários)
 xmls/
 xmls_chave/
 xmls_nfce/
-xml_NFs/
 xml_envio/
-xml_resposta_sefaz/
 xml_extraidos/
+xml_NFs/
+xml_resposta_sefaz/
 consChNFe.xml
 consNSU.xml
 distNSU.xml
 
+# Certificates (dados sensíveis - NÃO versionar)
+*.pfx
+*.p12
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
 # OS
+.DS_Store
 Thumbs.db
-*.DS_Store
+desktop.ini
+
+# Temporary files
+temp/
+tmp/
+*.tmp
+*.bak
+
+# Jupyter Notebooks
+.ipynb_checkpoints/
+*.ipynb
+
+# Backup files
+backups/

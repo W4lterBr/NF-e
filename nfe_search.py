@@ -6,43 +6,87 @@ import base64
 import logging
 import sqlite3
 import time
+import warnings
 from pathlib import Path
-from datetime import datetime, timedelta
-from collections import defaultdict
+from datetime import datetime
+
+# Suprime avisos de SSL não verificado
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # Bibliotecas de terceiros
 import requests
 import requests_pkcs12
 from requests.exceptions import RequestException
-from zeep import Client, Settings
+from zeep import Client
 from zeep.transports import Transport
 from zeep.exceptions import Fault
-from zeep.wsdl.utils import etree_to_string
-from zeep.plugins import Plugin
 from lxml import etree
 
-# Módulos locais
-try:
-    from modules.download_completo import create_complete_downloader
-except ImportError:
-    create_complete_downloader = None
 # -------------------------------------------------------------------
 # Configuração de logs
 # -------------------------------------------------------------------
 def setup_logger():
+    """Configura logger com saída para console e arquivo na pasta logs."""
+    BASE_DIR = Path(__file__).parent
+    LOGS_DIR = BASE_DIR / "logs"
+    
+    # Cria pasta de logs se não existir
+    LOGS_DIR.mkdir(exist_ok=True)
+    
+    # Nome do arquivo de log com data
+    log_filename = LOGS_DIR / f"busca_nfe_{datetime.now().strftime('%Y-%m-%d')}.log"
+    
+    # Remove log anterior se existir
+    if log_filename.exists():
+        try:
+            log_filename.unlink()
+        except Exception:
+            pass  # Se não conseguir deletar, continua
+    
     logger = logging.getLogger(__name__)
+    
     if not logger.hasHandlers():
-        handler = logging.StreamHandler()
-        formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
-        handler.setFormatter(formatter)
-        logger.addHandler(handler)
+        # Handler para arquivo
+        file_handler = logging.FileHandler(log_filename, encoding='utf-8')
+        file_handler.setLevel(logging.DEBUG)
+        file_formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+        file_handler.setFormatter(file_formatter)
+        
+        # Handler para console
+        console_handler = logging.StreamHandler()
+        console_handler.setLevel(logging.INFO)
+        console_formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+        console_handler.setFormatter(console_formatter)
+        
+        logger.addHandler(file_handler)
+        logger.addHandler(console_handler)
+    
     logger.setLevel(logging.DEBUG)
     return logger
 
 logger = setup_logger()
 logger.debug("Iniciando nfe_search.py")
 
-BASE = Path(__file__).parent
+def get_data_dir():
+    """Retorna o diretório de dados do aplicativo."""
+    import sys
+    import os
+    
+    # Se estiver executando como executável PyInstaller
+    if getattr(sys, 'frozen', False):
+        # Usa AppData do usuário
+        app_data = Path(os.environ.get('APPDATA', Path.home()))
+        data_dir = app_data / "BOT Busca NFE"
+    else:
+        # Desenvolvimento: usa pasta local
+        data_dir = Path(__file__).parent
+    
+    # Garante que o diretório existe
+    data_dir.mkdir(parents=True, exist_ok=True)
+    return data_dir
+
+BASE = get_data_dir()
 # -------------------------------------------------------------------
 # Fluxo NSU
 # -------------------------------------------------------------------
@@ -53,22 +97,53 @@ def ciclo_nsu(db, parser, intervalo=3600):
     Se ocorrer erro de conexão ou indisponibilidade da SEFAZ/internet,
     registra no log, aguarda alguns minutos e tenta novamente sem encerrar o processo.
     
-    NOVA FUNCIONALIDADE: Detecta resumos (resNFe) e baixa automaticamente XMLs completos
+    Implementa:
+    - NSU = 0 automático para primeira consulta
+    - Retry exponencial (5s → 15s → 60s → 5min)
+    - Modo investigação após 5 falhas consecutivas
+    - Detecção de estado offline
     """
-    XML_DIR = Path("xmls")
+    BASE_DIR = Path(__file__).parent
+    XML_DIR = BASE_DIR / "xmls"
+    INTERVALO_CONSUMO_INDEVIDO = 3900  # 65 minutos (1h5min)
+    
+    # Controle de retry exponencial
+    RETRY_DELAYS = [5, 15, 60, 300]  # 5s, 15s, 60s, 5min
+    MAX_FALHAS_INVESTIGACAO = 5
+    
+    # Estado global
+    estado_offline = False
+    falhas_consecutivas = {}
+    
     while True:
         try:
             logger.info(f"Iniciando busca periódica de NSU em {datetime.now().isoformat()}")
-            for cnpj, path, senha, inf, cuf in db.get_certificados():
+            certificados = db.get_certificados()
+            total_certs = len(certificados)
+            
+            for idx, (cnpj, path, senha, inf, cuf) in enumerate(certificados, 1):
+                consumo_indevido = False  # Inicializa ANTES do try
+                
                 try:
-                    svc = NFeService(path, senha, cnpj, cuf)
+                    logger.info(f"[{idx}/{total_certs}] Processando certificado {inf} (CNPJ: {cnpj})")
+                    
+                    # Verifica se pode consultar (erro 656 recente?)
                     ult_nsu = db.get_last_nsu(inf)
+                    if not db.pode_consultar_certificado(inf, ult_nsu):
+                        logger.info(f"Pulando {inf} - aguardando cooldown erro 656")
+                        continue
+                    
+                    # ✅ NSU = 0 AUTOMÁTICO: Detecta primeira consulta
+                    if ult_nsu == "000000000000000":
+                        logger.info(f"🔍 [{inf}] PRIMEIRA CONSULTA DETECTADA - Iniciando varredura completa (NSU=0)")
+                        db.marcar_primeira_consulta(inf)
+                    
+                    svc = NFeService(path, senha, cnpj, cuf)
                     logger.debug(f"Buscando notas a partir do NSU {ult_nsu} para {inf}")
                     
-                    # Cria downloader de XMLs completos se disponível
-                    complete_downloader = None
-                    if create_complete_downloader:
-                        complete_downloader = create_complete_downloader(svc, parser, db)
+                    # Inicializa contador de falhas para este certificado
+                    if inf not in falhas_consecutivas:
+                        falhas_consecutivas[inf] = 0
                     
                     while True:
                         try:
@@ -76,13 +151,25 @@ def ciclo_nsu(db, parser, intervalo=3600):
                             if not resp:
                                 logger.warning(f"Falha ao buscar NSU para {inf}")
                                 break
+                            
                             cStat = parser.extract_cStat(resp)
+                            
+                            # ✅ NSU = 0: Mostra maxNSU na primeira consulta
+                            if ult_nsu == "000000000000000":
+                                max_nsu = parser.extract_max_nsu(resp)
+                                if max_nsu and max_nsu != "000000000000000":
+                                    logger.info(f"📊 [{inf}] Total documentos disponíveis: {int(max_nsu)} (varredura completa)")
+                            
                             if cStat == '656':  # Consumo indevido, bloqueio temporário
                                 ult = parser.extract_last_nsu(resp)
                                 if ult and ult != ult_nsu:
                                     db.set_last_nsu(inf, ult)
                                     logger.info(f"NSU atualizado após consumo indevido para {inf}: {ult}")
-                                logger.warning(f"Consumo indevido, aguardando desbloqueio para {inf}")
+                                
+                                # Registra erro 656 para bloquear tentativas por 65 minutos
+                                db.registrar_erro_656(inf, ult_nsu)
+                                logger.warning(f"Consumo indevido para {inf}, bloqueado por 65 minutos")
+                                consumo_indevido = True
                                 break
 
                             docs = parser.extract_docs(resp)
@@ -91,109 +178,128 @@ def ciclo_nsu(db, parser, intervalo=3600):
                                 break
                             for nsu, xml in docs:
                                 try:
-                                    # ========================================
-                                    # NOVA FUNCIONALIDADE: Download XML Completo
-                                    # Suporta: NFe, CTe e NFS-e
-                                    # ========================================
-                                    xml_final = xml  # Por padrão usa o XML original
+                                    # Detecta tipo de documento
+                                    tipo = detectar_tipo_documento(xml)
                                     
-                                    if complete_downloader and complete_downloader.should_download_complete(xml):
-                                        doc_type = complete_downloader.get_document_type(xml)
-                                        logger.info(f"Detectado resumo {doc_type.upper()} no NSU {nsu} - tentando baixar XML completo")
-                                        xml_completo = complete_downloader.process_resumo_and_download_complete(xml, nsu, inf)
-                                        if xml_completo:
-                                            xml_final = xml_completo
-                                            logger.info(f"✅ XML completo {doc_type.upper()} baixado com sucesso para NSU {nsu}")
-                                        else:
-                                            logger.warning(f"⚠️  Não foi possível baixar XML completo {doc_type.upper()} para NSU {nsu}, usando resumo")
+                                    # Valida com schema apropriado (pula validação por enquanto para CT-e)
+                                    if tipo == 'NFe':
+                                        validar_xml_auto(xml, 'leiauteNFe_v4.00.xsd')
+                                    # CT-e não valida por enquanto (pode adicionar schema depois)
                                     
-                                    # Processa baseado no tipo de documento
-                                    detected = None
-                                    if complete_downloader:
-                                        try:
-                                            detected = complete_downloader.get_document_type(xml_final)
-                                        except Exception:
-                                            detected = None
-                                    doc_type = detected or (parser.detect_doc_type(xml_final) if parser else 'nfe')
-                                    doc_type_norm = (doc_type or '').lower()
+                                    tree = etree.fromstring(xml.encode('utf-8'))
                                     
-                                    if doc_type_norm == 'nfe':
-                                        # Processa NFe
-                                        validar_xml_auto(xml_final, 'leiauteNFe_v4.00.xsd')
-                                        tree = etree.fromstring(xml_final.encode('utf-8'))
-                                        infnfe = tree.find('.//{http://www.portalfiscal.inf.br/nfe}infNFe')
-                                        if infnfe is None:
-                                            continue
-                                        chave = infnfe.attrib.get('Id','')[-44:]
-                                        db.registrar_xml(chave, cnpj)
+                                    # Detecta tipo pela tag raiz para determinar status
+                                    root_tag = tree.tag.split('}')[-1] if '}' in tree.tag else tree.tag
                                     
-                                    elif doc_type_norm == 'cte':
-                                        # Processa CTe (validação tolerante, pois XSD pode não estar disponível)
-                                        try:
-                                            validar_xml_auto(xml_final, 'leiauteCTe_v3.00.xsd')
-                                        except Exception:
-                                            logger.debug("CT-e não validou no XSD; prosseguindo")
-                                        tree = etree.fromstring(xml_final.encode('utf-8'))
-                                        infcte = tree.find('.//{http://www.portalfiscal.inf.br/cte}infCte')
-                                        if infcte is None:
-                                            continue
-                                        chave = infcte.attrib.get('Id','')[-44:]
-                                        db.registrar_xml(chave, cnpj)
-                                        
-                                    elif doc_type_norm == 'nfse':
-                                        # Processa NFS-e (tolerante)
-                                        try:
-                                            validar_xml_auto(xml_final, 'leiauteNFSe_v1.00.xsd')
-                                        except Exception:
-                                            logger.debug("NFS-e não validou no XSD; prosseguindo")
-                                        tree = etree.fromstring(xml_final.encode('utf-8'))
-                                        numero_elem = tree.find('.//{http://www.abrasf.org.br/nfse.xsd}Numero')
-                                        numero = numero_elem.text if numero_elem is not None else ''
-                                        chave = f"NFSE_{numero}" if numero else f"NFSE_{nsu}"
-                                        db.registrar_xml(chave, cnpj)
-                                        # Salva detalhamento mínimo para NFS-e
-                                        db.criar_tabela_detalhada()
-                                        nota_nfse = extrair_detalhe_nfse(xml_final, nsu)
-                                        if nota_nfse:
-                                            nota_nfse['xml_status'] = 'COMPLETO'
-                                            nota_nfse['informante'] = inf
-                                            nota_nfse['nsu'] = nsu
-                                            db.salvar_nota_detalhada(nota_nfse)
-                                    
+                                    # Determina se é documento completo ou resumo/evento
+                                    if root_tag in ['nfeProc', 'cteProc', 'NFe', 'CTe']:
+                                        xml_status = 'COMPLETO'
+                                    elif root_tag == 'resNFe':
+                                        xml_status = 'RESUMO'
+                                    elif root_tag in ['resEvento', 'procEventoNFe', 'evento']:
+                                        xml_status = 'EVENTO'
                                     else:
-                                        # Documento tipo desconhecido, tenta processar como NFe
-                                        validar_xml_auto(xml_final, 'leiauteNFe_v4.00.xsd')
-                                        tree = etree.fromstring(xml_final.encode('utf-8'))
-                                        infnfe = tree.find('.//{http://www.portalfiscal.inf.br/nfe}infNFe')
-                                        if infnfe is None:
-                                            continue
-                                        chave = infnfe.attrib.get('Id','')[-44:]
-                                        db.registrar_xml(chave, cnpj)
+                                        xml_status = 'RESUMO'  # Padrão para desconhecidos
                                     
-                                    # Salva o XML final em disco (completo se conseguiu baixar)
-                                    salvar_xml_por_certificado(xml_final, cnpj)
-                                    # Salva nota detalhada (NFe e CTe)
-                                    if doc_type_norm == 'nfe':
-                                        db.criar_tabela_detalhada()
-                                        nota = extrair_nota_detalhada(xml_final, parser, db, chave)
-                                        db.salvar_nota_detalhada(nota)
-                                    elif doc_type_norm == 'cte':
-                                        db.criar_tabela_detalhada()
-                                        nota_cte = extrair_detalhe_cte(xml_final, chave)
-                                        db.salvar_nota_detalhada(nota_cte)
+                                    # Extrai chave baseado no tipo
+                                    chave = None
+                                    if tipo == 'NFe':
+                                        infnfe = tree.find('.//{http://www.portalfiscal.inf.br/nfe}infNFe')
+                                        if infnfe is not None:
+                                            chave = infnfe.attrib.get('Id','')[-44:]
+                                    elif tipo == 'CTe':
+                                        infcte = tree.find('.//{http://www.portalfiscal.inf.br/cte}infCte')
+                                        if infcte is not None:
+                                            chave = infcte.attrib.get('Id','')[-44:]
+                                    
+                                    # Para resumos e eventos, tenta extrair chave de outro local
+                                    if not chave:
+                                        ns = '{http://www.portalfiscal.inf.br/nfe}'
+                                        chNFe_elem = tree.find(f'.//{ns}chNFe')
+                                        if chNFe_elem is not None and chNFe_elem.text:
+                                            chave = chNFe_elem.text.strip()
+                                    
+                                    if not chave:
+                                        continue
+                                    
+                                    db.registrar_xml(chave, cnpj)
+                                    
+                                    # Extrai e grava status diretamente do XML
+                                    cStat, xMotivo = parser.extract_status_from_xml(xml)
+                                    if cStat and xMotivo:
+                                        db.set_nf_status(chave, cStat, xMotivo)
+                                        logger.debug(f"Status gravado para {chave}: {cStat} - {xMotivo}")
+                                    
+                                    # Salva o XML em disco
+                                    salvar_xml_por_certificado(xml, cnpj)
+                                    # Salva nota detalhada
+                                    db.criar_tabela_detalhada()
+                                    nota = extrair_nota_detalhada(xml, parser, db, chave, inf)
+                                    nota['informante'] = inf  # Adiciona informante (redundância para garantir)
+                                    nota['xml_status'] = xml_status  # Marca corretamente: COMPLETO, RESUMO ou EVENTO
+                                    db.salvar_nota_detalhada(nota)
+                                    
+                                    # Se for evento, atualiza o status da nota original
+                                    if xml_status == 'EVENTO':
+                                        processar_evento_status(xml, chave, db)
                                 except Exception:
                                     logger.exception("Erro ao processar docZip")
+                            
+                            # SEMPRE sincroniza com ultNSU da SEFAZ (mesmo que não tenha mudado)
                             ult = parser.extract_last_nsu(resp)
-                            if ult and ult != ult_nsu:
-                                db.set_last_nsu(inf, ult)
-                                ult_nsu = ult
+                            if ult:
+                                # ✅ Reset contador de falhas após sucesso
+                                if inf in falhas_consecutivas:
+                                    falhas_consecutivas[inf] = 0
+                                
+                                # ✅ Marca estado como online
+                                if estado_offline:
+                                    logger.info(f"✅ RECONECTADO: Internet/SEFAZ online novamente")
+                                    estado_offline = False
+                                
+                                if ult != ult_nsu:
+                                    # NSU avançou - registra e continua buscando
+                                    db.set_last_nsu(inf, ult)
+                                    logger.info(f"NSU avançou para {inf}: {ult_nsu} → {ult}")
+                                    ult_nsu = ult
+                                else:
+                                    # NSU não mudou - sincroniza mesmo assim e encerra busca
+                                    db.set_last_nsu(inf, ult)
+                                    logger.debug(f"NSU sincronizado (sem mudança) para {inf}: {ult}")
+                                    break
                             else:
+                                # SEFAZ não retornou ultNSU - situação anormal
+                                logger.warning(f"SEFAZ não retornou ultNSU para {inf}")
                                 break
                         except (requests.exceptions.RequestException, Fault, OSError) as e:
-                            logger.warning(f"Erro de rede/SEFAZ para {inf}: {e}")
-                            logger.info("Aguardando 3 minutos antes de tentar novamente este certificado...")
-                            time.sleep(180)  # aguarda 3 minutos e tenta de novo o mesmo certificado
+                            # ✅ RETRY EXPONENCIAL ESTRUTURADO
+                            falhas_consecutivas[inf] = falhas_consecutivas.get(inf, 0) + 1
+                            falha_num = falhas_consecutivas[inf]
+                            
+                            # Detecta se é problema de rede (offline)
+                            if isinstance(e, (requests.exceptions.ConnectionError, OSError)):
+                                estado_offline = True
+                                logger.error(f"🔴 OFFLINE: Sem conexão com internet/SEFAZ para {inf}")
+                            
+                            logger.warning(f"⚠️ Falha #{falha_num} para {inf}: {e}")
+                            
+                            # MODO INVESTIGAÇÃO: Após 5 falhas consecutivas
+                            if falha_num >= MAX_FALHAS_INVESTIGACAO:
+                                logger.critical(f"🔍 MODO INVESTIGAÇÃO ATIVADO para {inf} (5+ falhas consecutivas)")
+                                logger.info(f"   → Revalidando certificado: {path}")
+                                logger.info(f"   → Testando conectividade SEFAZ cUF={cuf}")
+                                logger.info(f"   → Pausando consultas por 10 minutos")
+                                time.sleep(600)  # 10 minutos de pausa
+                                falhas_consecutivas[inf] = 0  # Reset contador
+                                continue
+                            
+                            # Retry exponencial
+                            delay_idx = min(falha_num - 1, len(RETRY_DELAYS) - 1)
+                            delay = RETRY_DELAYS[delay_idx]
+                            logger.info(f"⏳ Retry exponencial: aguardando {delay}s antes de tentar novamente...")
+                            time.sleep(delay)
                             continue  # volta para o while interno
+                        
                 except Exception as e:
                     logger.exception(f"Erro inesperado ao processar certificado {inf}: {e}")
                     continue  # vai para o próximo certificado
@@ -205,7 +311,13 @@ def ciclo_nsu(db, parser, intervalo=3600):
                     xml_txt = xml_file.read_text(encoding="utf-8")
                     chave = extrair_chave_nfe(xml_txt)
                     if chave:
-                        nota = extrair_nota_detalhada(xml_txt, parser, db, chave)
+                        # Extrai e atualiza status do XML
+                        cStat, xMotivo = parser.extract_status_from_xml(xml_txt)
+                        if cStat and xMotivo:
+                            db.set_nf_status(chave, cStat, xMotivo)
+                        
+                        nota = extrair_nota_detalhada(xml_txt, parser, db, chave, inf)
+                        nota['informante'] = inf  # Garantir informante
                         db.salvar_nota_detalhada(nota)
                 except Exception as e:
                     logger.warning(f"Falha ao extrair/atualizar nota detalhada de {xml_file}: {e}")
@@ -220,18 +332,171 @@ def ciclo_nsu(db, parser, intervalo=3600):
             time.sleep(300)  # espera 5 minutos antes de recomeçar o ciclo externo
 
 # Função utilitária para extrair chave (44 dígitos) do XML
-def extrair_chave_nfe(xml_txt):
+def detectar_tipo_documento(xml_txt):
+    """
+    Detecta o tipo de documento fiscal no XML.
+    Retorna: 'NFe', 'CTe' ou None
+    """
     try:
         tree = etree.fromstring(xml_txt.encode("utf-8"))
+        # Verifica NF-e
+        infnfe = tree.find('.//{http://www.portalfiscal.inf.br/nfe}infNFe')
+        if infnfe is not None:
+            return 'NFe'
+        # Verifica CT-e
+        infcte = tree.find('.//{http://www.portalfiscal.inf.br/cte}infCte')
+        if infcte is not None:
+            return 'CTe'
+        return None
+    except Exception:
+        return None
+
+def extrair_chave_nfe(xml_txt):
+    """Extrai chave de acesso de NF-e ou CT-e."""
+    try:
+        tree = etree.fromstring(xml_txt.encode("utf-8"))
+        # Tenta NF-e
         infnfe = tree.find('.//{http://www.portalfiscal.inf.br/nfe}infNFe')
         if infnfe is not None:
             return infnfe.attrib.get('Id', '')[-44:]
+        # Tenta CT-e
+        infcte = tree.find('.//{http://www.portalfiscal.inf.br/cte}infCte')
+        if infcte is not None:
+            return infcte.attrib.get('Id', '')[-44:]
         return None
     except Exception:
         return None
 
 # Função para montar o dict da nota detalhada a partir do XML
-def extrair_nota_detalhada(xml_txt, parser, db, chave):
+def extrair_cte_detalhado(xml_txt, parser, db, chave, informante=None):
+    """Extrai informações detalhadas de um CT-e."""
+    try:
+        tree = etree.fromstring(xml_txt.encode('utf-8'))
+        inf = tree.find('.//{http://www.portalfiscal.inf.br/cte}infCte')
+        ide = inf.find('{http://www.portalfiscal.inf.br/cte}ide') if inf is not None else None
+        emit = inf.find('{http://www.portalfiscal.inf.br/cte}emit') if inf is not None else None
+        dest = inf.find('{http://www.portalfiscal.inf.br/cte}dest') if inf is not None else None
+        rem = inf.find('{http://www.portalfiscal.inf.br/cte}rem') if inf is not None else None
+        vPrest = tree.find('.//{http://www.portalfiscal.inf.br/cte}vPrest')
+        
+        # Valor do CT-e
+        valor = ""
+        if vPrest is not None:
+            vTPrest = vPrest.findtext('{http://www.portalfiscal.inf.br/cte}vTPrest')
+            valor = f"R$ {float(vTPrest):,.2f}".replace(',', 'X').replace('.', ',').replace('X', '.') if vTPrest else ""
+        
+        # CFOP do CT-e
+        cfop = ide.findtext('{http://www.portalfiscal.inf.br/cte}CFOP') if ide is not None else ""
+        
+        # Busca status no banco
+        status_db = db.get_nf_status(chave)
+        if status_db and status_db[0] and status_db[1]:
+            status_str = f"{status_db[0]} – {status_db[1]}"
+        else:
+            status_str = "Autorizado o uso do CT-e"
+        
+        # CNPJ do destinatário ou remetente
+        cnpj_destinatario = ""
+        if dest is not None:
+            cnpj_destinatario = dest.findtext('{http://www.portalfiscal.inf.br/cte}CNPJ', "")
+        elif rem is not None:
+            cnpj_destinatario = rem.findtext('{http://www.portalfiscal.inf.br/cte}CNPJ', "")
+        
+        return {
+            "chave": chave or "",
+            "ie_tomador": dest.findtext('{http://www.portalfiscal.inf.br/cte}IE') if dest is not None else "",
+            "nome_emitente": emit.findtext('{http://www.portalfiscal.inf.br/cte}xNome') if emit is not None else "",
+            "cnpj_emitente": emit.findtext('{http://www.portalfiscal.inf.br/cte}CNPJ') if emit is not None else "",
+            "numero": ide.findtext('{http://www.portalfiscal.inf.br/cte}nCT') if ide is not None else "",
+            "data_emissao": (ide.findtext('{http://www.portalfiscal.inf.br/cte}dhEmi')[:10]
+                            if ide is not None and ide.findtext('{http://www.portalfiscal.inf.br/cte}dhEmi')
+                            else ""),
+            "tipo": "CTe",
+            "valor": valor,
+            "cfop": cfop,
+            "vencimento": "",  # CT-e geralmente não tem vencimento
+            "uf": ide.findtext('{http://www.portalfiscal.inf.br/cte}cUF') if ide is not None else "",
+            "natureza": ide.findtext('{http://www.portalfiscal.inf.br/cte}natOp') if ide is not None else "",
+            "status": status_str,
+            "atualizado_em": datetime.now().isoformat(),
+            "cnpj_destinatario": cnpj_destinatario,
+            "xml_status": "COMPLETO",
+            "informante": str(informante or "")
+        }
+    except Exception as e:
+        logger.warning(f"Erro ao extrair CT-e detalhado: {e}")
+        return {
+            "chave": chave or "",
+            "ie_tomador": "",
+            "nome_emitente": "",
+            "cnpj_emitente": "",
+            "numero": "",
+            "data_emissao": "",
+            "tipo": "CTe",
+            "valor": "",
+            "cfop": "",
+            "vencimento": "",
+            "uf": "",
+            "natureza": "",
+            "status": "Autorizado o uso do CT-e",
+            "atualizado_em": datetime.now().isoformat(),
+            "cnpj_destinatario": "",
+            "xml_status": "COMPLETO",
+            "informante": str(informante or "")
+        }
+
+def processar_evento_status(xml_txt, chave_evento, db):
+    """
+    Processa eventos (cancelamento, carta correção) e atualiza o status da nota original.
+    """
+    try:
+        from lxml import etree
+        
+        root = etree.fromstring(xml_txt.encode('utf-8') if isinstance(xml_txt, str) else xml_txt)
+        ns = '{http://www.portalfiscal.inf.br/nfe}'
+        
+        # Extrai chave da nota referenciada
+        chNFe = root.findtext(f'.//{ns}chNFe')
+        if not chNFe or len(chNFe) != 44:
+            return
+        
+        # Extrai tipo de evento
+        tpEvento = root.findtext(f'.//{ns}tpEvento')
+        
+        # Extrai status do evento
+        cStat = root.findtext(f'.//{ns}cStat')
+        xMotivo = root.findtext(f'.//{ns}xMotivo')
+        
+        # Mapeia eventos para status
+        if tpEvento == '110111' and cStat == '135':  # Cancelamento autorizado
+            novo_status = "Cancelamento de NF-e homologado"
+            db.atualizar_status_por_evento(chNFe, novo_status)
+            logger.info(f"Status atualizado: {chNFe} → {novo_status}")
+        
+        elif tpEvento == '110110' and cStat == '135':  # Carta de correção
+            novo_status = "Carta de Correção registrada"
+            db.atualizar_status_por_evento(chNFe, novo_status)
+            logger.info(f"Status atualizado: {chNFe} → {novo_status}")
+        
+        # Eventos de manifestação (210200-210240) não alteram status principal
+        
+    except Exception as e:
+        logger.debug(f"Erro ao processar evento de status: {e}")
+
+def extrair_nota_detalhada(xml_txt, parser, db, chave, informante=None):
+    """Extrai informações detalhadas de NF-e ou CT-e automaticamente."""
+    tipo = detectar_tipo_documento(xml_txt)
+    
+    if tipo == 'CTe':
+        return extrair_cte_detalhado(xml_txt, parser, db, chave, informante)
+    elif tipo == 'NFe':
+        return extrair_nfe_detalhado(xml_txt, parser, db, chave, informante)
+    else:
+        # Tipo desconhecido, tenta NF-e como padrão
+        return extrair_nfe_detalhado(xml_txt, parser, db, chave, informante)
+
+def extrair_nfe_detalhado(xml_txt, parser, db, chave, informante=None):
+    """Extrai informações detalhadas de uma NF-e."""
     try:
         tree = etree.fromstring(xml_txt.encode('utf-8'))
         inf = tree.find('.//{http://www.portalfiscal.inf.br/nfe}infNFe')
@@ -241,12 +506,16 @@ def extrair_nota_detalhada(xml_txt, parser, db, chave):
         tot = tree.find('.//{http://www.portalfiscal.inf.br/nfe}ICMSTot')
 
         cfop = ""
+        ncm = ""
         if inf is not None:
             for det in inf.findall('{http://www.portalfiscal.inf.br/nfe}det'):
                 prod = det.find('{http://www.portalfiscal.inf.br/nfe}prod')
                 if prod is not None:
-                    cfop = prod.findtext('{http://www.portalfiscal.inf.br/nfe}CFOP') or ""
-                    if cfop:
+                    if not cfop:
+                        cfop = prod.findtext('{http://www.portalfiscal.inf.br/nfe}CFOP') or ""
+                    if not ncm:
+                        ncm = prod.findtext('{http://www.portalfiscal.inf.br/nfe}NCM') or ""
+                    if cfop and ncm:
                         break
 
         vencimento = ""
@@ -258,9 +527,17 @@ def extrair_nota_detalhada(xml_txt, parser, db, chave):
                     vencimento = dup.findtext('{http://www.portalfiscal.inf.br/nfe}dVenc', "")
 
         valor = ""
+        base_icms = ""
+        valor_icms = ""
         if tot is not None:
             vnf = tot.findtext('{http://www.portalfiscal.inf.br/nfe}vNF')
             valor = f"R$ {float(vnf):,.2f}".replace(',', 'X').replace('.', ',').replace('X', '.') if vnf else ""
+            
+            vBC = tot.findtext('{http://www.portalfiscal.inf.br/nfe}vBC')
+            base_icms = f"R$ {float(vBC):,.2f}".replace(',', 'X').replace('.', ',').replace('X', '.') if vBC else ""
+            
+            vICMS = tot.findtext('{http://www.portalfiscal.inf.br/nfe}vICMS')
+            valor_icms = f"R$ {float(vICMS):,.2f}".replace(',', 'X').replace('.', ',').replace('X', '.') if vICMS else ""
 
         # Busca status no banco (pode ser None)
         status_db = db.get_nf_status(chave)
@@ -285,14 +562,19 @@ def extrair_nota_detalhada(xml_txt, parser, db, chave):
             "valor": valor,
             "cfop": cfop,
             "vencimento": vencimento,
+            "ncm": ncm,
             "uf": ide.findtext('{http://www.portalfiscal.inf.br/nfe}cUF') if ide is not None else "",
             "natureza": ide.findtext('{http://www.portalfiscal.inf.br/nfe}natOp') if ide is not None else "",
+            "base_icms": base_icms,
+            "valor_icms": valor_icms,
             "status": status_str,
             "atualizado_em": datetime.now().isoformat(),
-            "cnpj_destinatario": cnpj_destinatario
+            "cnpj_destinatario": cnpj_destinatario,
+            "xml_status": "COMPLETO",
+            "informante": str(informante or "")
         }
     except Exception as e:
-        logger.warning(f"Erro ao extrair dados da NF-e: {e}")
+        logger.warning(f"Erro ao extrair nota detalhada: {e}")
         return {
             "chave": chave or "",
             "ie_tomador": "",
@@ -304,121 +586,17 @@ def extrair_nota_detalhada(xml_txt, parser, db, chave):
             "valor": "",
             "cfop": "",
             "vencimento": "",
+            "ncm": "",
             "uf": "",
             "natureza": "",
+            "base_icms": "",
+            "valor_icms": "",
             "status": "Autorizado o uso da NF-e",
             "atualizado_em": datetime.now().isoformat(),
-            "cnpj_destinatario": ""
+            "cnpj_destinatario": "",
+            "xml_status": "COMPLETO",
+            "informante": str(informante or "")
         }
-# -------------------------------------------------------------------
-def extrair_detalhe_nfse(xml_txt, nsu: str | None = None):
-    """Extrai campos principais da NFS-e (padrão ABRASF) para a tabela 'notas_detalhadas'.
-    Usa namespace http://www.abrasf.org.br/nfse.xsd. Chave gerada como 'NFSE_<Numero>'.
-    """
-    try:
-        ns = '{http://www.abrasf.org.br/nfse.xsd}'
-        tree = etree.fromstring(xml_txt.encode('utf-8')) if isinstance(xml_txt, str) else xml_txt
-
-        numero = tree.findtext(f'.//{ns}Numero') or ''
-        data_emissao = tree.findtext(f'.//{ns}DataEmissao') or ''
-        razao = tree.findtext(f'.//{ns}RazaoSocial') or ''
-        # Alguns layouts usam PrestadorServico/IdentificacaoPrestador
-        if not razao:
-            razao = tree.findtext(f'.//{ns}PrestadorServico//{ns}RazaoSocial') or ''
-
-        cnpj_emit = tree.findtext(f'.//{ns}Cnpj') or ''
-        if not cnpj_emit:
-            cnpj_emit = tree.findtext(f'.//{ns}Prestador//{ns}Cnpj') or ''
-
-        valor_serv = tree.findtext(f'.//{ns}ValorServicos') or ''
-        valor = f"R$ {float(valor_serv):,.2f}".replace(',', 'X').replace('.', ',').replace('X', '.') if valor_serv else ''
-
-        chave = f"NFSE_{numero}" if numero else (f"NFSE_{nsu}" if nsu else "NFSE")
-
-        return {
-            'chave': chave,
-            'ie_tomador': '',
-            'nome_emitente': razao,
-            'cnpj_emitente': cnpj_emit,
-            'numero': numero,
-            'data_emissao': data_emissao[:10] if data_emissao else '',
-            'tipo': 'NFS-e',
-            'valor': valor,
-            'cfop': '',
-            'vencimento': '',
-            'uf': '',
-            'natureza': '',
-            'status': 'Autorizado',
-            'atualizado_em': datetime.now().isoformat(),
-            'cnpj_destinatario': ''
-        }
-    except Exception as e:
-        logger.warning(f"Erro ao extrair dados da NFS-e: {e}")
-        return None
-# Função para montar o dict do CT-e a partir do XML (mínimo viável)
-def extrair_detalhe_cte(xml_txt, chave: str):
-    """Extrai campos principais do CT-e para a tabela 'notas_detalhadas'.
-    Campos considerados: chave, numero (nCT), data_emissao (dhEmi), emitente (CNPJ/xNome),
-    valor (vTPrest), tipo='CTe', uf (cUF), status padrão, atualizado_em.
-    """
-    try:
-        ns = '{http://www.portalfiscal.inf.br/cte}'
-        tree = etree.fromstring(xml_txt.encode('utf-8')) if isinstance(xml_txt, str) else xml_txt
-
-        # Aceita root em CTe ou procCTe
-        ide = tree.find(f'.//{ns}ide')
-        emit = tree.find(f'.//{ns}emit')
-        vprest = tree.find(f'.//{ns}vPrest')
-
-        numero = ide.findtext(f'{ns}nCT') if ide is not None else ''
-        dhEmi = ide.findtext(f'{ns}dhEmi') if ide is not None else ''
-        cUF = ide.findtext(f'{ns}cUF') if ide is not None else ''
-        xNome = emit.findtext(f'{ns}xNome') if emit is not None else ''
-        cnpj_emit = emit.findtext(f'{ns}CNPJ') if emit is not None else ''
-
-        # Valor total: vTPrest
-        vTPrest = ''
-        if vprest is not None:
-            vTPrest = vprest.findtext(f'{ns}vTPrest') or ''
-        valor = f"R$ {float(vTPrest):,.2f}".replace(',', 'X').replace('.', ',').replace('X', '.') if vTPrest else ''
-
-        return {
-            'chave': chave or '',
-            'ie_tomador': '',
-            'nome_emitente': xNome,
-            'cnpj_emitente': cnpj_emit,
-            'numero': numero,
-            'data_emissao': dhEmi[:10] if dhEmi else '',
-            'tipo': 'CTe',
-            'valor': valor,
-            'cfop': '',
-            'vencimento': '',
-            'uf': cUF or '',
-            'natureza': '',
-            'status': 'Autorizado',
-            'atualizado_em': datetime.now().isoformat(),
-            'cnpj_destinatario': ''
-        }
-    except Exception as e:
-        logger.warning(f"Erro ao extrair dados do CT-e: {e}")
-        return {
-            'chave': chave or '',
-            'ie_tomador': '',
-            'nome_emitente': '',
-            'cnpj_emitente': '',
-            'numero': '',
-            'data_emissao': '',
-            'tipo': 'CTe',
-            'valor': '',
-            'cfop': '',
-            'vencimento': '',
-            'uf': '',
-            'natureza': '',
-            'status': 'Autorizado',
-            'atualizado_em': datetime.now().isoformat(),
-            'cnpj_destinatario': ''
-        }
-    
 # -------------------------------------------------------------------
 # Salvar XML na pasta
 # -------------------------------------------------------------------
@@ -438,132 +616,179 @@ def format_cnpj_cpf_dir(doc: str) -> str:
 
 def salvar_xml_por_certificado(xml, cnpj_cpf, pasta_base="xmls"):
     """
-    Salva o XML em uma pasta separada por certificado, tipo de documento e ano-mês de emissão.
-    Exemplos: 
-    - xmls/47539664000197/NFe/2025-08/00123-EMPRESA.xml
-    - xmls/47539664000197/CTe/2025-08/00456-TRANSPORTADORA.xml
-    - xmls/47539664000197/NFS-e/2025-08/00789-PRESTADOR.xml
+    Salva o XML em uma pasta separada por certificado (apenas dígitos) e ano-mês de emissão.
+    Detecta automaticamente o tipo de documento e salva na pasta apropriada.
+    
+    Tipos suportados:
+    - NFe completas (procNFe) → NFe/
+    - CTe completas (procCTe) → CTe/
+    - Resumos NFe (resNFe) → Resumos/
+    - Eventos (resEvento, procEventoNFe) → Eventos/
+    
+    Exemplo: xmls/47539664000197/2025-08/NFe/00123-EMPRESA.xml
+    Exemplo: xmls/47539664000197/2025-08/Eventos/CANC-00123-EMPRESA.xml
     """
     import os
     from lxml import etree
     import re
+    from datetime import datetime
 
     def sanitize_filename(s: str) -> str:
         """Remove caracteres inválidos para nomes de arquivos/pastas."""
         return re.sub(r'[\\/*?:"<>|]', "_", s or "").strip()
 
-    def detect_document_type(xml_root):
-        """Detecta o tipo de documento fiscal baseado na tag raiz e namespaces"""
-        root_tag = xml_root.tag
-        
-        # Remove namespace se presente
-        if '}' in root_tag:
-            namespace, tag_name = root_tag.split('}', 1)
-            namespace = namespace[1:]  # Remove o '{'
-        else:
-            tag_name = root_tag
-            namespace = ""
-        
-        # Normaliza tag para lowercase
-        tag_lower = tag_name.lower()
-        
-        # Detecta tipo baseado na tag raiz
-        if any(x in tag_lower for x in ['nfe', 'resnfe', 'procnfe']):
-            return 'NFe'
-        elif any(x in tag_lower for x in ['cte', 'rescte', 'proccte']):
-            return 'CTe'  
-        elif any(x in tag_lower for x in ['nfse', 'resnfse', 'procnfse']):
-            return 'NFS-e'
-        
-        # Detecta por namespace se tag não foi conclusiva
-        if 'nfe' in namespace:
-            return 'NFe'
-        elif 'cte' in namespace:
-            return 'CTe'
-        elif 'nfse' in namespace or 'abrasf' in namespace:
-            return 'NFS-e'
-            
-        # Default para NFe se não conseguir detectar
-        return 'NFe'
-
-    def extract_document_data(xml_root, doc_type):
-        """Extrai dados específicos baseado no tipo de documento"""
-        if doc_type == 'NFe':
-            # NFe - busca em namespace NFe
-            ide = xml_root.find('.//{http://www.portalfiscal.inf.br/nfe}ide')
-            if ide is not None:
-                dEmi = ide.findtext('{http://www.portalfiscal.inf.br/nfe}dEmi')
-                dhEmi = ide.findtext('{http://www.portalfiscal.inf.br/nfe}dhEmi')
-                nNF = ide.findtext('{http://www.portalfiscal.inf.br/nfe}nNF') or "SEM_NUMERO"
-                
-                emit = xml_root.find('.//{http://www.portalfiscal.inf.br/nfe}emit')
-                xNome = emit.findtext('{http://www.portalfiscal.inf.br/nfe}xNome') if emit is not None else "SEM_NOME"
-                
-                return dEmi or dhEmi, nNF, xNome
-                
-        elif doc_type == 'CTe':
-            # CTe - busca em namespace CTe
-            ide = xml_root.find('.//{http://www.portalfiscal.inf.br/cte}ide')
-            if ide is not None:
-                dhEmi = ide.findtext('{http://www.portalfiscal.inf.br/cte}dhEmi')
-                nCT = ide.findtext('{http://www.portalfiscal.inf.br/cte}nCT') or "SEM_NUMERO"
-                
-                emit = xml_root.find('.//{http://www.portalfiscal.inf.br/cte}emit')
-                xNome = emit.findtext('{http://www.portalfiscal.inf.br/cte}xNome') if emit is not None else "SEM_NOME"
-                
-                return dhEmi, f"CTE-{nCT}", xNome
-                
-        elif doc_type == 'NFS-e':
-            # NFS-e - busca em namespace NFS-e (padrão nacional)
-            # Tenta diferentes estruturas de NFS-e
-            numero_elem = xml_root.find('.//{http://www.abrasf.org.br/nfse.xsd}Numero')
-            data_elem = xml_root.find('.//{http://www.abrasf.org.br/nfse.xsd}DataEmissao')
-            prestador_elem = xml_root.find('.//{http://www.abrasf.org.br/nfse.xsd}RazaoSocial')
-            
-            numero = numero_elem.text if numero_elem is not None else "SEM_NUMERO"
-            data_emissao = data_elem.text if data_elem is not None else None
-            nome_prestador = prestador_elem.text if prestador_elem is not None else "SEM_NOME"
-            
-            return data_emissao, f"NFSE-{numero}", nome_prestador
-            
-        # Fallback genérico
-        return None, "SEM_NUMERO", "SEM_NOME"
-
     try:
+        # Verifica se é apenas protocolo (não salva)
+        xml_str = xml if isinstance(xml, str) else xml.decode('utf-8')
+        xml_lower = xml_str.lower()
+        
+        # Detecta se é apenas protocolo de consulta (sem dados da nota)
+        is_only_protocol = (
+            '<retconssit' in xml_lower and 
+            '<protnfe' in xml_lower and
+            '<nfeproc' not in xml_lower and
+            '<nfe' not in xml_lower.replace('nferesultmsg', '').replace('protnfe', '')
+        )
+        
+        if is_only_protocol:
+            logger.warning("XML contém apenas protocolo, não será salvo")
+            return  # Não salva protocolos sem dados
+        
         cnpj_cpf_fmt = format_cnpj_cpf_dir(cnpj_cpf)
 
-        # Parse o XML para extrair dados
+        # Parse o XML para extrair dados de organização
         root = etree.fromstring(xml.encode("utf-8") if isinstance(xml, str) else xml)
         
-        # Detecta tipo de documento
-        doc_type = detect_document_type(root)
+        # Detecta tipo de documento pela tag raiz
+        root_tag = root.tag.split('}')[-1] if '}' in root.tag else root.tag
         
-        # Extrai dados específicos do tipo
-        data_raw, numero, nome = extract_document_data(root, doc_type)
+        # Determina a pasta e tipo baseado no documento
+        if root_tag in ['nfeProc', 'NFe']:
+            tipo_pasta = "NFe"
+            tipo_doc = "NFe"
+        elif root_tag in ['cteProc', 'CTe']:
+            tipo_pasta = "CTe"
+            tipo_doc = "CTe"
+        elif root_tag == 'resNFe':
+            tipo_pasta = "Resumos"
+            tipo_doc = "ResNFe"
+        elif root_tag in ['resEvento', 'procEventoNFe', 'evento']:
+            tipo_pasta = "Eventos"
+            tipo_doc = "Evento"
+        else:
+            # Tipo desconhecido - salva em "Outros"
+            tipo_pasta = "Outros"
+            tipo_doc = "Outro"
         
-        # Processa data de emissão
+        # Extrai informações para organização
+        ide = None
+        emit = None
+        nNF = None
+        xNome = None
+        data_raw = None
+        
+        # Para NFe/CTe completas
+        if tipo_doc in ["NFe", "CTe"]:
+            ns = '{http://www.portalfiscal.inf.br/nfe}' if tipo_doc == "NFe" else '{http://www.portalfiscal.inf.br/cte}'
+            ide = root.find(f'.//{ns}ide')
+            emit = root.find(f'.//{ns}emit')
+            
+            if ide is not None:
+                nNF = ide.findtext(f'{ns}nNF' if tipo_doc == "NFe" else f'{ns}nCT')
+                dEmi = ide.findtext(f'{ns}dEmi')
+                dhEmi = ide.findtext(f'{ns}dhEmi')
+                data_raw = dEmi or dhEmi
+            
+            if emit is not None:
+                xNome = emit.findtext(f'{ns}xNome')
+        
+        # Para resumos (resNFe)
+        elif tipo_doc == "ResNFe":
+            ns = '{http://www.portalfiscal.inf.br/nfe}'
+            chNFe = root.findtext(f'{ns}chNFe')
+            if chNFe and len(chNFe) >= 44:
+                # Extrai data da chave (posições 2-8: AAMMDD)
+                try:
+                    ano = "20" + chNFe[2:4]
+                    mes = chNFe[4:6]
+                    data_raw = f"{ano}-{mes}-01"
+                except:
+                    pass
+            nNF = root.findtext(f'{ns}nNF') or "RESUMO"
+            xNome = root.findtext(f'{ns}xNome') or "NFe"
+        
+        # Para eventos (resEvento, procEventoNFe)
+        elif tipo_doc == "Evento":
+            ns = '{http://www.portalfiscal.inf.br/nfe}'
+            
+            # Tenta extrair chave e tipo de evento
+            chNFe = root.findtext(f'.//{ns}chNFe')
+            tpEvento = root.findtext(f'.//{ns}tpEvento')
+            nSeqEvento = root.findtext(f'.//{ns}nSeqEvento') or "1"
+            dhEvento = root.findtext(f'.//{ns}dhEvento')
+            
+            # Mapeia tipo de evento
+            eventos_map = {
+                '110110': 'CARTA_CORRECAO',
+                '110111': 'CANCELAMENTO',
+                '210200': 'CONFIRMACAO',
+                '210210': 'CIENCIA',
+                '210220': 'DESCONHECIMENTO',
+                '210240': 'NAO_REALIZADA'
+            }
+            tipo_evento = eventos_map.get(tpEvento, f'EVENTO_{tpEvento}')
+            
+            if chNFe and len(chNFe) >= 44:
+                # Extrai data da chave
+                try:
+                    ano = "20" + chNFe[2:4]
+                    mes = chNFe[4:6]
+                    data_raw = f"{ano}-{mes}-01"
+                    # Extrai número da nota da chave (posições 25-34)
+                    nNF = chNFe[25:34]
+                except:
+                    pass
+            
+            if dhEvento:
+                data_raw = dhEvento
+            
+            nNF = nNF or "EVENTO"
+            xNome = tipo_evento
+        
+        # Define ano-mês para organização
         if data_raw:
             data_part = data_raw.split("T")[0]
-            ano_mes = data_part[:7] if len(data_part) >= 7 else "SEM_DATA"
+            ano_mes = data_part[:7] if len(data_part) >= 7 else datetime.now().strftime("%Y-%m")
         else:
-            ano_mes = "SEM_DATA"
-
-        # Monta estrutura de pastas: pasta_base/CNPJ/TIPO/ANO-MES/
-        pasta_dest = os.path.join(pasta_base, cnpj_cpf_fmt, doc_type, ano_mes)
+            ano_mes = datetime.now().strftime("%Y-%m")
+        
+        nNF = nNF or "SEM_NUMERO"
+        xNome = xNome or "SEM_NOME"
+        
+        # Cria pasta com tipo de documento
+        pasta_dest = os.path.join(pasta_base, cnpj_cpf_fmt, ano_mes, tipo_pasta)
         os.makedirs(pasta_dest, exist_ok=True)
 
-        # Nome do arquivo com prefixo do tipo
-        nome_arquivo = f"{sanitize_filename(numero)}-{sanitize_filename(nome)[:40]}.xml"
+        nome_arquivo = f"{sanitize_filename(nNF)}-{sanitize_filename(xNome)[:40]}.xml"
         caminho_xml = os.path.join(pasta_dest, nome_arquivo)
 
         with open(caminho_xml, "w", encoding="utf-8") as f:
             f.write(xml)
-        print(f"[SALVO {doc_type}] {caminho_xml}")
-        return caminho_xml
+        print(f"[SALVO {tipo_doc}] {caminho_xml}")
         
+        # Gerar PDF automaticamente (apenas para NFe/CTe completas)
+        if tipo_doc in ["NFe", "CTe"]:
+            try:
+                caminho_pdf = caminho_xml.replace('.xml', '.pdf')
+                if not os.path.exists(caminho_pdf):
+                    from modules.pdf_simple import generate_danfe_pdf
+                    success = generate_danfe_pdf(xml, caminho_pdf, tipo_doc)
+                    if success:
+                        print(f"[PDF GERADO] {caminho_pdf}")
+            except Exception as pdf_err:
+                print(f"[AVISO] Erro ao gerar PDF: {pdf_err}")
     except Exception as e:
         print(f"[ERRO ao salvar XML de {cnpj_cpf}]: {e}")
-        return None
 # -------------------------------------------------------------------
 # Validação de XML com XSD
 # -------------------------------------------------------------------
@@ -573,21 +798,11 @@ def validar_xml_auto(xml, default_xsd):
 
     # Mapeamento padrão
     ROOT_XSD_MAP = {
-        # NFe
         "nfeProc":      "procNFe_v4.00.xsd",
         "NFe":          "leiauteNFe_v4.00.xsd",
         "procEventoNFe":"procEventoNFe_v1.00.xsd",
         "resNFe":       "resNFe_v1.01.xsd",
         "resEvento":    "resEvento_v1.01.xsd",
-        # CTe
-        "procCTe":      "procCTe_v3.00.xsd",
-        "CTe":          "leiauteCTe_v3.00.xsd",
-        "resCTe":       "resCTe_v1.04.xsd",
-        # NFS-e
-        "procNFSe":     "procNFSe_v1.00.xsd",
-        "NFSe":         "leiauteNFSe_v1.00.xsd",
-        "resNFSe":      "resNFSe_v1.00.xsd",
-        # Outros
         "retConsReciNFe":"retConsReciNFe_v4.00.xsd",
         "enviNFe":      "enviNFe_v4.00.xsd",
         "distDFeInt":   "distDFeInt_v1.01.xsd",
@@ -658,127 +873,15 @@ URL_DISTRIBUICAO = (
     "NFeDistribuicaoDFe.asmx?wsdl"
 )
 CONSULTA_WSDL = {
+    '31': "https://nfe.fazenda.mg.gov.br/nfe2/services/NFeConsultaProtocolo4?wsdl",  # MG
     '50': "https://nfe.sefaz.ms.gov.br/ws/NFeConsultaProtocolo4?wsdl",  # MS
-    # ... os demais já estavam no seu dicionário, mas só MS interessa aqui.
+    '51': "https://www.sefazvirtual.fazenda.gov.br/NFeConsultaProtocolo4/NFeConsultaProtocolo4.asmx?wsdl",  # SVRS
+    '52': "https://www.sefazvirtual.fazenda.gov.br/NFeConsultaProtocolo4/NFeConsultaProtocolo4.asmx?wsdl",  # GO -> SVRS
 }
 URL_CONSULTA_FALLBACK = (
-    "https://www1.nfe.fazenda.gov.br/NFeConsultaProtocolo/"
-    "NFeConsultaProtocolo.asmx?wsdl"
+    "https://www.sefazvirtual.fazenda.gov.br/NFeConsultaProtocolo4/"
+    "NFeConsultaProtocolo4.asmx?wsdl"
 )
-
-# -------------------------------------------------------------------
-# Rate Limiting para SEFAZ
-# -------------------------------------------------------------------
-class SEFAZRateLimiter:
-    """
-    Gerencia limites de taxa da SEFAZ para evitar bloqueios.
-    
-    Limites conhecidos:
-    - Consulta de Protocolo: ~60-120 por minuto por certificado
-    - Distribuição NSU: ~300-500 por hora
-    """
-    
-    def __init__(self):
-        # Rastreia consultas por certificado
-        self.protocol_queries = defaultdict(list)  # {cnpj: [timestamps]}
-        self.nsu_queries = defaultdict(list)       # {cnpj: [timestamps]}
-        
-        # Limites configuráveis
-        self.PROTOCOL_LIMIT_PER_MINUTE = 50  # Conservador para evitar bloqueio
-        self.NSU_LIMIT_PER_HOUR = 400
-        self.PROTOCOL_COOLDOWN = 1.2  # Segundos entre consultas de protocolo
-        self.NSU_COOLDOWN = 8.0       # Segundos entre consultas NSU
-        
-        logger.info(f"Rate Limiter iniciado - Protocolo: {self.PROTOCOL_LIMIT_PER_MINUTE}/min, NSU: {self.NSU_LIMIT_PER_HOUR}/hora")
-    
-    def can_query_protocol(self, cnpj: str) -> bool:
-        """Verifica se pode fazer consulta de protocolo."""
-        now = datetime.now()
-        minute_ago = now - timedelta(minutes=1)
-        
-        # Remove consultas antigas
-        self.protocol_queries[cnpj] = [
-            ts for ts in self.protocol_queries[cnpj] if ts > minute_ago
-        ]
-        
-        # Verifica limite
-        can_query = len(self.protocol_queries[cnpj]) < self.PROTOCOL_LIMIT_PER_MINUTE
-        if not can_query:
-            logger.warning(f"Rate limit atingido para protocolo CNPJ {cnpj}: {len(self.protocol_queries[cnpj])}/{self.PROTOCOL_LIMIT_PER_MINUTE}")
-        
-        return can_query
-    
-    def can_query_nsu(self, cnpj: str) -> bool:
-        """Verifica se pode fazer consulta NSU."""
-        now = datetime.now()
-        hour_ago = now - timedelta(hours=1)
-        
-        # Remove consultas antigas
-        self.nsu_queries[cnpj] = [
-            ts for ts in self.nsu_queries[cnpj] if ts > hour_ago
-        ]
-        
-        # Verifica limite
-        can_query = len(self.nsu_queries[cnpj]) < self.NSU_LIMIT_PER_HOUR
-        if not can_query:
-            logger.warning(f"Rate limit atingido para NSU CNPJ {cnpj}: {len(self.nsu_queries[cnpj])}/{self.NSU_LIMIT_PER_HOUR}")
-        
-        return can_query
-    
-    def record_protocol_query(self, cnpj: str):
-        """Registra uma consulta de protocolo."""
-        self.protocol_queries[cnpj].append(datetime.now())
-        time.sleep(self.PROTOCOL_COOLDOWN)  # Cooldown entre consultas
-    
-    def record_nsu_query(self, cnpj: str):
-        """Registra uma consulta NSU."""
-        self.nsu_queries[cnpj].append(datetime.now())
-        time.sleep(self.NSU_COOLDOWN)  # Cooldown entre consultas
-    
-    def wait_if_needed(self, cnpj: str, query_type: str = "protocol") -> bool:
-        """
-        Espera se necessário para respeitar rate limits.
-        Retorna False se deve pular este certificado temporariamente.
-        """
-        if query_type == "protocol":
-            if not self.can_query_protocol(cnpj):
-                logger.info(f"Aguardando rate limit para protocolo CNPJ {cnpj}...")
-                time.sleep(60)  # Espera 1 minuto
-                return self.can_query_protocol(cnpj)
-        else:  # NSU
-            if not self.can_query_nsu(cnpj):
-                logger.info(f"Aguardando rate limit para NSU CNPJ {cnpj}...")
-                time.sleep(600)  # Espera 10 minutos
-                return self.can_query_nsu(cnpj)
-        
-        return True
-    
-    def get_stats(self) -> dict:
-        """Retorna estatísticas de uso."""
-        now = datetime.now()
-        stats = {}
-        
-        for cnpj in set(list(self.protocol_queries.keys()) + list(self.nsu_queries.keys())):
-            # Consultas de protocolo na última hora
-            hour_ago = now - timedelta(hours=1)
-            protocol_last_hour = len([
-                ts for ts in self.protocol_queries[cnpj] if ts > hour_ago
-            ])
-            
-            # Consultas NSU na última hora
-            nsu_last_hour = len([
-                ts for ts in self.nsu_queries[cnpj] if ts > hour_ago
-            ])
-            
-            stats[cnpj] = {
-                'protocol_last_hour': protocol_last_hour,
-                'nsu_last_hour': nsu_last_hour,
-                'total_protocol': len(self.protocol_queries[cnpj]),
-                'total_nsu': len(self.nsu_queries[cnpj])
-            }
-        
-        return stats
-
 # -------------------------------------------------------------------
 # Banco de Dados
 # -------------------------------------------------------------------
@@ -869,12 +972,21 @@ class DatabaseManager:
                 informante TEXT PRIMARY KEY,
                 ult_nsu TEXT
             )''')
+            cur.execute('''CREATE TABLE IF NOT EXISTS nsu_cte (
+                informante TEXT PRIMARY KEY,
+                ult_nsu TEXT
+            )''')
+            cur.execute('''CREATE TABLE IF NOT EXISTS erro_656 (
+                informante TEXT PRIMARY KEY,
+                ultimo_erro TIMESTAMP,
+                nsu_bloqueado TEXT
+            )''')
             conn.commit()
             logger.debug("Tabelas verificadas/criadas no banco")
     
     def criar_tabela_detalhada(self):
         with self._connect() as conn:
-            # Cria a tabela com o campo cnpj_destinatario, se ainda não existir
+            # Cria a tabela com todos os campos necessários
             conn.execute('''
             CREATE TABLE IF NOT EXISTS notas_detalhadas (
                 chave TEXT PRIMARY KEY,
@@ -887,35 +999,33 @@ class DatabaseManager:
                 valor TEXT,
                 cfop TEXT,
                 vencimento TEXT,
-                uf TEXT,
-                natureza TEXT,
+                ncm TEXT,
                 status TEXT DEFAULT 'Autorizado o uso da NF-e',
-                xml_status TEXT DEFAULT 'RESUMO', -- RESUMO | COMPLETO
+                natureza TEXT,
+                uf TEXT,
+                base_icms TEXT,
+                valor_icms TEXT,
                 informante TEXT,
-                nsu TEXT,
+                xml_status TEXT DEFAULT 'COMPLETO',
                 atualizado_em DATETIME,
                 cnpj_destinatario TEXT
             )
             ''')
-            # Garante que a coluna cnpj_destinatario existe (caso o banco seja antigo)
-            try:
-                conn.execute("ALTER TABLE notas_detalhadas ADD COLUMN cnpj_destinatario TEXT;")
-            except sqlite3.OperationalError:
-                # Já existe, ignora o erro
-                pass
-            # Migrações leves para novas colunas
-            try:
-                conn.execute("ALTER TABLE notas_detalhadas ADD COLUMN xml_status TEXT DEFAULT 'RESUMO';")
-            except sqlite3.OperationalError:
-                pass
-            try:
-                conn.execute("ALTER TABLE notas_detalhadas ADD COLUMN informante TEXT;")
-            except sqlite3.OperationalError:
-                pass
-            try:
-                conn.execute("ALTER TABLE notas_detalhadas ADD COLUMN nsu TEXT;")
-            except sqlite3.OperationalError:
-                pass
+            # Garante que as colunas existem (caso o banco seja antigo)
+            columns_to_add = [
+                ("cnpj_destinatario", "TEXT"),
+                ("xml_status", "TEXT DEFAULT 'COMPLETO'"),
+                ("ncm", "TEXT"),
+                ("base_icms", "TEXT"),
+                ("valor_icms", "TEXT"),
+                ("informante", "TEXT")
+            ]
+            for col_name, col_type in columns_to_add:
+                try:
+                    conn.execute(f"ALTER TABLE notas_detalhadas ADD COLUMN {col_name} {col_type};")
+                except sqlite3.OperationalError:
+                    # Já existe, ignora o erro
+                    pass
             conn.commit()
 
     def salvar_nota_detalhada(self, nota):
@@ -923,35 +1033,29 @@ class DatabaseManager:
             conn.execute('''
                 INSERT OR REPLACE INTO notas_detalhadas (
                     chave, ie_tomador, nome_emitente, cnpj_emitente, numero,
-                    data_emissao, tipo, valor, cfop, vencimento, uf, natureza,
-                    status, xml_status, informante, nsu, atualizado_em, cnpj_destinatario
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    data_emissao, tipo, valor, cfop, vencimento, ncm, uf, natureza,
+                    base_icms, valor_icms, status, atualizado_em, cnpj_destinatario, 
+                    xml_status, informante
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
                 nota['chave'], nota['ie_tomador'], nota['nome_emitente'], nota['cnpj_emitente'],
                 nota['numero'], nota['data_emissao'], nota['tipo'], nota['valor'],
-                nota.get('cfop', ''), nota.get('vencimento', ''), nota.get('uf', ''),
-                nota.get('natureza', ''), nota['status'], nota.get('xml_status','RESUMO'),
-                nota.get('informante',''), nota.get('nsu',''), nota['atualizado_em'],
-                nota.get('cnpj_destinatario', '')
+                nota.get('cfop', ''), nota.get('vencimento', ''), nota.get('ncm', ''),
+                nota.get('uf', ''), nota.get('natureza', ''), 
+                nota.get('base_icms', ''), nota.get('valor_icms', ''),
+                nota['status'], nota['atualizado_em'],
+                nota.get('cnpj_destinatario', ''), 
+                nota.get('xml_status', 'COMPLETO'),
+                nota.get('informante', '')
             ))
             conn.commit()
 
     def get_certificados(self):
-        # TEMPORÁRIO: Forçar uso da tabela legada para carregar todos os certificados
-        logger.debug("Forçando uso da tabela legada para carregar todos os certificados")
-        
         with self._connect() as conn:
-            # Usa diretamente a tabela antiga para garantir que todos os certificados sejam carregados
             rows = conn.execute(
                 "SELECT cnpj_cpf,caminho,senha,informante,cUF_autor FROM certificados"
             ).fetchall()
-            logger.debug(f"Certificados carregados da tabela legada: {len(rows)} certificados")
-            
-            # Log detalhado dos certificados carregados
-            for i, cert in enumerate(rows, 1):
-                cnpj, caminho, senha, inf, cuf = cert
-                logger.debug(f"Certificado {i}: CNPJ={cnpj}, Informante={inf}, UF={cuf}, Caminho={caminho}")
-            
+            logger.debug(f"Certificados carregados: {rows}")
             return rows
 
     def get_last_nsu(self, informante):
@@ -971,6 +1075,83 @@ class DatabaseManager:
             )
             conn.commit()
             logger.debug(f"NSU atualizado para {informante}: {nsu}")
+            
+            # Se o NSU avançou, limpa o bloqueio de erro 656 (pode ter documentos novos)
+            conn.execute("DELETE FROM erro_656 WHERE informante = ?", (informante,))
+            conn.commit()
+    
+    def get_last_nsu_cte(self, informante):
+        """Obtém último NSU processado de CT-e para o informante"""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT ult_nsu FROM nsu_cte WHERE informante=?", (informante,)
+            ).fetchone()
+            last = row[0] if row else "000000000000000"
+            logger.debug(f"Último NSU CT-e para {informante}: {last}")
+            return last
+
+    def set_last_nsu_cte(self, informante, nsu):
+        """Atualiza último NSU processado de CT-e para o informante"""
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO nsu_cte (informante,ult_nsu) VALUES (?,?)",
+                (informante, nsu)
+            )
+            conn.commit()
+            logger.debug(f"NSU CT-e atualizado para {informante}: {nsu}")
+    
+    def registrar_erro_656(self, informante, nsu):
+        """Registra que houve erro 656 para este informante/NSU"""
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO erro_656 (informante, ultimo_erro, nsu_bloqueado) VALUES (?, datetime('now'), ?)",
+                (informante, nsu)
+            )
+            conn.commit()
+            logger.debug(f"Erro 656 registrado: {informante} NSU={nsu}")
+    
+    def marcar_primeira_consulta(self, informante):
+        """Marca que este certificado está fazendo a primeira consulta (NSU=0)"""
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO config (chave, valor) VALUES (?, datetime('now'))",
+                (f'primeira_consulta_{informante}',)
+            )
+            conn.commit()
+            logger.info(f"✅ Primeira consulta marcada para {informante}")
+    
+    def pode_consultar_certificado(self, informante, nsu_atual):
+        """Verifica se pode consultar o certificado (não teve erro 656 na última hora)"""
+        with self._connect() as conn:
+            row = conn.execute(
+                """SELECT ultimo_erro, nsu_bloqueado 
+                   FROM erro_656 
+                   WHERE informante = ?""",
+                (informante,)
+            ).fetchone()
+            
+            if not row:
+                return True  # Nunca teve erro 656
+            
+            ultimo_erro_str, nsu_bloqueado = row
+            
+            # Se o NSU mudou, pode consultar (tem documentos novos)
+            if nsu_bloqueado != nsu_atual:
+                logger.debug(f"{informante}: NSU mudou de {nsu_bloqueado} para {nsu_atual}, pode consultar")
+                return True
+            
+            # Verifica se já passou 65 minutos desde o último erro
+            from datetime import datetime, timedelta
+            ultimo_erro = datetime.fromisoformat(ultimo_erro_str)
+            agora = datetime.now()
+            diferenca = (agora - ultimo_erro).total_seconds() / 60  # em minutos
+            
+            if diferenca >= 65:  # 65 minutos de segurança
+                logger.debug(f"{informante}: Passou {diferenca:.1f} minutos desde erro 656, pode consultar")
+                return True
+            else:
+                logger.info(f"{informante}: Ainda em bloqueio erro 656 (faltam {65 - diferenca:.1f} minutos)")
+                return False
 
     def registrar_xml(self, chave, cnpj):
         with self._connect() as conn:
@@ -1002,50 +1183,6 @@ class DatabaseManager:
             conn.commit()
             logger.debug(f"Status gravado: {chave} → {cStat} / {xMotivo}")
 
-    def marcar_para_download(self, chave, cnpj):
-        """Marca um documento para download posterior na busca normal"""
-        with self._connect() as conn:
-            # Cria tabela se não existir
-            conn.execute('''
-                CREATE TABLE IF NOT EXISTS download_pendente (
-                    chave TEXT PRIMARY KEY,
-                    cnpj TEXT,
-                    data_marcacao DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    processado INTEGER DEFAULT 0
-                )
-            ''')
-            
-            # Insere ou atualiza a marcação
-            conn.execute(
-                "INSERT OR REPLACE INTO download_pendente (chave, cnpj, processado) VALUES (?, ?, 0)",
-                (chave, cnpj)
-            )
-            conn.commit()
-            logger.debug(f"Documento marcado para download: {chave} (CNPJ: {cnpj})")
-
-    def get_pendentes_download(self, cnpj=None):
-        """Retorna documentos marcados para download"""
-        with self._connect() as conn:
-            if cnpj:
-                cursor = conn.execute(
-                    "SELECT chave, cnpj FROM download_pendente WHERE cnpj = ? AND processado = 0",
-                    (cnpj,)
-                )
-            else:
-                cursor = conn.execute(
-                    "SELECT chave, cnpj FROM download_pendente WHERE processado = 0"
-                )
-            return cursor.fetchall()
-
-    def marcar_como_processado(self, chave):
-        """Marca um documento como processado"""
-        with self._connect() as conn:
-            conn.execute(
-                "UPDATE download_pendente SET processado = 1 WHERE chave = ?",
-                (chave,)
-            )
-            conn.commit()
-
     def find_cert_by_cnpj(self, cnpj):
         for row in self.get_certificados():
             if row[0] == cnpj:
@@ -1076,6 +1213,19 @@ class XMLProcessor:
         last = ult.text.zfill(15) if ult is not None and ult.text else None
         logger.debug(f"último NSU extraído: {last}")
         return last
+    
+    def extract_max_nsu(self, resp_xml):
+        """Extrai maxNSU da resposta SEFAZ - indica o maior NSU disponível (útil na primeira consulta)"""
+        try:
+            tree = etree.fromstring(resp_xml.encode('utf-8'))
+            max_nsu = tree.find('.//nfe:maxNSU', namespaces=self.NS)
+            if max_nsu is not None and max_nsu.text:
+                val = max_nsu.text.strip().zfill(15)
+                logger.debug(f"maxNSU extraído: {val}")
+                return val
+        except:
+            pass
+        return None
 
     def extract_cStat(self, resp_xml):
         tree = etree.fromstring(resp_xml.encode('utf-8'))
@@ -1086,36 +1236,11 @@ class XMLProcessor:
 
     def parse_protNFe(self, xml_obj):
         logger.debug("Parseando protocolo NF-e")
-        
-        # Verifica se é a mensagem especial de erro 404
-        if isinstance(xml_obj, str) and '<erro_404>' in xml_obj:
-            logger.debug("Detectado erro 404 especial na resposta")
-            return '', '404', 'Erro 404: Uso de prefixo de namespace nao permitido'
-        
         # Se já for Element, use direto
         if isinstance(xml_obj, etree._Element):
             tree = xml_obj
         else:
             tree = etree.fromstring(xml_obj.encode('utf-8'))
-            
-        # Primeiro verifica se há erro na própria consulta (retConsSitNFe)
-        # Pode estar como root ou como filho
-        ret_cons = tree.find('.//{http://www.portalfiscal.inf.br/nfe}retConsSitNFe')
-        
-        # Se não encontrou como filho, verifica se o próprio root é retConsSitNFe
-        if ret_cons is None and tree.tag.endswith('retConsSitNFe'):
-            ret_cons = tree
-            
-        if ret_cons is not None:
-            cStat = ret_cons.findtext('.//{http://www.portalfiscal.inf.br/nfe}cStat') or ''
-            xMotivo = ret_cons.findtext('.//{http://www.portalfiscal.inf.br/nfe}xMotivo') or ''
-            
-            # Se erro 404 (namespace), trata como erro de consulta
-            if cStat == '404':
-                logger.warning(f"Erro 404 na consulta: {xMotivo}")
-                # Retorna dados com erro 404 para ser tratado especificamente
-                return '', '404', xMotivo
-                
         prot = tree.find('.//{http://www.portalfiscal.inf.br/nfe}protNFe')
         if prot is None:
             logger.debug("nenhum protNFe encontrado")
@@ -1125,156 +1250,90 @@ class XMLProcessor:
         xMotivo = prot.findtext('{http://www.portalfiscal.inf.br/nfe}xMotivo') or ''
         logger.debug(f"Parse protocolo → chNFe={chNFe}, cStat={cStat}, xMotivo={xMotivo}")
         return chNFe, cStat, xMotivo
-
-    def detect_doc_type(self, xml_str: str) -> str:
+    
+    def extract_status_from_xml(self, xml_str):
+        """
+        Extrai status (cStat, xMotivo) diretamente do XML completo.
+        Funciona para NFe e CTe com protocolo embutido.
+        Mapeia códigos especiais (denegação, recusa, cancelamento).
+        Retorna: (cStat, xMotivo) ou (None, None)
+        """
         try:
-            root = etree.fromstring(xml_str.encode('utf-8'))
-            tag = etree.QName(root).localname.lower()
-            # NFe tipos
-            if 'resnfe' in tag:
-                return 'resNFe'
-            if 'procnfe' in tag or 'nfeproc' in tag:
-                return 'nfeProc'
-            if tag == 'nfe':
-                return 'NFe'
-            # CTe tipos
-            if 'rescte' in tag:
-                return 'resCTe'
-            if 'proccte' in tag:
-                return 'procCTe'
-            if tag == 'cte':
-                return 'CTe'
-            # NFSe tipos (ABRASF)
-            if 'procnfse' in tag:
-                return 'procNFSe'
-            if 'resnfse' in tag:
-                return 'resNFSe'
-            if 'nfse' in tag and tag != 'nfe':
-                return 'NFSe'
-            return tag
-        except Exception:
-            return 'unknown'
-
-    def extrair_dados_resnfe(self, xml_str: str):
-        """Extrai dados básicos de um resNFe para popular tabela"""
-        try:
-            tree = etree.fromstring(xml_str.encode('utf-8'))
-            ns = '{http://www.portalfiscal.inf.br/nfe}'
-            chave = tree.findtext(f'.//{ns}chNFe') or ''
-            cnpj_emit = tree.findtext(f'.//{ns}CNPJ') or ''
-            xNome = tree.findtext(f'.//{ns}xNome') or ''
-            dEmi = tree.findtext(f'.//{ns}dEmi') or ''
-            vNF = tree.findtext(f'.//{ns}vNF') or ''
-            cUF = tree.findtext(f'.//{ns}cUF') or ''
-            return {
-                'chave': chave,
-                'ie_tomador': '',
-                'nome_emitente': xNome,
-                'cnpj_emitente': cnpj_emit,
-                'numero': '',
-                'data_emissao': dEmi,
-                'tipo': 'NFe',
-                'valor': vNF,
-                'uf': cUF,
-                'natureza': '',
-                'status': 'Resumo',
-                'atualizado_em': datetime.now().isoformat()
-            }
+            tree = etree.fromstring(xml_str.encode('utf-8') if isinstance(xml_str, str) else xml_str)
+            
+            # Tenta NFe primeiro
+            prot = tree.find('.//{http://www.portalfiscal.inf.br/nfe}protNFe')
+            if prot is not None:
+                cStat = prot.findtext('{http://www.portalfiscal.inf.br/nfe}infProt/{http://www.portalfiscal.inf.br/nfe}cStat') or \
+                        prot.findtext('{http://www.portalfiscal.inf.br/nfe}cStat') or ''
+                xMotivo = prot.findtext('{http://www.portalfiscal.inf.br/nfe}infProt/{http://www.portalfiscal.inf.br/nfe}xMotivo') or \
+                          prot.findtext('{http://www.portalfiscal.inf.br/nfe}xMotivo') or ''
+                
+                # Mapeia status especiais
+                if cStat:
+                    xMotivo = self._mapear_status_especial(cStat, xMotivo)
+                    logger.debug(f"Status extraído de NFe: {cStat} - {xMotivo}")
+                    return cStat, xMotivo
+            
+            # Tenta CTe
+            prot = tree.find('.//{http://www.portalfiscal.inf.br/cte}protCTe')
+            if prot is not None:
+                cStat = prot.findtext('{http://www.portalfiscal.inf.br/cte}infProt/{http://www.portalfiscal.inf.br/cte}cStat') or \
+                        prot.findtext('{http://www.portalfiscal.inf.br/cte}cStat') or ''
+                xMotivo = prot.findtext('{http://www.portalfiscal.inf.br/cte}infProt/{http://www.portalfiscal.inf.br/cte}xMotivo') or \
+                          prot.findtext('{http://www.portalfiscal.inf.br/cte}xMotivo') or ''
+                
+                # Mapeia status especiais
+                if cStat:
+                    xMotivo = self._mapear_status_especial(cStat, xMotivo)
+                    logger.debug(f"Status extraído de CTe: {cStat} - {xMotivo}")
+                    return cStat, xMotivo
+            
+            logger.debug("Nenhum status encontrado no XML")
+            return None, None
         except Exception as e:
-            logger.error(f"Erro ao extrair resNFe: {e}")
-            return None
+            logger.warning(f"Erro ao extrair status do XML: {e}")
+            return None, None
+    
+    def _mapear_status_especial(self, cStat: str, xMotivo: str) -> str:
+        """Mapeia códigos de status especiais para mensagens claras"""
+        mapeamento = {
+            '100': 'Autorizado o uso da NF-e',
+            '101': 'Cancelamento de NF-e homologado',
+            '135': 'Evento registrado e vinculado a NF-e',
+            '301': 'Uso Denegado: Irregularidade fiscal do emitente',
+            '302': 'Uso Denegado: Irregularidade fiscal do destinatário',
+            '110': 'Uso Denegado',
+            '205': 'NF-e está denegada na base de dados da SEFAZ',
+            '218': 'NF-e já está cancelada na base de dados da SEFAZ'
+        }
+        return mapeamento.get(cStat, xMotivo)
 
 # -------------------------------------------------------------------
 # Serviço SOAP
 # -------------------------------------------------------------------
 class NFeService:
-    # Rate limiter compartilhado entre todas as instâncias
-    _rate_limiter = None
-    
     def __init__(self, cert_path, senha, informante, cuf):
         logger.debug(f"Inicializando serviço para informante={informante}, cUF={cuf}")
-        
-        # Inicializa rate limiter se necessário
-        if NFeService._rate_limiter is None:
-            NFeService._rate_limiter = SEFAZRateLimiter()
-        
-        # Configurar sessão com certificado e SSL
         sess = requests.Session()
-        
-        # Desabilitar verificação SSL para contornar problemas com certificados SEFAZ
-        sess.verify = False
-        
-        # Configurar timeouts mais agressivos
-        sess.timeout = (30, 60)  # (connect timeout, read timeout)
-        
-        # Configurar certificado
+        sess.verify = False  # Desabilita verificação SSL
         sess.mount('https://', requests_pkcs12.Pkcs12Adapter(
             pkcs12_filename=cert_path, pkcs12_password=senha
         ))
-        
-        # Desabilitar avisos de SSL não verificado
-        import urllib3
-        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-        
-        # Configurar transport com timeouts personalizados
-        trans = Transport(session=sess, timeout=30, operation_timeout=60)
-        self._session = sess
-        
-        # Configurar Settings do zeep para evitar prefixos de namespace
-        # strict=False permite mais flexibilidade
-        # xsd_ignore_sequence_order=True para ordem flexível de elementos
-        zeep_settings = Settings(
-            strict=False,
-            xml_huge_tree=True,
-            xsd_ignore_sequence_order=True
-        )
-        
-        # Inicializar cliente de distribuição com tratamento de exceções
-        try:
-            self.dist_client = Client(
-                wsdl=URL_DISTRIBUICAO, 
-                transport=trans,
-                settings=zeep_settings
-            )
-            logger.debug(f"Cliente de distribuição inicializado: {URL_DISTRIBUICAO}")
-        except Exception as e:
-            logger.error(f"Falha crítica ao inicializar cliente de distribuição: {e}")
-            self.dist_client = None
-        
-        # Inicializar cliente de consulta (protocolo) com tratamento de exceções
+        trans = Transport(session=sess)
+        self.dist_client = Client(wsdl=URL_DISTRIBUICAO, transport=trans)
         wsdl = CONSULTA_WSDL.get(str(cuf), URL_CONSULTA_FALLBACK)
         try:
-            self.cons_client = Client(
-                wsdl=wsdl, 
-                transport=trans,
-                settings=zeep_settings
-            )
+            self.cons_client = Client(wsdl=wsdl, transport=trans)
             logger.debug(f"Cliente de protocolo inicializado: {wsdl}")
         except Exception as e:
             self.cons_client = None
             logger.warning(f"Falha ao inicializar WSDL de protocolo ({wsdl}): {e}")
-            
         self.informante = informante
         self.cuf        = cuf
-        # Endpoint real do serviço de protocolo (sem ?wsdl)
-        try:
-            self.cons_endpoint = wsdl.split('?')[0]
-        except Exception:
-            self.cons_endpoint = wsdl
 
     def fetch_by_cnpj(self, tipo, ult_nsu):
         logger.debug(f"Chamando distribuição: tipo={tipo}, informante={self.informante}, ultNSU={ult_nsu}")
-        
-        # Verificar se cliente de distribuição está disponível
-        if not self.dist_client:
-            logger.error("Cliente de distribuição não disponível")
-            return None
-        
-        # Aplicar rate limiting para NSU
-        if not self._rate_limiter.wait_if_needed(self.informante, "nsu"):
-            logger.warning(f"Rate limit NSU excedido para {self.informante}, pulando consulta")
-            return None
-        
         distInt = etree.Element("distDFeInt",
             xmlns=XMLProcessor.NS['nfe'], versao="1.01"
         )
@@ -1285,7 +1344,6 @@ class NFeService:
         etree.SubElement(sub, "ultNSU").text       = ult_nsu
 
         xml_envio = etree.tostring(distInt, encoding='utf-8').decode()
-        
         # Valide antes de enviar
         try:
             validar_xml_auto(xml_envio, 'distDFeInt_v1.01.xsd')
@@ -1293,38 +1351,14 @@ class NFeService:
             logger.error("XML de distribuição não passou na validação XSD. Corrija antes de enviar.")
             return None
 
-        # Tentar conexão com tratamento robusto de exceções
         try:
-            logger.debug("Enviando requisição para SEFAZ...")
             resp = self.dist_client.service.nfeDistDFeInteresse(nfeDadosMsg=distInt)
-            xml_str = etree.tostring(resp, encoding='utf-8').decode()
-            logger.debug(f"Resposta Distribuição:\n{xml_str}")
-            
-            # Registrar consulta NSU bem-sucedida
-            self._rate_limiter.record_nsu_query(self.informante)
-            
-            return xml_str
-            
         except Fault as fault:
             logger.error(f"SOAP Fault Distribuição: {fault}")
             return None
-            
-        except (requests.exceptions.ConnectTimeout, 
-                requests.exceptions.ReadTimeout,
-                requests.exceptions.Timeout) as timeout_error:
-            logger.error(f"Timeout na conexão com SEFAZ: {timeout_error}")
-            logger.warning("Tentativa de distribuição cancelada devido a timeout")
-            return None
-            
-        except requests.exceptions.ConnectionError as conn_error:
-            logger.error(f"Erro de conexão com SEFAZ: {conn_error}")
-            logger.warning("Verificar conectividade com internet")
-            return None
-            
-        except Exception as e:
-            logger.error(f"Erro inesperado na distribuição: {e}")
-            logger.exception("Detalhes completos do erro:")
-            return None
+        xml_str = etree.tostring(resp, encoding='utf-8').decode()
+        logger.debug(f"Resposta Distribuição:\n{xml_str}")
+        return xml_str
 
     def fetch_prot_nfe(self, chave):
         """
@@ -1334,90 +1368,80 @@ class NFeService:
             logger.debug("Cliente de protocolo não disponível")
             return None
 
-        # Aplicar rate limiting para consulta de protocolo
-        if not self._rate_limiter.wait_if_needed(self.informante, "protocol"):
-            logger.warning(f"Rate limit protocolo excedido para {self.informante}, pulando consulta da chave {chave}")
-            return None
-
         logger.debug(f"Chamando protocolo para chave={chave}")
         
-        # Cria elemento XML SEM prefixos de namespace
-        # O erro 404 "prefixo de namespace não permitido" acontece quando há prefixos como nfe: ou soap:
-        NS = "http://www.portalfiscal.inf.br/nfe"
+        # Define URL do serviço baseado no cUF (extrai da chave ou usa self.cuf)
+        # Chave NFe: posições 0-1 = cUF
+        cuf_from_chave = chave[:2] if len(chave) == 44 else str(self.cuf)
         
-        # Cria elemento raiz com namespace padrão (sem prefixo)
-        consSitNFe = etree.Element(
-            "{%s}consSitNFe" % NS,
-            versao="4.00",
-            nsmap={None: NS}  # None = namespace padrão (sem prefixo)
-        )
+        url_map = {
+            '31': 'https://nfe.fazenda.mg.gov.br/nfe2/services/NFeConsultaProtocolo4',  # MG
+            '50': 'https://nfe.sefaz.ms.gov.br/ws/NFeConsultaProtocolo4',  # MS
+            '51': 'https://www.sefazvirtual.fazenda.gov.br/NFeConsultaProtocolo4/NFeConsultaProtocolo4.asmx',  # SVRS
+            '52': 'https://www.sefazvirtual.fazenda.gov.br/NFeConsultaProtocolo4/NFeConsultaProtocolo4.asmx',  # GO
+            '35': 'https://nfe.fazenda.sp.gov.br/ws/nfeconsultaprotocolo4.asmx',  # SP
+            '33': 'https://nfe.fazenda.rj.gov.br/ws/NFeConsultaProtocolo4',  # RJ
+            '41': 'https://nfe.sefa.pr.gov.br/nfe/NFeConsultaProtocolo4',  # PR
+            '53': 'https://nfe.sefaz.df.gov.br/ws/NFeConsultaProtocolo4',  # DF
+        }
+        url = url_map.get(cuf_from_chave, 'https://www.sefazvirtual.fazenda.gov.br/NFeConsultaProtocolo4/NFeConsultaProtocolo4.asmx')
         
-        # Adiciona elementos filhos (herdam o namespace automaticamente)
-        etree.SubElement(consSitNFe, "{%s}tpAmb" % NS).text = "1"
-        etree.SubElement(consSitNFe, "{%s}xServ" % NS).text = "CONSULTAR"
-        etree.SubElement(consSitNFe, "{%s}chNFe" % NS).text = chave
+        # Monta XML SEM prefixos de namespace (SEFAZ rejeita prefixos)
+        xml_consulta = f'''<consSitNFe xmlns="http://www.portalfiscal.inf.br/nfe" versao="4.00"><tpAmb>1</tpAmb><xServ>CONSULTAR</xServ><chNFe>{chave}</chNFe></consSitNFe>'''
         
-        # Converte para string para validação
-        xml_envio_str = etree.tostring(consSitNFe, encoding='unicode', pretty_print=False)
-        
-        # Valida o XML de consulta
+        logger.debug(f"XML de consulta:\n{xml_consulta}")
+        logger.debug(f"URL do serviço (cUF={cuf_from_chave}): {url}")
+
+        # Envia requisição SOAP manualmente (evita que Zeep adicione prefixos)
         try:
-            validar_xml_auto(xml_envio_str, 'consSitNFe_v4.00.xsd')
+            # Monta envelope SOAP 1.2
+            soap_envelope = f'''<?xml version="1.0" encoding="utf-8"?>
+<soap12:Envelope xmlns:soap12="http://www.w3.org/2003/05/soap-envelope" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema">
+  <soap12:Body>
+    <nfeDadosMsg xmlns="http://www.portalfiscal.inf.br/nfe/wsdl/NFeConsultaProtocolo4">{xml_consulta}</nfeDadosMsg>
+  </soap12:Body>
+</soap12:Envelope>'''
+            
+            logger.debug(f"Envelope SOAP:\n{soap_envelope[:500]}")
+            
+            headers = {
+                'Content-Type': 'application/soap+xml; charset=utf-8',
+            }
+            
+            # Usa a sessão que já tem o certificado configurado
+            resp = self.dist_client.transport.session.post(url, data=soap_envelope.encode('utf-8'), headers=headers)
+            resp.raise_for_status()
+            
+            # Extrai corpo da resposta SOAP
+            resp_tree = etree.fromstring(resp.content)
+            body = resp_tree.find('.//{http://www.w3.org/2003/05/soap-envelope}Body')
+            if body is not None and len(body) > 0:
+                resp = body[0]
+            else:
+                logger.error("Resposta SOAP sem corpo")
+                return None
+                
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Erro na requisição HTTP: {e}")
+            return None
         except Exception as e:
-            logger.error(f"XML de consulta protocolo não passou na validação XSD: {e}")
+            logger.error(f"Erro ao montar/enviar requisição SOAP: {e}")
             return None
 
-        # 1) Tenta requisição SOAP crua para controlar totalmente namespaces
+        # Converte resposta para string XML
         try:
-            logger.debug("Consultando protocolo na SEFAZ (modo SOAP raw)...")
-            logger.debug(f"XML enviado (sem prefixos):\n{xml_envio_str}")
-            soap_env = self._build_protocolo_envelope(xml_envio_str)
-            ws_action = "http://www.portalfiscal.inf.br/nfe/wsdl/NFeConsultaProtocolo4/nfeConsultaNF"
-            headers = {
-                'Content-Type': f'application/soap+xml; charset=utf-8; action="{ws_action}"',
-            }
-            resp = self._session.post(self.cons_endpoint, data=soap_env.encode('utf-8'), headers=headers, timeout=60)
-            resp.raise_for_status()
-            xml_str = resp.text
-            logger.debug(f"Resposta Protocolo (raw):\n{xml_str}")
-            self._rate_limiter.record_protocol_query(self.informante)
-            return xml_str
-        except Exception as raw_err:
-            logger.warning(f"Falha no modo SOAP raw: {raw_err}. Tentando via cliente SOAP...")
-            # 2) Fallback para cliente SOAP (zeep)
-            try:
-                resp = self.cons_client.service.nfeConsultaNF(consSitNFe)
-                xml_str = etree.tostring(resp, encoding='utf-8').decode()
-                logger.debug(f"Resposta Protocolo (zeep):\n{xml_str}")
-                self._rate_limiter.record_protocol_query(self.informante)
-                return xml_str
-            except Fault as fault:
-                logger.error(f"SOAP Fault Protocolo: {fault}")
-                return None
-            except (requests.exceptions.ConnectTimeout, 
-                    requests.exceptions.ReadTimeout,
-                    requests.exceptions.Timeout) as timeout_error:
-                logger.error(f"Timeout na consulta de protocolo: {timeout_error}")
-                logger.warning(f"Consulta de protocolo cancelada para chave: {chave}")
-                return None
-            except requests.exceptions.ConnectionError as conn_error:
-                logger.error(f"Erro de conexão na consulta de protocolo: {conn_error}")
-                return None
-            except Exception as e:
-                error_str = str(e)
-                if "404" in error_str and ("namespace" in error_str.lower() or "prefixo" in error_str.lower()):
-                    logger.warning(f"Erro 404 detectado na consulta de protocolo para chave {chave}")
-                    return '<erro_404>Erro 404: Uso de prefixo de namespace nao permitido</erro_404>'
-                logger.error(f"Erro inesperado na consulta de protocolo: {e}")
-                return None
-
-        # Zeep pode retornar lxml.Element, string, ou objeto
-        if hasattr(resp, 'decode'):
-            resp_xml = resp.decode()
-        elif hasattr(resp, '__str__'):
-            resp_xml = str(resp)
-        else:
-            resp_xml = etree.tostring(resp, encoding="utf-8").decode()
+            if isinstance(resp, etree._Element):
+                resp_xml = etree.tostring(resp, encoding="utf-8").decode()
+            elif hasattr(resp, 'decode'):
+                resp_xml = resp.decode()
+            elif isinstance(resp, str):
+                resp_xml = resp
+            else:
+                # Último recurso: tenta serializar
+                resp_xml = etree.tostring(resp, encoding="utf-8").decode()
+        except Exception as e:
+            logger.error(f"Erro ao converter resposta SOAP em XML: {e}")
+            return None
 
         # Protege contra respostas inválidas (vazia, HTML, etc)
         if not resp_xml or resp_xml.strip().startswith('<html') or resp_xml.strip() == '':
@@ -1428,299 +1452,230 @@ class NFeService:
         # with open('ult_resposta_protocolo.xml', 'w', encoding='utf-8') as f:
         #     f.write(resp_xml)
 
-        # Valida o XML da resposta (padrão é leiauteNFe_v4.00.xsd, mas pode mudar conforme SEFAZ)
-        try:
-            validar_xml_auto(resp_xml, 'leiauteNFe_v4.00.xsd')
-        except Exception:
-            logger.warning("Resposta da SEFAZ não passou na validação XSD.")
-            return None
-
+        # NÃO valida XML de resposta da SEFAZ (esquemas podem variar)
         logger.debug(f"Resposta Protocolo (raw):\n{resp_xml}")
         return resp_xml
-
-    def _build_protocolo_envelope(self, xml_envio_str: str) -> str:
-        """Monta um envelope SOAP 1.2 com o payload já sem prefixos.
-        Mantém o consSitNFe com namespace padrão e sem prefixos.
-        """
-        wsdl_ns = "http://www.portalfiscal.inf.br/nfe/wsdl/NFeConsultaProtocolo4"
-        # Construímos com o namespace do SOAP apenas no envelope, sem interferir no payload
-        envelope = (
-            f"<Envelope xmlns=\"http://www.w3.org/2003/05/soap-envelope\">"
-            f"<Body>"
-            f"<nfeConsultaNF xmlns=\"{wsdl_ns}\">"
-            f"<nfeDadosMsg>"
-            f"{xml_envio_str}"
-            f"</nfeDadosMsg>"
-            f"</nfeConsultaNF>"
-            f"</Body>"
-            f"</Envelope>"
-        )
-        return envelope
-
-    def fetch_by_chave(self, chave: str):
-        """Consulta distribuição por chave específica (consChNFe)."""
-        logger.debug(f"Distribuição por chave: {chave}")
-        if not self.dist_client:
-            logger.error("Cliente de distribuição não disponível")
-            return None
-
-        if not self._rate_limiter.wait_if_needed(self.informante, "nsu"):
-            logger.warning(f"Rate limit NSU excedido para {self.informante}, pulando consChNFe")
-            return None
-
-        ns = XMLProcessor.NS['nfe']
-        distInt = etree.Element("distDFeInt", xmlns=ns, versao="1.01")
-        etree.SubElement(distInt, "tpAmb").text = "1"
-        etree.SubElement(distInt, "cUFAutor").text = str(self.cuf)
-        cons = etree.SubElement(distInt, "consChNFe")
-        etree.SubElement(cons, "chNFe").text = chave
-
-        xml_envio = etree.tostring(distInt, encoding='utf-8').decode()
-        try:
-            validar_xml_auto(xml_envio, 'distDFeInt_v1.01.xsd')
-        except Exception:
-            logger.warning("XML consChNFe não validou contra XSD; prosseguindo mesmo assim")
-
-        try:
-            resp = self.dist_client.service.nfeDistDFeInteresse(nfeDadosMsg=distInt)
-            xml_str = etree.tostring(resp, encoding='utf-8').decode()
-            self._rate_limiter.record_nsu_query(self.informante)
-            return xml_str
-        except Exception as e:
-            logger.error(f"Erro na consChNFe: {e}")
-            return None
 
 # -------------------------------------------------------------------
 # Fluxo Principal
 # -------------------------------------------------------------------
+def processar_cte(db, cert_data):
+    """
+    Processa CT-e para um certificado específico usando o serviço CTeDistribuicaoDFe.
+    
+    Args:
+        db: Instância do DatabaseManager
+        cert_data: Tupla (cnpj, path, senha, informante, cuf)
+    """
+    from modules.cte_service import CTeService
+    
+    cnpj, path, senha, inf, cuf = cert_data
+    
+    try:
+        # Inicializa serviço CT-e
+        cte_svc = CTeService(path, senha, cnpj, cuf, ambiente='producao')
+        logger.info(f"🚛 Iniciando busca de CT-e para {inf}")
+        
+        # Obtém último NSU CT-e processado
+        last_nsu_cte = db.get_last_nsu_cte(inf)
+        
+        # Primeira consulta (NSU = 0) para verificar maxNSU
+        if last_nsu_cte == "000000000000000":
+            resp = cte_svc.fetch_by_cnpj("CNPJ" if len(cnpj)==14 else "CPF", last_nsu_cte)
+            if resp:
+                max_nsu = cte_svc.extract_max_nsu(resp)
+                if max_nsu and max_nsu != "000000000000000":
+                    logger.info(f"📊 [{inf}] CT-e disponíveis até NSU: {max_nsu}")
+        
+        # Loop de busca incremental
+        ult_nsu_cte = last_nsu_cte
+        while True:
+            resp_cte = cte_svc.fetch_by_cnpj("CNPJ" if len(cnpj)==14 else "CPF", ult_nsu_cte)
+            
+            if not resp_cte:
+                logger.debug(f"Sem resposta CT-e para {inf}")
+                break
+            
+            cStat_cte = cte_svc.extract_cstat(resp_cte)
+            
+            if cStat_cte == '656':
+                logger.warning(f"Consumo indevido CT-e (656) para {inf}, aguardar")
+                break
+            
+            # Extrai e processa documentos CT-e
+            docs_processados = 0
+            for nsu, xml_cte, schema in cte_svc.extrair_docs(resp_cte):
+                try:
+                    # Detecta tipo de documento CT-e
+                    tipo_doc = detectar_tipo_documento(xml_cte)
+                    
+                    if tipo_doc != 'CTe':
+                        logger.debug(f"Documento NSU {nsu} não é CT-e, tipo: {tipo_doc}")
+                        continue
+                    
+                    # Extrai chave do CT-e
+                    tree = etree.fromstring(xml_cte.encode('utf-8'))
+                    infcte = tree.find('.//{http://www.portalfiscal.inf.br/cte}infCte')
+                    
+                    if infcte is None:
+                        # Pode ser evento ou resumo
+                        logger.debug(f"infCte não encontrado em NSU {nsu}, schema={schema}")
+                        
+                        # Tenta extrair chave de eventos
+                        ch_cte_elem = tree.find('.//{http://www.portalfiscal.inf.br/cte}chCTe')
+                        if ch_cte_elem is not None and ch_cte_elem.text:
+                            chave_cte = ch_cte_elem.text.strip()
+                        else:
+                            continue
+                    else:
+                        chave_cte = infcte.attrib.get('Id', '')[-44:]
+                    
+                    # Registra XML no banco
+                    db.registrar_xml(chave_cte, cnpj)
+                    
+                    # Salva XML em disco
+                    salvar_xml_por_certificado(xml_cte, cnpj)
+                    
+                    # Processa e salva nota detalhada
+                    db.criar_tabela_detalhada()
+                    nota_cte = extrair_nota_detalhada(xml_cte, None, db, chave_cte, inf)
+                    nota_cte['informante'] = inf  # Garantir informante
+                    
+                    # Determina status do XML (COMPLETO, RESUMO, EVENTO)
+                    root_tag = tree.tag.split('}')[-1] if '}' in tree.tag else tree.tag
+                    if root_tag in ['cteProc', 'CTe']:
+                        nota_cte['xml_status'] = 'COMPLETO'
+                    elif root_tag == 'resCTe':
+                        nota_cte['xml_status'] = 'RESUMO'
+                    elif root_tag in ['procEventoCTe', 'eventoCTe']:
+                        nota_cte['xml_status'] = 'EVENTO'
+                    else:
+                        nota_cte['xml_status'] = 'RESUMO'
+                    
+                    db.salvar_nota_detalhada(nota_cte)
+                    docs_processados += 1
+                    logger.debug(f"✅ CT-e processado: NSU={nsu}, chave={chave_cte}, schema={schema}")
+                    
+                except Exception as e:
+                    logger.exception(f"Erro ao processar CT-e NSU {nsu}: {e}")
+            
+            # Atualiza NSU CT-e
+            ult_cte = cte_svc.extract_last_nsu(resp_cte)
+            if ult_cte:
+                if ult_cte != ult_nsu_cte:
+                    db.set_last_nsu_cte(inf, ult_cte)
+                    logger.info(f"🚛 CT-e NSU avançou para {inf}: {ult_nsu_cte} → {ult_cte} ({docs_processados} docs)")
+                    ult_nsu_cte = ult_cte
+                else:
+                    # NSU não mudou - sincroniza e encerra
+                    db.set_last_nsu_cte(inf, ult_cte)
+                    if docs_processados > 0:
+                        logger.info(f"✅ CT-e sincronizado para {inf}: {docs_processados} documentos processados")
+                    break
+            else:
+                logger.debug("SEFAZ não retornou ultNSU para CT-e")
+                break
+                
+    except Exception as e:
+        logger.exception(f"Erro ao processar CT-e para {inf}: {e}")
+
+
 def main():
-    BASE = Path(__file__).parent
-    db = DatabaseManager(BASE / "notas.db")
-    db.criar_tabela_detalhada()
+    data_dir = get_data_dir()
+    db = DatabaseManager(data_dir / "notas.db")
     parser = XMLProcessor()
     logger.info(f"=== Início da busca: {datetime.now().isoformat()} ===")
+    logger.info(f"Diretório de dados: {data_dir}")
     
-    certificados_processados = 0
-    total_certificados = 0
-    
-    try:
-        # 1) Distribuição com download automático de XMLs completos
-        certificados = db.get_certificados()
-        total_certificados = len(certificados)
-        logger.info(f"Total de certificados a processar: {total_certificados}")
+    # 1) Distribuição - NFe E CTe
+    for cnpj, path, senha, inf, cuf in db.get_certificados():
+        logger.debug(f"Processando certificado: CNPJ={cnpj}, arquivo={path}, informante={inf}, cUF={cuf}")
         
-        for cnpj, path, senha, inf, cuf in certificados:
-            try:
-                logger.debug(f"Processando certificado: CNPJ={cnpj}, arquivo={path}, informante={inf}, cUF={cuf}")
-                
-                # Inicializar serviço com tratamento de exceções
-                try:
-                    svc = NFeService(path, senha, cnpj, cuf)
-                    if not svc.dist_client:
-                        logger.error(f"Não foi possível inicializar serviço para certificado {cnpj}")
-                        continue
-                except Exception as e:
-                    logger.error(f"Erro ao inicializar serviço para certificado {cnpj}: {e}")
-                    continue
-                
-                last_nsu = db.get_last_nsu(inf)
-                resp = svc.fetch_by_cnpj("CNPJ" if len(cnpj)==14 else "CPF", last_nsu)
-                
-                if not resp:
-                    logger.warning(f"Sem resposta da SEFAZ para certificado {cnpj}")
-                    continue
-                    
-                cStat = parser.extract_cStat(resp)
-                ult = parser.extract_last_nsu(resp)
-                
-                if cStat == '656':
-                    logger.info(f"{inf}: Consumo indevido (656), manter NSU em {last_nsu}")
-                else:
-                    if ult:
-                        db.set_last_nsu(inf, ult)
-                    
-                    # Cria downloader de XMLs completos se disponível
-                    complete_downloader = None
-                    if create_complete_downloader:
-                        complete_downloader = create_complete_downloader(svc, parser, db)
-                        
-                        for nsu, xml in parser.extract_docs(resp):
-                            try:
-                                # Detecta o tipo de documento
-                                doc_type = parser.detect_doc_type(xml)
-                                if doc_type == 'resNFe':
-                                    # Validar como resumo e salvar como RESUMO
-                                    try:
-                                        validar_xml_auto(xml, 'resNFe_v1.01.xsd')
-                                    except Exception:
-                                        logger.debug("resNFe não validou no XSD; prosseguindo")
-                                    nota = parser.extrair_dados_resnfe(xml)
-                                    if nota:
-                                        nota['xml_status'] = 'RESUMO'
-                                        nota['informante'] = inf
-                                        nota['nsu'] = nsu
-                                        db.salvar_nota_detalhada(nota)
-                                elif doc_type == 'resCTe':
-                                    # Resumo de CTe → criar entrada mínima como RESUMO
-                                    try:
-                                        validar_xml_auto(xml, 'resCTe_v1.04.xsd')
-                                    except Exception:
-                                        logger.debug("resCTe não validou no XSD; prosseguindo")
-                                    try:
-                                        tree_res = etree.fromstring(xml.encode('utf-8'))
-                                        nscte = '{http://www.portalfiscal.inf.br/cte}'
-                                        chave_cte = tree_res.findtext(f'.//{nscte}chCTe') or ''
-                                        xNome = tree_res.findtext(f'.//{nscte}xNome') or ''
-                                        dEmi = tree_res.findtext(f'.//{nscte}dEmi') or ''
-                                        nota_res = {
-                                            'chave': chave_cte,
-                                            'ie_tomador': '',
-                                            'nome_emitente': xNome,
-                                            'cnpj_emitente': '',
-                                            'numero': '',
-                                            'data_emissao': dEmi,
-                                            'tipo': 'CTe',
-                                            'valor': '',
-                                            'uf': '',
-                                            'natureza': '',
-                                            'status': 'Resumo',
-                                            'xml_status': 'RESUMO',
-                                            'informante': inf,
-                                            'nsu': nsu,
-                                            'atualizado_em': datetime.now().isoformat(),
-                                            'cnpj_destinatario': ''
-                                        }
-                                        db.salvar_nota_detalhada(nota_res)
-                                    except Exception:
-                                        logger.debug("Falha ao extrair dados de resCTe; prosseguindo")
-                                else:
-                                    # Tenta tratar como XML completo
-                                    try:
-                                        validar_xml_auto(xml, 'leiauteNFe_v4.00.xsd')
-                                    except Exception:
-                                        logger.debug("XML completo não validou no XSD; prosseguindo")
-                                    tree   = etree.fromstring(xml.encode('utf-8'))
-                                    infnfe = tree.find('.//{http://www.portalfiscal.inf.br/nfe}infNFe')
-                                    infcte = tree.find('.//{http://www.portalfiscal.inf.br/cte}infCte')
-                                    if infnfe is not None:
-                                        chave  = infnfe.attrib.get('Id','')[-44:]
-                                        # Extrai dados completos de NFe
-                                        nota = DatabaseManager.extrair_dados_nfe(xml, db)
-                                        if nota:
-                                            nota['xml_status'] = 'COMPLETO'
-                                            nota['informante'] = inf
-                                            nota['nsu'] = nsu
-                                            db.salvar_nota_detalhada(nota)
-                                            db.registrar_xml(chave, cnpj)
-                                    elif infcte is not None:
-                                        chave  = infcte.attrib.get('Id','')[-44:]
-                                        # Extrai dados completos de CTe
-                                        nota_cte = extrair_detalhe_cte(xml, chave)
-                                        if nota_cte:
-                                            nota_cte['xml_status'] = 'COMPLETO'
-                                            nota_cte['informante'] = inf
-                                            nota_cte['nsu'] = nsu
-                                            db.salvar_nota_detalhada(nota_cte)
-                                            db.registrar_xml(chave, cnpj)
-                                    else:
-                                        logger.debug("Documento completo não corresponde a NFe ou CTe conhecidos; pulando")
-                            except Exception as e:
-                                logger.error(f"Erro ao processar docZip NSU {nsu}: {e}")
-                                
-                certificados_processados += 1
-                logger.info(f"Certificado {cnpj} processado ({certificados_processados}/{total_certificados})")
-                
-            except Exception as e:
-                logger.error(f"Erro ao processar certificado {cnpj}: {e}")
-                continue
-                
-    except Exception as e:
-        logger.error(f"Erro geral na busca de distribuição: {e}")
+        # 1.1) Busca NFe
+        svc      = NFeService(path, senha, cnpj, cuf)
+        last_nsu = db.get_last_nsu(inf)
+        resp     = svc.fetch_by_cnpj("CNPJ" if len(cnpj)==14 else "CPF", last_nsu)
+        if not resp:
+            logger.warning(f"Sem resposta NFe para {inf}")
+        else:
+            cStat = parser.extract_cStat(resp)
+            ult   = parser.extract_last_nsu(resp)
+            if cStat == '656':
+                logger.info(f"{inf}: Consumo indevido NFe (656), manter NSU em {last_nsu}")
+            else:
+                if ult:
+                    db.set_last_nsu(inf, ult)
+                for nsu, xml in parser.extract_docs(resp):
+                    try:
+                        validar_xml_auto(xml, 'leiauteNFe_v4.00.xsd')
+                        tree   = etree.fromstring(xml.encode('utf-8'))
+                        infnfe = tree.find('.//{http://www.portalfiscal.inf.br/nfe}infNFe')
+                        if infnfe is None:
+                            logger.debug("infNFe não encontrado no XML, pulando")
+                            continue
+                        chave  = infnfe.attrib.get('Id','')[-44:]
+                        db.registrar_xml(chave, cnpj)
+                    except Exception:
+                        logger.exception("Erro ao processar docZip NFe")
+        
+        # 1.2) Busca CTe em paralelo
+        try:
+            processar_cte(db, (cnpj, path, senha, inf, cuf))
+        except Exception as e:
+            logger.exception(f"Erro geral ao processar CT-e para {inf}: {e}")
     
     # 2) Consulta de Protocolo
-    try:
-        logger.info("Iniciando consulta de protocolos...")
-        faltam = db.get_chaves_missing_status()
-        if not faltam:
-            logger.info("Nenhuma chave faltando status")
-        else:
-            logger.info(f"Consultando protocolo para {len(faltam)} chaves")
-            protocolos_consultados = 0
-            
-            for chave, cnpj in faltam:
-                try:
-                    cert = db.find_cert_by_cnpj(cnpj)
-                    if not cert:
-                        logger.warning(f"Certificado não encontrado para {cnpj}, ignorando {chave}")
-                        continue
-                        
-                    _, path, senha, inf, cuf = cert
-                    
-                    try:
-                        svc = NFeService(path, senha, cnpj, cuf)
-                        if not svc.cons_client:
-                            logger.warning(f"Cliente de protocolo não disponível para {cnpj}")
-                            continue
-                    except Exception as e:
-                        logger.error(f"Erro ao inicializar serviço de protocolo para {cnpj}: {e}")
-                        continue
-                    
-                    logger.debug(f"Consultando protocolo para NF-e {chave} (informante {inf})")
-                    prot_xml = svc.fetch_prot_nfe(chave)
-                    
-                    if prot_xml:
-                        ch, cStat, xMotivo = parser.parse_protNFe(prot_xml)
-                        
-                        # Trata erros específicos da SEFAZ
-                        if cStat == '404':
-                            logger.warning(f"Erro 404 (namespace) para chave {chave}: {xMotivo}")
-                            # Marca como erro para não tentar novamente
-                            db.set_nf_status(chave, '404', f"Erro SEFAZ: {xMotivo}")
-                            protocolos_consultados += 1  # Conta como processado
-                            continue
-                            
-                        if ch and ch == chave:  # Verifica se a chave confere
-                            db.set_nf_status(ch, cStat, xMotivo)
-                            protocolos_consultados += 1
-                        elif ch:  # Chave diferente
-                            logger.warning(f"Chave retornada ({ch}) diferente da solicitada ({chave})")
-                            db.set_nf_status(chave, 'ERRO', "Chave divergente na resposta")
-                            protocolos_consultados += 1
-                        else:
-                            logger.warning(f"Chave não encontrada na resposta do protocolo para {chave}")
-                            # Marca como erro para não ficar tentando infinitamente
-                            db.set_nf_status(chave, 'SEM_PROTOCOLO', 'Protocolo não encontrado na resposta')
-                            protocolos_consultados += 1
-                    else:
-                        logger.warning(f"Sem resposta de protocolo para chave {chave}")
-                        db.set_nf_status(chave, 'SEM_RESPOSTA', 'SEFAZ não retornou dados')
-                        protocolos_consultados += 1
-                            
-                except Exception as e:
-                    logger.error(f"Erro ao consultar protocolo para chave {chave}: {e}")
-                    # Marca como erro para não tentar novamente
-                    db.set_nf_status(chave, 'ERRO', f"Erro consulta: {str(e)[:100]}")
-                    continue
-            
-            logger.info(f"Consulta de protocolos concluída: {protocolos_consultados} protocolos atualizados")
-            
-    except Exception as e:
-        logger.error(f"Erro geral na consulta de protocolos: {e}")
-    
+    faltam = db.get_chaves_missing_status()
+    if not faltam:
+        logger.info("Nenhuma chave faltando status")
+    else:
+        for chave, cnpj in faltam:
+            cert = db.find_cert_by_cnpj(cnpj)
+            if not cert:
+                logger.warning(f"Certificado não encontrado para {cnpj}, ignorando {chave}")
+                continue
+            _, path, senha, inf, cuf = cert
+            svc = NFeService(path, senha, cnpj, cuf)
+            logger.debug(f"Consultando protocolo para NF-e {chave} (informante {inf})")
+            prot_xml = svc.fetch_prot_nfe(chave)
+            if not prot_xml:
+                continue
+            ch, cStat, xMotivo = parser.parse_protNFe(prot_xml)
+            if ch:
+                db.set_nf_status(ch, cStat, xMotivo)
     logger.info(f"=== Busca concluída: {datetime.now().isoformat()} ===")
-    logger.info(f"Certificados processados: {certificados_processados}/{total_certificados}")
+
+
+def consultar_nfe_por_chave(chave: str, certificado_path: str, senha: str, cnpj: str, cuf: str) -> str:
+    """
+    Função helper para consultar XML completo de uma NFe pela chave de acesso.
+    Retorna o XML completo em formato string, ou None se não encontrado.
+    """
+    try:
+        logger.info(f"Consultando NFe por chave: {chave}")
+        svc = NFeService(certificado_path, senha, cnpj, cuf)
+        prot_xml = svc.fetch_prot_nfe(chave)
+        
+        if not prot_xml:
+            logger.warning(f"Nenhuma resposta obtida para chave {chave}")
+            return None
+        
+        # Verifica se o retorno contém o XML completo (procNFe)
+        if '<protNFe' in prot_xml or '<retConsSitNFe' in prot_xml:
+            logger.info(f"XML completo obtido para chave {chave}")
+            return prot_xml
+        
+        logger.warning(f"Resposta não contém XML completo para chave {chave}")
+        return None
+        
+    except Exception as e:
+        logger.error(f"Erro ao consultar chave {chave}: {e}")
+        return None
+
 
 if __name__ == "__main__":
-    import sys
-    BASE = Path(__file__).parent
-    db = DatabaseManager(BASE / "notas.db")
+    data_dir = get_data_dir()
+    db = DatabaseManager(data_dir / "notas.db")
     parser = XMLProcessor()
-    
-    # Se receber argumentos da interface, executa apenas uma vez
-    if len(sys.argv) > 1:
-        logger.info("Executando busca única (chamada da interface)")
-        main()
-    else:
-        # Execução normal com loop infinito
-        logger.info("Executando busca periódica (modo daemon)")
-        ciclo_nsu(db, parser, intervalo=3600)  # 3600 segundos = 1h
+    logger.info(f"Diretório de dados: {data_dir}")
+    ciclo_nsu(db, parser, intervalo=3900)  # 3900 segundos = 65 minutos

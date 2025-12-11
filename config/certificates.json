@@ -11,7 +11,7 @@
       "is_valid": true,
       "fingerprint": "01881fc92c7d32ce59a742875276a0801b28e3d0fafbcfb50af1ab9928551f59",
       "added_at": "2025-10-30T14:37:57.212864",
-      "days_until_expiry": 117
+      "days_until_expiry": 113
     },
     {
       "file_path": "C:/Arquivo Walter - Empresas/Certificados/CERTIFICADO DIGITAL PARTNESS FUTURA valido ate 21 07 2026.pfx",
@@ -24,7 +24,7 @@
       "is_valid": true,
       "fingerprint": "a192a963fbd63ba82526dd7070ae2c5ffaf13bfb09cfc47f52e6c14fc0a77346",
       "added_at": "2025-10-30T14:38:45.094520",
-      "days_until_expiry": 263
+      "days_until_expiry": 259
     },
     {
       "file_path": "C:/Arquivo Walter - Empresas/Certificados/CERTIFICADO DIGITAL ALFA COMPUTADORES.pfx",
@@ -37,7 +37,19 @@
       "is_valid": true,
       "fingerprint": "2c7b480a98afcd56187e1d0305818d8cd2ed971ceca3804080f3d5fc0759c948",
       "added_at": "2025-10-30T15:16:58.619032",
-      "days_until_expiry": 40
+      "days_until_expiry": 36
+    },
+    {
+      "file_path": "C:/Arquivo Walter - Empresas/Certificados/CERTIFICADO DIGITAL JL COMERCIO BH.pfx",
+      "alias": "JL COMERCIO",
+      "password": "123456",
+      "cn": "JL COMERCIO ALIMENTICIO LTDA:48160135000140",
+      "cnpj": "48160135000140",
+      "cpf": "",
+      "not_valid_after": "2026-09-17T14:58:00+00:00",
+      "is_valid": true,
+      "fingerprint": "86c78755402a8f7ebb1c332be4e8b4df40d92d4bd786a432d7fc26700950f222",
+      "added_at": "2025-11-03T09:57:59.363587"
     }
   ],
   "active_certificate": "C:/Arquivo Walter - Empresas/Certificados/CERTIFICADO DIGITAL PARTNESS FUTURA valido ate 21 07 2026.pfx"
