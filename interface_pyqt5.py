@@ -2159,7 +2159,9 @@ class MainWindow(QMainWindow):
         from PyQt5.QtCore import Qt
         
         try:
-            updater = GitHubUpdater("W4lterBr/NF-e", BASE_DIR)
+            # BASE_DIR: onde estão os arquivos .py (para atualizar)
+            # DATA_DIR: onde criar backups (tem permissão de escrita)
+            updater = GitHubUpdater("W4lterBr/NF-e", BASE_DIR, backup_dir=DATA_DIR / "backups")
             
             # Verifica se há atualizações
             has_update, current, remote = updater.check_for_updates()

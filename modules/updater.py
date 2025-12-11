@@ -15,14 +15,16 @@ logger = logging.getLogger(__name__)
 class GitHubUpdater:
     """Gerenciador de atualizações via GitHub."""
     
-    def __init__(self, repo: str, base_dir: Path):
+    def __init__(self, repo: str, base_dir: Path, backup_dir: Optional[Path] = None):
         """
         Args:
             repo: Repositório no formato 'usuario/repo'
-            base_dir: Diretório base da aplicação
+            base_dir: Diretório base da aplicação (onde estão os arquivos .py)
+            backup_dir: Diretório para backups (opcional, padrão: base_dir/backups)
         """
         self.repo = repo
         self.base_dir = Path(base_dir)
+        self.backup_dir = Path(backup_dir) if backup_dir else self.base_dir / "backups"
         self.api_url = f"https://api.github.com/repos/{repo}"
         self.raw_url = f"https://raw.githubusercontent.com/{repo}/main"
         self.version_file = self.base_dir / "version.txt"
@@ -124,11 +126,9 @@ class GitHubUpdater:
         if not file_path.exists():
             return True
             
-        backup_dir = self.base_dir / "backups"
-        backup_dir.mkdir(exist_ok=True)
-        
         try:
-            backup_path = backup_dir / f"{file_path.name}.bak"
+            self.backup_dir.mkdir(parents=True, exist_ok=True)
+            backup_path = self.backup_dir / f"{file_path.name}.bak"
             shutil.copy2(file_path, backup_path)
             logger.info(f"Backup criado: {backup_path}")
             return True

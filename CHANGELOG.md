@@ -1,5 +1,19 @@
 # Changelog - BOT Busca NFE
 
+## [1.0.4] - 2025-12-11
+
+### Corrigido
+- 🔒 **CRÍTICO**: Erro de permissão ao criar backups durante atualização
+- GitHubUpdater agora aceita backup_dir opcional
+- Backups salvos em %APPDATA%\BOT Busca NFE\backups
+- Arquivos atualizados em Program Files (só leitura dos .py)
+
+### Melhorado
+- Sistema de atualização 100% funcional sem admin
+- Separação correta: arquivos em Program Files, backups em AppData
+
+🎯 Atualizações funcionam perfeitamente agora!
+
 ## [1.0.3] - 2025-12-11
 
 ### Corrigido
