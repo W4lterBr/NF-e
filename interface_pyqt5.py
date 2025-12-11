@@ -273,19 +273,6 @@ class MainWindow(QMainWindow):
 
         central = QWidget()
         self.setCentralWidget(central)
-    
-    def _update_window_title(self):
-        """Atualiza o título da janela com a versão atual."""
-        try:
-            version_file = BASE_DIR / "version.txt"
-            if version_file.exists():
-                version = version_file.read_text(encoding='utf-8').strip()
-            else:
-                version = "1.0.0"
-        except Exception:
-            version = "1.0.0"
-        
-        self.setWindowTitle(f"Busca de Notas Fiscais - v{version}")
 
         # Use a horizontal splitter: left = certificados tree, right = main area (toolbar + tabs)
         main_split = QSplitter()
@@ -1187,6 +1174,19 @@ class MainWindow(QMainWindow):
             self.table.verticalHeader().setDefaultSectionSize(24)
         except Exception:
             pass
+
+    def _update_window_title(self):
+        """Atualiza o título da janela com a versão atual."""
+        try:
+            version_file = BASE_DIR / "version.txt"
+            if version_file.exists():
+                version = version_file.read_text(encoding='utf-8').strip()
+            else:
+                version = "1.0.0"
+        except Exception:
+            version = "1.0.0"
+        
+        self.setWindowTitle(f"Busca de Notas Fiscais - v{version}")
 
     def _apply_theme(self):
         # Global stylesheet for a clean modern look
