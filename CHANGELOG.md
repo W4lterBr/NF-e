@@ -1,5 +1,18 @@
 # Changelog - BOT Busca NFE
 
+## [1.0.13] - 2025-12-11
+
+### Corrigido
+- ✨ Título da janela agora atualiza após aplicar atualizações
+- Versão exibida corretamente sem precisar reiniciar
+- Função _update_window_title() criada para atualizar título dinamicamente
+
+### Melhorado
+- Usuário vê imediatamente a nova versão após atualizar
+- Melhor feedback visual após atualizações
+
+🎯 Versão sempre atualizada no título!
+
 ## [1.0.12] - 2025-12-11
 
 ### Melhorado

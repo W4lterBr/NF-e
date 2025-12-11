@@ -265,7 +265,17 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         
-        # Lê a versão do arquivo version.txt
+        self._update_window_title()
+        self.resize(1200, 720)
+        ensure_logs_dir()
+
+        self.db = UIDB(DB_PATH)
+
+        central = QWidget()
+        self.setCentralWidget(central)
+    
+    def _update_window_title(self):
+        """Atualiza o título da janela com a versão atual."""
         try:
             version_file = BASE_DIR / "version.txt"
             if version_file.exists():
@@ -276,13 +286,6 @@ class MainWindow(QMainWindow):
             version = "1.0.0"
         
         self.setWindowTitle(f"Busca de Notas Fiscais - v{version}")
-        self.resize(1200, 720)
-        ensure_logs_dir()
-
-        self.db = UIDB(DB_PATH)
-
-        central = QWidget()
-        self.setCentralWidget(central)
 
         # Use a horizontal splitter: left = certificados tree, right = main area (toolbar + tabs)
         main_split = QSplitter()
@@ -2265,6 +2268,8 @@ class MainWindow(QMainWindow):
                 )
                 
                 if reply == QMessageBox.Yes:
+                    # Atualiza o título antes de reiniciar (caso usuário cancele)
+                    self._update_window_title()
                     QApplication.quit()
                     if getattr(sys, 'frozen', False):
                         # Executável compilado
@@ -2272,6 +2277,9 @@ class MainWindow(QMainWindow):
                     else:
                         # Desenvolvimento
                         os.execl(sys.executable, sys.executable, *sys.argv)
+                else:
+                    # Usuário não quer reiniciar agora - atualiza título mesmo assim
+                    self._update_window_title()
             else:
                 QMessageBox.warning(
                     self,
