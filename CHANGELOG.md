@@ -1,5 +1,17 @@
 # Changelog - BOT Busca NFE
 
+## [1.0.10] - 2025-12-11
+
+### Adicionado
+- ✨ Versão agora é exibida no título da janela: "Busca de Notas Fiscais - v1.0.10"
+- Leitura automática de version.txt ao iniciar aplicação
+
+### Melhorado
+- Usuário pode ver imediatamente qual versão está usando
+- Facilita verificação de atualizações
+
+🎯 Versão sempre visível na barra de título!
+
 ## [1.0.9] - 2025-12-11
 
 ### Corrigido

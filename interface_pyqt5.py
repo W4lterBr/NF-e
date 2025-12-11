@@ -264,7 +264,18 @@ class SearchDialog(QDialog):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Busca de Notas Fiscais")
+        
+        # Lê a versão do arquivo version.txt
+        try:
+            version_file = BASE_DIR / "version.txt"
+            if version_file.exists():
+                version = version_file.read_text(encoding='utf-8').strip()
+            else:
+                version = "1.0.0"
+        except Exception:
+            version = "1.0.0"
+        
+        self.setWindowTitle(f"Busca de Notas Fiscais - v{version}")
         self.resize(1200, 720)
         ensure_logs_dir()
 
