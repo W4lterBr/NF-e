@@ -147,6 +147,24 @@ def run_search(progress_cb: Optional[Callable[[str], None]] = None) -> Dict[str,
                 except Exception:
                     pass
         
+        # Adiciona handler ao logger para capturar logs
+        import logging
+        if progress_cb:
+            class ProgressHandler(logging.Handler):
+                def emit(self, record):
+                    try:
+                        msg = self.format(record)
+                        progress_cb(msg)
+                    except:
+                        pass
+            
+            # Obtém o logger do nfe_search
+            logger = logging.getLogger('nfe_search')
+            handler = ProgressHandler()
+            handler.setFormatter(logging.Formatter('%(levelname)s: %(message)s'))
+            logger.addHandler(handler)
+            logger.setLevel(logging.INFO)
+        
         sys.stdout = ProgressCapture()
         
         # Executa a função main() do nfe_search

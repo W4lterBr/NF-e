@@ -1,5 +1,18 @@
 # Changelog - BOT Busca NFE
 
+## [1.0.15] - 2025-12-11
+
+### Corrigido
+- 🔧 Janela "Buscar na SEFAZ" agora exibe logs em tempo real
+- Logger do nfe_search agora conectado ao progress callback
+- Handler de logging adicionado para capturar mensagens INFO/DEBUG
+
+### Melhorado
+- Feedback visual durante busca na SEFAZ
+- Usuário vê progresso em tempo real
+
+📊 Busca totalmente visível!
+
 ## [1.0.14] - 2025-12-11
 
 ### Corrigido
