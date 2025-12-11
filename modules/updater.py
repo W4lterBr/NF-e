@@ -79,6 +79,7 @@ class GitHubUpdater:
             "modules/updater.py",
             "modules/sandbox_worker.py",
             "modules/sandbox_task.py",
+            "modules/sandbox_task_runner.py",  # ADICIONADO - worker isolado para PDFs/SEFAZ
             "modules/certificate_manager.py",
             "modules/certificate_dialog.py",
             "modules/sefaz_integration.py",

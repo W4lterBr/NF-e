@@ -1,5 +1,18 @@
 # Changelog - BOT Busca NFE
 
+## [1.0.12] - 2025-12-11
+
+### Melhorado
+- ✨ sandbox_task_runner.py agora é incluído nas atualizações automáticas
+- Sistema pode receber correções sem recompilação
+- Atualizações via GitHub baixam todos os arquivos necessários
+
+### Corrigido
+- Erro de PDF agora corrigível via atualização remota
+- Não precisa mais reinstalar para receber correções
+
+🎯 Sistema 100% atualizável remotamente!
+
 ## [1.0.11] - 2025-12-11
 
 ### Corrigido
