@@ -2222,10 +2222,8 @@ class MainWindow(QMainWindow):
                 return
             
             # Inicia busca na SEFAZ (mesma lógica do do_search)
-            dlg = SearchDialog(self)
-            dlg.setWindowTitle("Busca Completa - Buscando todos os XMLs...")
-            dlg.show()
-            QApplication.processEvents()
+            # Sem SearchDialog - usando apenas barra de status
+            self.set_status("🔄 Busca Completa: resetando NSU e buscando todos XMLs...", 0)
 
             def on_progress(line: str):
                 if not line:
@@ -2243,27 +2241,13 @@ class MainWindow(QMainWindow):
                         minutos = int(match.group(1))
                         # Calcula próxima busca
                         self._next_search_time = datetime.now() + timedelta(minutes=minutos)
-                        self.set_status(f"Busca completa finalizada. Próxima em {minutos} minutos...", 0)
+                        self.set_status(f"✅ Busca completa finalizada. Próxima em {minutos} minutos", 3000)
                     else:
-                        self.set_status("Busca completa finalizada. Aguardando próxima...", 0)
-                    
-                    # Fecha o diálogo após 2 segundos
-                    QTimer.singleShot(2000, lambda: dlg.close() if dlg else None)
+                        self.set_status("✅ Busca completa finalizada", 3000)
                     return
                 
-                # extract percentage
-                p = None
-                try:
-                    parts = line.replace(":", " ").split(" ")
-                    for part in parts:
-                        if part.isdigit():
-                            p = int(part)
-                            break
-                except Exception:
-                    pass
-                if p is not None:
-                    dlg.set_percent(p)
-                dlg.append(line)
+                # Atualiza status com a linha de progresso
+                print(line)  # Logs no console
 
             # Worker thread para não travar a interface
             class SearchWorker(QThread):
@@ -2276,7 +2260,9 @@ class MainWindow(QMainWindow):
             
             def on_finished(res: Dict[str, Any]):
                 if not res.get("ok"):
-                    dlg.append(f"\nErro: {res.get('error') or res.get('message')}")
+                    error = res.get('error') or res.get('message')
+                    print(f"Erro na busca completa: {error}")
+                    self.set_status(f"❌ Erro: {error[:50]}...", 5000)
                     self._search_in_progress = False  # Libera para nova busca
                 # Diálogo será fechado automaticamente por on_progress
                 self.refresh_all()
@@ -2301,14 +2287,16 @@ class MainWindow(QMainWindow):
             if not files:
                 QMessageBox.information(self, "PDFs em lote", "Nenhum XML encontrado.")
                 return
-            dlg = SearchDialog(self)
-            dlg.setWindowTitle("Gerando PDFs em lote…")
-            dlg.show(); QApplication.processEvents()
+            # Sem SearchDialog - usando barra de status
             total = len(files)
+            self.set_status(f"📄 Gerando PDFs: 0/{total}", 0)
+            
+            erros = 0
             for idx, f in enumerate(files, start=1):
                 try:
-                    dlg.set_percent(int(idx/total*100))
-                    dlg.append(f"[{idx}/{total}] {f.name}")
+                    self.set_status(f"📄 Gerando PDFs: {idx}/{total} ({int(idx/total*100)}%)", 0)
+                    QApplication.processEvents()
+                    
                     xml = f.read_text(encoding='utf-8', errors='ignore')
                     # detectar tipo simples
                     low = xml.lower()
@@ -2322,11 +2310,16 @@ class MainWindow(QMainWindow):
                     payload: Dict[str, Any] = {"xml": xml, "tipo": tipo, "out_path": out_path, "force_simple_fallback": True}
                     res = sandbox.run_task("generate_pdf", payload, timeout=240)
                     if not res.get('ok'):
-                        dlg.append("  - falha")
+                        erros += 1
                 except Exception:
-                    dlg.append("  - erro")
+                    erros += 1
                     continue
-            dlg.append("\nConcluído.")
+            
+            msg = f"✅ PDFs gerados: {total - erros}/{total}"
+            if erros > 0:
+                msg += f" ({erros} erros)"
+            self.set_status(msg, 5000)
+            QMessageBox.information(self, "PDFs em lote", msg)
         except Exception as e:
             QMessageBox.critical(self, "PDFs em lote", f"Erro: {e}")
 
