@@ -1,5 +1,16 @@
 # Changelog - BOT Busca NFE
 
+## [1.0.2] - 2025-12-11
+
+### Corrigido
+- ⚡ Sistema de atualização agora baixa TODOS os arquivos Python
+- Lista completa de módulos incluindo interface_pyqt5.py
+- Versão atualizada em installer.iss
+
+### Melhorado
+- Sistema de atualização mais robusto e completo
+- Atualizações funcionam corretamente agora
+
 ## [1.0.1] - 2025-12-11
 
 ### Corrigido
