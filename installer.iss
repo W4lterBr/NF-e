@@ -43,16 +43,11 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 Name: "quicklaunchicon"; Description: "Criar ícone na Barra de Tarefas"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
 
 [Files]
-; Executável principal e todos os arquivos da pasta dist
+; Executável principal e toda a pasta dist (PyInstaller onedir mode)
+; IMPORTANTE: Em onedir, o PyInstaller cria: BOT Busca NFE.exe + pasta _internal/ com tudo
 Source: "dist\BOT Busca NFE\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
-; Arquivos Python para atualizações (da raiz do projeto)
-Source: "nfe_search.py"; DestDir: "{app}"; Flags: ignoreversion
-Source: "version.txt"; DestDir: "{app}"; Flags: ignoreversion
-Source: "CHANGELOG.md"; DestDir: "{app}"; Flags: ignoreversion
-Source: "modules\*.py"; DestDir: "{app}\modules"; Flags: ignoreversion recursesubdirs createallsubdirs
-; Pastas adicionais necessárias (se ainda não estiverem em dist)
-Source: "Icone\*"; DestDir: "{app}\Icone"; Flags: ignoreversion recursesubdirs createallsubdirs; Excludes: "*.pyc,*.pyo"
-Source: "Arquivo_xsd\*"; DestDir: "{app}\Arquivo_xsd"; Flags: ignoreversion recursesubdirs createallsubdirs
+; NOTA: Arquivo_xsd, Icone e modules já estão dentro de dist\BOT Busca NFE\_internal\
+; Os arquivos .py para atualização também já estão em dist\BOT Busca NFE\ e dist\BOT Busca NFE\_internal\
 
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"

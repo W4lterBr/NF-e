@@ -1643,7 +1643,11 @@ def main():
             ch, cStat, xMotivo = parser.parse_protNFe(prot_xml)
             if ch:
                 db.set_nf_status(ch, cStat, xMotivo)
+    
     logger.info(f"=== Busca concluída: {datetime.now().isoformat()} ===")
+    # Mensagem para interface detectar fim da busca
+    print("Busca de NSU finalizada. Dormindo por 65 minutos...")
+    logger.info("Busca de NSU finalizada. Dormindo por 65 minutos...")
 
 
 def consultar_nfe_por_chave(chave: str, certificado_path: str, senha: str, cnpj: str, cuf: str) -> str:

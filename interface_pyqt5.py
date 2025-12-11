@@ -104,6 +104,7 @@ def ensure_logs_dir():
 
 def run_search(progress_cb: Optional[Callable[[str], None]] = None) -> Dict[str, Any]:
     """Executa a busca de NFe/CTe na SEFAZ."""
+    old_stdout = sys.stdout
     try:
         # Adiciona BASE_DIR ao sys.path para importação
         if str(BASE_DIR) not in sys.path:
@@ -119,24 +120,35 @@ def run_search(progress_cb: Optional[Callable[[str], None]] = None) -> Dict[str,
         sys.modules['nfe_search'] = nfe_search
         spec.loader.exec_module(nfe_search)
         
-        # Redireciona stdout para capturar progresso
-        from io import StringIO
-        old_stdout = sys.stdout
-        captured_output = StringIO()
-        
         # Classe para capturar e enviar progresso em tempo real
         class ProgressCapture:
             def write(self, text):
-                old_stdout.write(text)  # Mantém output no console
-                if progress_cb and text.strip():
-                    progress_cb(text.rstrip())
+                try:
+                    old_stdout.write(text)  # Mantém output no console
+                    if progress_cb and text.strip():
+                        progress_cb(text.rstrip())
+                except Exception as e:
+                    old_stdout.write(f"[ERRO ProgressCapture] {e}\n")
+                    
             def flush(self):
-                old_stdout.flush()
+                try:
+                    old_stdout.flush()
+                except Exception:
+                    pass
         
         sys.stdout = ProgressCapture()
         
         # Executa a função main() do nfe_search
-        nfe_search.main()
+        try:
+            nfe_search.main()
+        except SystemExit:
+            # nfe_search pode chamar sys.exit() - ignorar
+            pass
+        except Exception as e:
+            import traceback
+            error_msg = f"Erro durante execução do nfe_search: {str(e)}\n{traceback.format_exc()}"
+            sys.stdout = old_stdout
+            return {"ok": False, "error": error_msg}
         
         # Restaura stdout
         sys.stdout = old_stdout
@@ -147,7 +159,11 @@ def run_search(progress_cb: Optional[Callable[[str], None]] = None) -> Dict[str,
         sys.stdout = old_stdout
         import traceback
         error_msg = f"Erro na busca: {str(e)}\n{traceback.format_exc()}"
+        print(error_msg)  # Log no console
         return {"ok": False, "error": error_msg}
+    finally:
+        # Garante que stdout sempre será restaurado
+        sys.stdout = old_stdout
 
 
 def resolve_xml_text(item: Dict[str, Any]) -> Optional[str]:
@@ -290,7 +306,6 @@ class MainWindow(QMainWindow):
         btn_busca_chave = QPushButton("Busca por chave"); btn_busca_chave.clicked.connect(self.buscar_por_chave)
         btn_batch_pdf = QPushButton("PDFs em lote…"); btn_batch_pdf.clicked.connect(self.do_batch_pdf)
         btn_certs = QPushButton("Certificados…"); btn_certs.clicked.connect(self.open_certificates)
-        btn_update = QPushButton("🔄 Atualizações"); btn_update.clicked.connect(self.check_updates)
         btn_logs = QPushButton("Abrir logs"); btn_logs.clicked.connect(self.open_logs_folder)
         btn_open_xmls = QPushButton("Abrir XMLs"); btn_open_xmls.clicked.connect(self.open_xmls_folder)
 
@@ -311,7 +326,6 @@ class MainWindow(QMainWindow):
             btn_busca_completa.setIcon(_icon('search.png', QStyle.SP_FileDialogContentsView))
             btn_batch_pdf.setIcon(_icon('pdf.png', QStyle.SP_DialogSaveButton))
             btn_certs.setIcon(_icon('certificate.png', QStyle.SP_DialogOkButton))
-            btn_update.setIcon(_icon('update.png', QStyle.SP_BrowserReload))
             btn_logs.setIcon(_icon('log.png', QStyle.SP_MessageBoxInformation))
             btn_open_xmls.setIcon(_icon('xml.png', QStyle.SP_FileIcon))
         except Exception:
@@ -326,7 +340,6 @@ class MainWindow(QMainWindow):
         t.addWidget(btn_busca_chave)
         t.addWidget(btn_batch_pdf)
         t.addWidget(btn_certs)
-        t.addWidget(btn_update)
         t.addWidget(btn_logs)
         t.addWidget(btn_open_xmls)
         v.addLayout(t)
@@ -710,6 +723,8 @@ class MainWindow(QMainWindow):
         tarefas.addSeparator()
         add_action(tarefas, "Busca por chave", self.buscar_por_chave, "Ctrl+K", "search.png")
         add_action(tarefas, "Certificados…", self.open_certificates, "Ctrl+Shift+C", "certificate.png")
+        tarefas.addSeparator()
+        add_action(tarefas, "🔄 Atualizações", self.check_updates, "Ctrl+U", "update.png")
         tarefas.addSeparator()
         add_action(tarefas, "Limpar", self.limpar_dados, "Ctrl+Shift+L", "xml.png")
         tarefas.addSeparator()
@@ -1643,27 +1658,51 @@ class MainWindow(QMainWindow):
         class SearchWorker(QThread):
             finished_search = pyqtSignal(dict)
             progress_line = pyqtSignal(str)
+            error_occurred = pyqtSignal(str)
             
             def run(self):
-                res = run_search(progress_cb=lambda line: self.progress_line.emit(line))
-                self.finished_search.emit(res)
+                try:
+                    res = run_search(progress_cb=lambda line: self.progress_line.emit(line))
+                    self.finished_search.emit(res)
+                except Exception as e:
+                    import traceback
+                    error_msg = f"Erro fatal na thread de busca: {str(e)}\n{traceback.format_exc()}"
+                    print(error_msg)
+                    self.error_occurred.emit(error_msg)
+                    self.finished_search.emit({"ok": False, "error": error_msg})
         
         def on_finished(res: Dict[str, Any]):
-            if not res.get("ok"):
-                dlg.append(f"\nErro: {res.get('error') or res.get('message')}")
+            try:
+                if not res.get("ok"):
+                    dlg.append(f"\nErro: {res.get('error') or res.get('message')}")
+                    self._search_in_progress = False
+                # Não fecha o diálogo aqui - será fechado automaticamente por on_progress
+                self.refresh_all()
+                self._search_worker = None
+                
+                # Gera PDFs dos novos XMLs em background
+                print("[INFO] Iniciando geração de PDFs dos novos XMLs...")
+                QTimer.singleShot(1000, self._gerar_pdfs_faltantes)
+            except Exception as e:
+                import traceback
+                error_msg = f"Erro em on_finished: {str(e)}\n{traceback.format_exc()}"
+                print(error_msg)
+                QMessageBox.critical(self, "Erro", error_msg)
+        
+        def on_error(error_msg: str):
+            try:
+                print(f"[ERRO] {error_msg}")
+                dlg.append(f"\n❌ ERRO FATAL:\n{error_msg}")
                 self._search_in_progress = False
-            # Não fecha o diálogo aqui - será fechado automaticamente por on_progress
-            self.refresh_all()
-            self._search_worker = None
-            
-            # Gera PDFs dos novos XMLs em background
-            print("[INFO] Iniciando geração de PDFs dos novos XMLs...")
-            QTimer.singleShot(1000, self._gerar_pdfs_faltantes)
+                QMessageBox.critical(self, "Erro Fatal na Busca", error_msg)
+            except Exception as e:
+                print(f"Erro ao processar on_error: {e}")
         
         # Conecta sinais
         self._search_worker = SearchWorker()
         self._search_worker.progress_line.connect(on_progress)
         self._search_worker.finished_search.connect(on_finished)
+        self._search_worker.error_occurred.connect(on_error)
         self._search_worker.start()
 
     # ==========================

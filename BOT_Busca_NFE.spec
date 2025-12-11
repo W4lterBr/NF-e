@@ -9,9 +9,10 @@ block_cipher = None
 added_files = [
     ('Icone', 'Icone'),
     ('Arquivo_xsd', 'Arquivo_xsd'),
-    # Arquivos .py como dados externos (permitir atualizações sem recompilar)
-    ('nfe_search.py', '.'),
-    ('modules', 'modules'),
+    # IMPORTANTE: Não incluir .py como datas aqui
+    # Os .py serão copiados pelo build.bat para permitir atualizações
+    # ('nfe_search.py', '.'),  # REMOVIDO - será copiado pelo build.bat
+    # ('modules', 'modules'),  # REMOVIDO - será copiado pelo build.bat
 ]
 
 # Imports ocultos necessários

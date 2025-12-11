@@ -42,14 +42,22 @@ if errorlevel 1 (
     exit /b 1
 )
 
-REM Copia arquivos .py para a pasta dist (necessário para atualizações)
+REM Copia arquivos .py para a pasta dist (necessário para atualizações remotas)
 echo.
-echo Copiando arquivos Python para dist...
-copy /Y nfe_search.py "dist\BOT Busca NFE\"
-copy /Y version.txt "dist\BOT Busca NFE\"
-copy /Y CHANGELOG.md "dist\BOT Busca NFE\"
+echo [ATUALIZACAO] Copiando arquivos Python para atualizacoes...
+echo   - nfe_search.py
+copy /Y nfe_search.py "dist\BOT Busca NFE\" >nul
+echo   - version.txt
+copy /Y version.txt "dist\BOT Busca NFE\" >nul
+echo   - CHANGELOG.md
+copy /Y CHANGELOG.md "dist\BOT Busca NFE\" >nul
+
+REM Copia pasta modules completa
+echo   - modules\*.py
 if not exist "dist\BOT Busca NFE\modules" mkdir "dist\BOT Busca NFE\modules"
-xcopy /Y /E modules "dist\BOT Busca NFE\modules\"
+xcopy /Y /S /I modules\*.py "dist\BOT Busca NFE\modules\" >nul
+
+echo   Arquivos de atualizacao copiados!
 
 echo.
 echo ============================================================
