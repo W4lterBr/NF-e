@@ -1,5 +1,20 @@
 # Changelog - BOT Busca NFE
 
+## [1.0.6] - 2025-12-11
+
+### Corrigido
+- 🔒 **CRÍTICO**: Sistema fechava após primeira busca (faltava loop infinito)
+- Função main() agora executa em loop contínuo com sleep de 65 minutos
+- Tratamento de erros durante ciclo com retry automático após 5 minutos
+- Suporte a KeyboardInterrupt para parada controlada
+
+### Melhorado
+- Sistema mantém busca contínua automaticamente
+- Logs mais informativos sobre intervalo de sleep
+- Recuperação automática de erros durante execução
+
+🎯 Sistema agora roda indefinidamente como esperado!
+
 ## [1.0.5] - 2025-12-11
 
 ### Corrigido
