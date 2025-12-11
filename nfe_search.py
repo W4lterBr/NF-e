@@ -795,8 +795,8 @@ def salvar_xml_por_certificado(xml, cnpj_cpf, pasta_base="xmls"):
 # Validação de XML com XSD
 # -------------------------------------------------------------------
 def validar_xml_auto(xml, default_xsd):
-    # Mostra XML para debug
-    print("\n--- XML sendo validado ---\n", xml, "\n-------------------------\n")
+    # Debug desativado para evitar travamento com XMLs grandes
+    # print("\n--- XML sendo validado ---\n", xml, "\n-------------------------\n")
 
     # Mapeamento padrão
     ROOT_XSD_MAP = {
@@ -823,7 +823,7 @@ def validar_xml_auto(xml, default_xsd):
 
     # ATENÇÃO: Pule validação de eventos (resEvento, procEventoNFe etc)
     if root_tag.lower() in {"proceventonfe", "resevento", "receventonfe"}:
-        print(f"[DEBUG] PULANDO validação XSD para {root_tag} (problema conhecido com XSD de eventos SEFAZ)")
+        logger.debug(f"PULANDO validação XSD para {root_tag} (problema conhecido com XSD de eventos SEFAZ)")
         return True
 
     # Descobre nome do XSD correto
@@ -837,9 +837,9 @@ def validar_xml_auto(xml, default_xsd):
         base_dir = Path(base_dir)
         for p in base_dir.rglob(xsd_name):
             if p.exists():
-                print(f"[XSD] Encontrado: {p}")
+                logger.debug(f"XSD Encontrado: {p}")
                 return str(p)
-        print(f"[XSD] NÃO encontrado: {xsd_name} em {base_dir}")
+        logger.warning(f"XSD NÃO encontrado: {xsd_name} em {base_dir}")
         return None
 
     xsd_path = find_xsd(xsd_file)

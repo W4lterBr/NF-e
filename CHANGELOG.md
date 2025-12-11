@@ -1,5 +1,20 @@
 # Changelog - BOT Busca NFE
 
+## [1.0.7] - 2025-12-11
+
+### Corrigido
+- 🔒 **CRÍTICO**: Interface travava durante validação XML
+- Removido print() que imprimia XMLs gigantes (milhares de linhas)
+- Substituídos prints de debug por logger.debug/warning
+- Validação XSD agora não trava a interface
+
+### Melhorado
+- Performance muito melhor durante busca
+- Mensagens de debug vão apenas para log (não para interface)
+- Sistema mais responsivo
+
+🎯 Busca executa sem travamentos agora!
+
 ## [1.0.6] - 2025-12-11
 
 ### Corrigido
