@@ -1,5 +1,19 @@
 # Changelog - BOT Busca NFE
 
+## [1.0.14] - 2025-12-11
+
+### Corrigido
+- 🛡️ Instalador agora executa programa com privilégios de administrador após instalação
+- Flag `shellexec` adicionada ao Inno Setup para permitir UAC prompt
+- Manifesto de aplicação configurado para solicitar elevação automaticamente
+
+### Adicionado
+- Manifest Windows (`app.manifest`) com `requireAdministrator`
+- Compatibilidade Windows 7/8/8.1/10/11
+- DPI Awareness ativado
+
+🔐 Sem mais erro 740!
+
 ## [1.0.13] - 2025-12-11
 
 ### Corrigido

@@ -2,7 +2,7 @@
 ; Gera instalador profissional para Windows
 
 #define MyAppName "BOT Busca NFE"
-#define MyAppVersion "1.0.13"
+#define MyAppVersion "1.0.14"
 #define MyAppPublisher "DWM System Developer"
 #define MyAppURL "https://dwmsystems.up.railway.app/"
 #define MyAppExeName "BOT Busca NFE.exe"
@@ -56,7 +56,7 @@ Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: de
 Name: "{userappdata}\Microsoft\Internet Explorer\Quick Launch\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: quicklaunchicon
 
 [Run]
-Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Flags: nowait postinstall skipifsilent shellexec
 
 [Code]
 // Verifica se o .NET Framework está instalado (se necessário)
