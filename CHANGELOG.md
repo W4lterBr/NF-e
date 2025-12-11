@@ -1,5 +1,20 @@
 # Changelog - BOT Busca NFE
 
+## [1.0.17] - 2025-12-11
+
+### Corrigido
+- ☠️ **CRÍTICO**: Sistema não fecha mais após busca SEFAZ concluída
+- Criada função `run_single_cycle()` para executar apenas uma iteração
+- Removido loop infinito `while True` quando chamado pela interface
+- Removido `time.sleep(INTERVALO)` que travava o sistema
+
+### Melhorado
+- Busca SEFAZ agora retorna controle para interface imediatamente
+- Interface responsável por agendar próxima busca
+- Mensagem clara: "Próxima busca será agendada pela interface..."
+
+✅ Sistema permanece aberto após busca!
+
 ## [1.0.16] - 2025-12-11
 
 ### Corrigido

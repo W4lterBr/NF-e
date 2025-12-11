@@ -167,9 +167,9 @@ def run_search(progress_cb: Optional[Callable[[str], None]] = None) -> Dict[str,
         
         sys.stdout = ProgressCapture()
         
-        # Executa a função main() do nfe_search
+        # Executa apenas UMA iteração de busca (sem loop infinito)
         try:
-            nfe_search.main()
+            nfe_search.run_single_cycle()
         except SystemExit:
             # nfe_search pode chamar sys.exit() - ignorar
             pass
