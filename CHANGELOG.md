@@ -1,5 +1,21 @@
 # Changelog - BOT Busca NFE
 
+## [1.0.19] - 2025-12-11
+
+### Alterado
+- 📁 **Nova estrutura de pastas**: XMLs agora separados por tipo
+- Estrutura: `xmls/<CNPJ>/<TIPO>/<YYYY-MM>/arquivo.xml`
+- Pastas separadas: `NFE/` e `CTE/`
+- Busca inteligente: tenta nova estrutura primeiro, depois antiga
+- Compatibilidade total com XMLs já baixados (estrutura antiga)
+
+### Melhorado
+- Organização mais clara dos documentos
+- Fácil localizar NFes vs CTes
+- Manutenção facilitada
+
+🗂️ Pasta organizada por tipo!
+
 ## [1.0.18] - 2025-12-11
 
 ### Adicionado

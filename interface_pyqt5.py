@@ -1508,11 +1508,12 @@ class MainWindow(QMainWindow):
                 chave = (item.get('chave') or '').strip()
                 informante = (item.get('informante') or '').strip()
                 data_emissao = (item.get('data_emissao') or '')[:10]  # YYYY-MM-DD
+                tipo = (item.get('tipo') or 'NFe').strip().upper().replace('-', '')  # NFE ou CTE
                 if chave and informante:
                     # Extract YYYY-MM from date
                     year_month = data_emissao[:7] if len(data_emissao) >= 7 else datetime.now().strftime("%Y-%m")
-                    # Create folder structure: xmls/<CNPJ>/<YYYY-MM>/
-                    xmls_root = BASE_DIR / "xmls" / informante / year_month
+                    # Create folder structure: xmls/<CNPJ>/<TIPO>/<YYYY-MM>/
+                    xmls_root = BASE_DIR / "xmls" / informante / tipo / year_month
                     xmls_root.mkdir(parents=True, exist_ok=True)
                     # Save XML
                     xml_file = xmls_root / f"{chave}.xml"
@@ -1545,14 +1546,24 @@ class MainWindow(QMainWindow):
                 # Try to find existing XML/PDF in xmls folder
                 chave = item.get('chave', '')
                 informante = item.get('informante', '')
+                tipo = (item.get('tipo') or 'NFe').strip().upper().replace('-', '')  # NFE ou CTE
                 if chave and informante:
-                    # Search in xmls/<CNPJ>/*/*.xml
+                    # Search in xmls/<CNPJ>/<TIPO>/*/*.xml (nova estrutura)
+                    # e também xmls/<CNPJ>/*/*.xml (estrutura antiga - compatibilidade)
                     xmls_root = BASE_DIR / "xmls" / informante
                     found_xml = None
                     if xmls_root.exists():
-                        for xml_file in xmls_root.rglob(f"{chave}.xml"):
-                            found_xml = xml_file
-                            break
+                        # Tenta primeiro na estrutura nova com tipo
+                        tipo_folder = xmls_root / tipo
+                        if tipo_folder.exists():
+                            for xml_file in tipo_folder.rglob(f"{chave}.xml"):
+                                found_xml = xml_file
+                                break
+                        # Se não encontrou, busca na estrutura antiga (sem tipo)
+                        if not found_xml:
+                            for xml_file in xmls_root.rglob(f"{chave}.xml"):
+                                found_xml = xml_file
+                                break
                     if found_xml:
                         pdf_path = found_xml.with_suffix('.pdf')
                     else:
@@ -1560,7 +1571,7 @@ class MainWindow(QMainWindow):
                         import tempfile
                         tmp = Path(tempfile.gettempdir()) / "BOT_Busca_NFE_PDFs"
                         tmp.mkdir(parents=True, exist_ok=True)
-                        pdf_path = tmp / f"{(item.get('tipo') or 'NFe')}-{chave}.pdf"
+                        pdf_path = tmp / f"{tipo}-{chave}.pdf"
                 else:
                     # Use temp folder - SEMPRE usar pasta temp do Windows
                     import tempfile
