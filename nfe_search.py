@@ -1762,7 +1762,7 @@ def run_single_cycle():
                 svc = NFeService(path, senha, cnpj, cuf)
                 logger.debug(f"Consultando protocolo para NF-e {chave} (informante {inf})")
                 prot = svc.fetch_prot_nfe(chave)
-                cStat, xMotivo = parser.parse_prot_nfe(prot)
+                cStat, xMotivo = parser.parse_protNFe(prot)
                 if cStat and xMotivo:
                     db.set_nf_status(chave, cStat, xMotivo)
         
