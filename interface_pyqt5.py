@@ -450,11 +450,24 @@ class MainWindow(QMainWindow):
         central_layout.setContentsMargins(0, 0, 0, 0)
         central_layout.addWidget(main_split)
 
-        # Status bar
+        # Status bar com resumo de busca
         self._statusbar = QStatusBar()
         self.setStatusBar(self._statusbar)
         self.status_label = QLabel("Pronto")
-        self._statusbar.addWidget(self.status_label)
+        self._statusbar.addWidget(self.status_label, 1)  # stretch=1
+        
+        # Resumo de busca (sempre visível)
+        self.search_summary_label = QLabel("")
+        self.search_summary_label.setStyleSheet("color: #0066cc; font-weight: bold; padding: 0 10px;")
+        self._statusbar.addPermanentWidget(self.search_summary_label)
+        
+        # Progress bar compacta na status bar
+        self.search_progress = QProgressBar()
+        self.search_progress.setMaximumWidth(200)
+        self.search_progress.setMaximumHeight(16)
+        self.search_progress.setTextVisible(True)
+        self.search_progress.setVisible(False)
+        self._statusbar.addPermanentWidget(self.search_progress)
 
         # Menus (Central de Tarefas)
         try:
@@ -464,6 +477,14 @@ class MainWindow(QMainWindow):
 
         # Data cache
         self.notes = []
+        
+        # Estatísticas de busca
+        self._search_stats = {
+            'nfes_found': 0,
+            'ctes_found': 0,
+            'start_time': None,
+            'last_cert': ''
+        }
 
         # Incremental table fill state
         self._table_fill_timer = QTimer(self)
@@ -1205,6 +1226,23 @@ class MainWindow(QMainWindow):
             version = "1.0.0"
         
         self.setWindowTitle(f"Busca de Notas Fiscais - v{version}")
+    
+    def _update_search_summary(self):
+        """Atualiza resumo de busca em tempo real."""
+        from datetime import datetime
+        try:
+            elapsed = (datetime.now() - self._search_stats['start_time']).total_seconds()
+            cert_info = f"Cert: ...{self._search_stats['last_cert']}" if self._search_stats['last_cert'] else ""
+            
+            summary = f"🔍 NFes: {self._search_stats['nfes_found']} | CTes: {self._search_stats['ctes_found']}"
+            if cert_info:
+                summary += f" | {cert_info}"
+            summary += f" | {elapsed:.0f}s"
+            
+            self.search_summary_label.setText(summary)
+            QApplication.processEvents()
+        except Exception as e:
+            print(f"[DEBUG] Erro ao atualizar resumo: {e}")
 
     def _apply_theme(self):
         # Global stylesheet for a clean modern look
@@ -1661,6 +1699,20 @@ class MainWindow(QMainWindow):
         self._next_search_time = None
         print(f"[DEBUG] _search_in_progress={self._search_in_progress}, _next_search_time={self._next_search_time}")
         
+        # Reseta estatísticas
+        self._search_stats = {
+            'nfes_found': 0,
+            'ctes_found': 0,
+            'start_time': datetime.now(),
+            'last_cert': '',
+            'total_docs': 0
+        }
+        
+        # Mostra progress bar
+        self.search_progress.setVisible(True)
+        self.search_progress.setRange(0, 0)  # Modo indeterminado
+        self.search_summary_label.setText("🔍 Iniciando busca...")
+        
         # Atualiza timestamp da última busca
         try:
             self.db.set_last_search_time(datetime.now().isoformat())
@@ -1676,11 +1728,51 @@ class MainWindow(QMainWindow):
             if not line:
                 return
             
+            # Atualiza resumo baseado nos logs
+            try:
+                # Detecta processamento de certificado
+                if "Processando certificado" in line:
+                    import re
+                    match = re.search(r'CNPJ=(\d+)', line)
+                    if match:
+                        cnpj = match.group(1)
+                        self._search_stats['last_cert'] = cnpj[-4:]  # Últimos 4 dígitos
+                        self._update_search_summary()
+                
+                # Detecta NFe encontrada
+                if "registrar_xml" in line.lower() or "infnfe" in line.lower():
+                    self._search_stats['nfes_found'] += 1
+                    self._update_search_summary()
+                
+                # Detecta CTe encontrado
+                if "processar_cte" in line.lower() or "🚛" in line:
+                    self._search_stats['ctes_found'] += 1
+                    self._update_search_summary()
+                
+                # Detecta documentos processados
+                if "docZip" in line or "NSU" in line:
+                    self._search_stats['total_docs'] += 1
+                    self._update_search_summary()
+                    
+            except Exception as e:
+                print(f"[DEBUG] Erro ao atualizar estatísticas: {e}")
+            
             # Detecta se a busca foi finalizada e vai dormir
-            if "Busca de NSU finalizada" in line or "Dormindo por" in line:
+            if "Busca de NSU finalizada" in line or "Próxima busca será agendada" in line:
                 print(f"[DEBUG] Busca finalizada detectada: {line}")
                 # Marca que a busca finalizou
                 self._search_in_progress = False
+                
+                # Oculta progress bar
+                self.search_progress.setVisible(False)
+                
+                # Mostra resumo final
+                elapsed = (datetime.now() - self._search_stats['start_time']).total_seconds()
+                self.search_summary_label.setText(
+                    f"✅ NFes: {self._search_stats['nfes_found']} | "
+                    f"CTes: {self._search_stats['ctes_found']} | "
+                    f"Tempo: {elapsed:.0f}s"
+                )
                 
                 # Extrai tempo de espera (em minutos)
                 import re

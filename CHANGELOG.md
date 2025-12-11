@@ -1,5 +1,22 @@
 # Changelog - BOT Busca NFE
 
+## [1.0.18] - 2025-12-11
+
+### Adicionado
+- 📊 **Resumo de busca em tempo real** na barra de status
+- Contador de NFes e CTes encontrados durante busca
+- Progress bar compacta mostrando busca em andamento
+- Tempo decorrido da busca
+- Último certificado processado (4 dígitos)
+- Resumo final após conclusão: "✅ NFes: X | CTes: Y | Tempo: Zs"
+
+### Melhorado
+- Feedback visual instantâneo sem precisar abrir janela de debug
+- Estatísticas sempre visíveis na interface
+- Progress bar some automaticamente após conclusão
+
+🚀 Busca totalmente monitorada!
+
 ## [1.0.17] - 2025-12-11
 
 ### Corrigido
