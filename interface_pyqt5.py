@@ -453,7 +453,10 @@ class MainWindow(QMainWindow):
         # Status bar com resumo de busca
         self._statusbar = QStatusBar()
         self.setStatusBar(self._statusbar)
-        self.status_label = QLabel("Pronto")
+        
+        # Inicializa status com última hora de busca
+        last_search_text = self._get_last_search_status()
+        self.status_label = QLabel(last_search_text)
         self._statusbar.addWidget(self.status_label, 1)  # stretch=1
         
         # Resumo de busca (sempre visível)
@@ -742,6 +745,10 @@ class MainWindow(QMainWindow):
                 else:
                     self.status_label.setText("⏳ Iniciando próxima busca...")
                     self._next_search_time = None
+            else:
+                # Atualiza com última busca se não estiver buscando
+                last_search_text = self._get_last_search_status()
+                self.status_label.setText(last_search_text)
         except Exception as e:
             print(f"[DEBUG] Erro em _update_search_status: {e}")
             import traceback
@@ -1243,6 +1250,35 @@ class MainWindow(QMainWindow):
             QApplication.processEvents()
         except Exception as e:
             print(f"[DEBUG] Erro ao atualizar resumo: {e}")
+    
+    def _get_last_search_status(self):
+        """Retorna texto com status da última busca."""
+        from datetime import datetime
+        try:
+            last_search = self.db.get_last_search_time()
+            if last_search:
+                last_dt = datetime.fromisoformat(last_search)
+                now = datetime.now()
+                diff_minutes = (now - last_dt).total_seconds() / 60
+                
+                # Formata tempo decorrido
+                if diff_minutes < 60:
+                    tempo = f"{diff_minutes:.0f}min"
+                elif diff_minutes < 1440:  # menos de 24h
+                    horas = diff_minutes / 60
+                    tempo = f"{horas:.1f}h"
+                else:
+                    dias = diff_minutes / 1440
+                    tempo = f"{dias:.1f}d"
+                
+                # Formata hora
+                hora = last_dt.strftime("%H:%M")
+                return f"Última busca: {hora} (há {tempo})"
+            else:
+                return "Pronto - Nenhuma busca realizada"
+        except Exception as e:
+            print(f"[DEBUG] Erro ao obter última busca: {e}")
+            return "Pronto"
 
     def _apply_theme(self):
         # Global stylesheet for a clean modern look

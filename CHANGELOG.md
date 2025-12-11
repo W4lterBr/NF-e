@@ -1,5 +1,21 @@
 # Changelog - BOT Busca NFE
 
+## [1.0.20] - 2025-12-11
+
+### Adicionado
+- ⏰ **Status com última busca** exibido ao iniciar
+- Mostra hora da última busca: "14:30"
+- Mostra tempo decorrido: "há 15min", "há 2.5h", "há 1.2d"
+- Atualização automática a cada segundo
+- Fallback: "Pronto - Nenhuma busca realizada" se nunca buscou
+
+### Melhorado
+- Usuário vê imediatamente quando foi a última busca
+- Mais contexto sobre o estado do sistema
+- Interface mais informativa
+
+🕒 Sempre sabe quando foi a última busca!
+
 ## [1.0.19] - 2025-12-11
 
 ### Alterado
