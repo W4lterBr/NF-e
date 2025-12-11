@@ -1,5 +1,23 @@
 # Changelog - BOT Busca NFE
 
+## [1.0.1] - 2025-12-11
+
+### Corrigido
+- 🐛 **CRÍTICO**: Sistema não fecha mais durante execução da busca
+- Tratamento completo de exceções em run_search()
+- Proteção contra SystemExit no nfe_search.main()
+- Thread SearchWorker com tratamento de erros fatais
+- Mensagem de finalização da busca para interface detectar fim
+- Correção na estrutura de instalação (evita duplicação de .py)
+
+### Melhorado
+- Sistema de build atualizado (BOT_Busca_NFE.spec, build.bat)
+- Instalador Inno Setup simplificado
+- Botão de atualizações movido para menu Tarefas (Ctrl+U)
+
+### Documentação
+- Adicionado ESTRUTURA_INSTALACAO.md com guia completo
+
 ## [1.0.0] - 2025-12-11
 
 ### Adicionado
