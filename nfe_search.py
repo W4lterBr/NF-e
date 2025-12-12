@@ -1751,11 +1751,16 @@ def run_single_cycle():
         logger.info("✅ Todos os certificados processados, iniciando consulta de protocolos...")
         
         # 2) Consulta de Protocolo
+        logger.debug("Verificando chaves sem status...")
         faltam = db.get_chaves_missing_status()
+        logger.debug(f"Encontradas {len(faltam) if faltam else 0} chaves sem status")
+        
         if not faltam:
             logger.info("Nenhuma chave faltando status")
         else:
-            for chave, cnpj in faltam:
+            logger.info(f"📋 Consultando status de {len(faltam)} chave(s)...")
+            for idx, (chave, cnpj) in enumerate(faltam, 1):
+                logger.info(f"[{idx}/{len(faltam)}] Consultando chave {chave}...")
                 cert = db.find_cert_by_cnpj(cnpj)
                 if not cert:
                     logger.warning(f"Certificado não encontrado para {cnpj}, ignorando {chave}")
@@ -1767,6 +1772,7 @@ def run_single_cycle():
                 chNFe, cStat, xMotivo = parser.parse_protNFe(prot)
                 if cStat and xMotivo:
                     db.set_nf_status(chave, cStat, xMotivo)
+                    logger.info(f"✅ Status atualizado: {chave} → {cStat} - {xMotivo}")
         
         logger.info(f"=== Busca concluída: {datetime.now().isoformat()} ===")
         logger.info(f"Busca de NSU finalizada. Próxima busca será agendada pela interface...")
