@@ -1505,9 +1505,13 @@ def processar_cte(db, cert_data):
                 if max_nsu and max_nsu != "000000000000000":
                     logger.info(f"📊 [{inf}] CT-e disponíveis até NSU: {max_nsu}")
         
-        # Loop de busca incremental
+        # Loop de busca incremental com limite de segurança
         ult_nsu_cte = last_nsu_cte
-        while True:
+        max_iterations = 100  # Limite de segurança para evitar loop infinito
+        iteration_count = 0
+        
+        while iteration_count < max_iterations:
+            iteration_count += 1
             resp_cte = cte_svc.fetch_by_cnpj("CNPJ" if len(cnpj)==14 else "CPF", ult_nsu_cte)
             
             if not resp_cte:
@@ -1593,6 +1597,10 @@ def processar_cte(db, cert_data):
             else:
                 logger.debug("SEFAZ não retornou ultNSU para CT-e")
                 break
+        
+        # Log se atingiu o limite de iterações
+        if iteration_count >= max_iterations:
+            logger.warning(f"⚠️ CT-e: Atingido limite de {max_iterations} iterações para {inf}. Última NSU: {ult_nsu_cte}")
                 
     except Exception as e:
         logger.exception(f"Erro ao processar CT-e para {inf}: {e}")
