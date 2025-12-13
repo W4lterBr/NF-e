@@ -123,25 +123,25 @@ def run_search(progress_cb: Optional[Callable[[str], None]] = None) -> Dict[str,
         sys.modules['nfe_search'] = nfe_search
         spec.loader.exec_module(nfe_search)
         
-        # Flag para prevenir recursão infinita
-        _in_progress_callback = False
+        # Usa threading.Lock para proteção thread-safe contra recursão
+        import threading
+        _callback_lock = threading.Lock()
         
         # Classe para capturar e enviar progresso em tempo real
         class ProgressCapture:
             def write(self, text):
-                nonlocal _in_progress_callback
                 try:
                     # Usa original_stdout que nunca é None
                     if original_stdout:
                         original_stdout.write(text)
                     
-                    # PROTEÇÃO: Não chama progress_cb se já estamos dentro dele
-                    if progress_cb and text.strip() and not _in_progress_callback:
-                        _in_progress_callback = True
-                        try:
-                            progress_cb(text.rstrip())
-                        finally:
-                            _in_progress_callback = False
+                    # PROTEÇÃO: Usa trylock para evitar recursão sem bloquear
+                    if progress_cb and text.strip():
+                        if _callback_lock.acquire(blocking=False):
+                            try:
+                                progress_cb(text.rstrip())
+                            finally:
+                                _callback_lock.release()
                 except Exception as e:
                     # Fallback: tenta imprimir no console de qualquer forma
                     try:
@@ -162,18 +162,14 @@ def run_search(progress_cb: Optional[Callable[[str], None]] = None) -> Dict[str,
         if progress_cb:
             class ProgressHandler(logging.Handler):
                 def emit(self, record):
-                    nonlocal _in_progress_callback
                     try:
-                        # PROTEÇÃO: Não emite log se já estamos processando um callback
-                        if _in_progress_callback:
-                            return
-                        
-                        _in_progress_callback = True
-                        try:
-                            msg = self.format(record)
-                            progress_cb(msg)
-                        finally:
-                            _in_progress_callback = False
+                        # PROTEÇÃO: Usa trylock para evitar recursão
+                        if _callback_lock.acquire(blocking=False):
+                            try:
+                                msg = self.format(record)
+                                progress_cb(msg)
+                            finally:
+                                _callback_lock.release()
                     except:
                         pass
             
@@ -1283,7 +1279,7 @@ class MainWindow(QMainWindow):
             summary += f" | {elapsed:.0f}s"
             
             self.search_summary_label.setText(summary)
-            QApplication.processEvents()
+            # REMOVIDO: QApplication.processEvents() causava reentrância e travamento
         except Exception:
             pass  # Silencioso para evitar recursão
     
