@@ -123,15 +123,25 @@ def run_search(progress_cb: Optional[Callable[[str], None]] = None) -> Dict[str,
         sys.modules['nfe_search'] = nfe_search
         spec.loader.exec_module(nfe_search)
         
+        # Flag para prevenir recursão infinita
+        _in_progress_callback = False
+        
         # Classe para capturar e enviar progresso em tempo real
         class ProgressCapture:
             def write(self, text):
+                nonlocal _in_progress_callback
                 try:
                     # Usa original_stdout que nunca é None
                     if original_stdout:
                         original_stdout.write(text)
-                    if progress_cb and text.strip():
-                        progress_cb(text.rstrip())
+                    
+                    # PROTEÇÃO: Não chama progress_cb se já estamos dentro dele
+                    if progress_cb and text.strip() and not _in_progress_callback:
+                        _in_progress_callback = True
+                        try:
+                            progress_cb(text.rstrip())
+                        finally:
+                            _in_progress_callback = False
                 except Exception as e:
                     # Fallback: tenta imprimir no console de qualquer forma
                     try:
@@ -152,9 +162,18 @@ def run_search(progress_cb: Optional[Callable[[str], None]] = None) -> Dict[str,
         if progress_cb:
             class ProgressHandler(logging.Handler):
                 def emit(self, record):
+                    nonlocal _in_progress_callback
                     try:
-                        msg = self.format(record)
-                        progress_cb(msg)
+                        # PROTEÇÃO: Não emite log se já estamos processando um callback
+                        if _in_progress_callback:
+                            return
+                        
+                        _in_progress_callback = True
+                        try:
+                            msg = self.format(record)
+                            progress_cb(msg)
+                        finally:
+                            _in_progress_callback = False
                     except:
                         pass
             
@@ -1265,8 +1284,8 @@ class MainWindow(QMainWindow):
             
             self.search_summary_label.setText(summary)
             QApplication.processEvents()
-        except Exception as e:
-            print(f"[DEBUG] Erro ao atualizar resumo: {e}")
+        except Exception:
+            pass  # Silencioso para evitar recursão
     
     def _get_last_search_status(self):
         """Retorna texto com status da última busca."""
@@ -1293,9 +1312,8 @@ class MainWindow(QMainWindow):
                 return f"Última busca: {hora} (há {tempo})"
             else:
                 return "Pronto - Nenhuma busca realizada"
-        except Exception as e:
-            print(f"[DEBUG] Erro ao obter última busca: {e}")
-            return "Pronto"
+        except Exception:
+            return "Pronto"  # Silencioso para evitar recursão
     
     def _load_intervalo_config(self) -> int:
         """Carrega intervalo de busca configurado (em horas). Padrão: 1 hora."""
@@ -1766,11 +1784,9 @@ class MainWindow(QMainWindow):
     def do_search(self):
         from datetime import datetime, timedelta
         
-        print("[DEBUG] do_search iniciado")
         # Marca busca em andamento
         self._search_in_progress = True
         self._next_search_time = None
-        print(f"[DEBUG] _search_in_progress={self._search_in_progress}, _next_search_time={self._next_search_time}")
         
         # Reseta estatísticas
         self._search_stats = {
@@ -1789,9 +1805,8 @@ class MainWindow(QMainWindow):
         # Atualiza timestamp da última busca
         try:
             self.db.set_last_search_time(datetime.now().isoformat())
-            print("[DEBUG] Timestamp da busca atualizado")
-        except Exception as e:
-            print(f"[DEBUG] Erro ao atualizar timestamp: {e}")
+        except Exception:
+            pass  # Silencioso para evitar recursão
         
         # Janela de debug desabilitada - usando apenas status bar
         # dlg = SearchDialog(self)
