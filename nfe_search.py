@@ -1510,56 +1510,76 @@ def processar_cte(db, cert_data):
         max_iterations = 100  # Limite de segurança para evitar loop infinito
         iteration_count = 0
         
+        logger.info(f"🚛 [{inf}] Iniciando loop CT-e. NSU inicial: {ult_nsu_cte}")
+        
         while iteration_count < max_iterations:
             iteration_count += 1
+            logger.debug(f"🔄 [{inf}] CT-e iteração {iteration_count}/{max_iterations}, NSU atual: {ult_nsu_cte}")
+            
             resp_cte = cte_svc.fetch_by_cnpj("CNPJ" if len(cnpj)==14 else "CPF", ult_nsu_cte)
             
             if not resp_cte:
-                logger.debug(f"Sem resposta CT-e para {inf}")
+                logger.debug(f"✅ [{inf}] CT-e: Sem resposta (fim da fila)")
                 break
             
+            logger.debug(f"📥 [{inf}] CT-e: Resposta recebida, extraindo cStat...")
             cStat_cte = cte_svc.extract_cstat(resp_cte)
+            logger.debug(f"📊 [{inf}] CT-e cStat: {cStat_cte}")
             
             if cStat_cte == '656':
-                logger.warning(f"Consumo indevido CT-e (656) para {inf}, aguardar")
+                logger.warning(f"⚠️ [{inf}] CT-e: Consumo indevido (656), encerrando loop")
                 break
             
             # Extrai e processa documentos CT-e
+            logger.debug(f"📦 [{inf}] CT-e: Extraindo documentos...")
             docs_processados = 0
+            doc_count = 0
             for nsu, xml_cte, schema in cte_svc.extrair_docs(resp_cte):
+                doc_count += 1
+                logger.debug(f"📄 [{inf}] CT-e: Processando doc {doc_count}, NSU={nsu}, schema={schema}")
                 try:
                     # Detecta tipo de documento CT-e
                     tipo_doc = detectar_tipo_documento(xml_cte)
+                    logger.debug(f"🔍 [{inf}] CT-e NSU {nsu}: tipo={tipo_doc}")
                     
                     if tipo_doc != 'CTe':
-                        logger.debug(f"Documento NSU {nsu} não é CT-e, tipo: {tipo_doc}")
+                        logger.debug(f"⏭️ [{inf}] CT-e NSU {nsu}: não é CT-e, pulando")
                         continue
                     
                     # Extrai chave do CT-e
+                    logger.debug(f"🔑 [{inf}] CT-e NSU {nsu}: Parseando XML...")
                     tree = etree.fromstring(xml_cte.encode('utf-8'))
                     infcte = tree.find('.//{http://www.portalfiscal.inf.br/cte}infCte')
                     
                     if infcte is None:
                         # Pode ser evento ou resumo
-                        logger.debug(f"infCte não encontrado em NSU {nsu}, schema={schema}")
+                        logger.debug(f"🔍 [{inf}] CT-e NSU {nsu}: infCte não encontrado, tentando chCTe...")
                         
                         # Tenta extrair chave de eventos
                         ch_cte_elem = tree.find('.//{http://www.portalfiscal.inf.br/cte}chCTe')
                         if ch_cte_elem is not None and ch_cte_elem.text:
                             chave_cte = ch_cte_elem.text.strip()
+                            logger.debug(f"✅ [{inf}] CT-e NSU {nsu}: chave={chave_cte}")
                         else:
+                            logger.debug(f"❌ [{inf}] CT-e NSU {nsu}: chave não encontrada, pulando")
                             continue
                     else:
                         chave_cte = infcte.attrib.get('Id', '')[-44:]
+                        logger.debug(f"✅ [{inf}] CT-e NSU {nsu}: chave={chave_cte}")
                     
                     # Registra XML no banco
+                    logger.debug(f"💾 [{inf}] CT-e {chave_cte}: Registrando no banco...")
                     db.registrar_xml(chave_cte, cnpj)
                     
                     # Salva XML em disco
+                    logger.debug(f"💾 [{inf}] CT-e {chave_cte}: Salvando em disco...")
                     salvar_xml_por_certificado(xml_cte, cnpj)
                     
                     # Processa e salva nota detalhada
+                    logger.debug(f"📝 [{inf}] CT-e {chave_cte}: Criando tabela detalhada...")
                     db.criar_tabela_detalhada()
+                    
+                    logger.debug(f"📝 [{inf}] CT-e {chave_cte}: Extraindo nota detalhada...")
                     nota_cte = extrair_nota_detalhada(xml_cte, None, db, chave_cte, inf)
                     nota_cte['informante'] = inf  # Garantir informante
                     
@@ -1574,35 +1594,52 @@ def processar_cte(db, cert_data):
                     else:
                         nota_cte['xml_status'] = 'RESUMO'
                     
+                    logger.debug(f"💾 [{inf}] CT-e {chave_cte}: Salvando nota detalhada...")
                     db.salvar_nota_detalhada(nota_cte)
                     docs_processados += 1
-                    logger.debug(f"✅ CT-e processado: NSU={nsu}, chave={chave_cte}, schema={schema}")
+                    logger.info(f"✅ [{inf}] CT-e processado: NSU={nsu}, chave={chave_cte}")
                     
                 except Exception as e:
-                    logger.exception(f"Erro ao processar CT-e NSU {nsu}: {e}")
+                    logger.error(f"❌ [{inf}] Erro ao processar CT-e NSU {nsu}: {e}")
+                    logger.exception(e)
+            
+            logger.debug(f"📦 [{inf}] CT-e: Fim da extração. Total documentos: {doc_count}, processados: {docs_processados}")
             
             # Atualiza NSU CT-e
+            logger.debug(f"🔄 [{inf}] CT-e: Extraindo ultNSU da resposta...")
             ult_cte = cte_svc.extract_last_nsu(resp_cte)
+            logger.debug(f"📊 [{inf}] CT-e: ultNSU={ult_cte}, NSU atual={ult_nsu_cte}")
+            
             if ult_cte:
                 if ult_cte != ult_nsu_cte:
+                    logger.debug(f"💾 [{inf}] CT-e: Atualizando NSU no banco: {ult_nsu_cte} → {ult_cte}")
                     db.set_last_nsu_cte(inf, ult_cte)
-                    logger.info(f"🚛 CT-e NSU avançou para {inf}: {ult_nsu_cte} → {ult_cte} ({docs_processados} docs)")
+                    logger.info(f"➡️ [{inf}] CT-e NSU avançou: {ult_nsu_cte} → {ult_cte} ({docs_processados} docs)")
                     ult_nsu_cte = ult_cte
+                    logger.debug(f"🔄 [{inf}] CT-e: Continuando para próxima iteração...")
                 else:
                     # NSU não mudou - sincroniza e encerra
+                    logger.debug(f"🛑 [{inf}] CT-e: NSU não mudou, finalizando loop...")
                     db.set_last_nsu_cte(inf, ult_cte)
                     if docs_processados > 0:
-                        logger.info(f"✅ CT-e sincronizado para {inf}: {docs_processados} documentos processados")
+                        logger.info(f"✅ [{inf}] CT-e sincronizado: {docs_processados} documentos processados")
+                    else:
+                        logger.info(f"✅ [{inf}] CT-e sincronizado: nenhum documento novo")
+                    logger.debug(f"🏁 [{inf}] CT-e: Break - NSU não mudou")
                     break
             else:
-                logger.debug("SEFAZ não retornou ultNSU para CT-e")
+                logger.warning(f"⚠️ [{inf}] CT-e: SEFAZ não retornou ultNSU, encerrando loop")
+                logger.debug(f"🏁 [{inf}] CT-e: Break - sem ultNSU")
                 break
         
         # Log se atingiu o limite de iterações
         if iteration_count >= max_iterations:
-            logger.warning(f"⚠️ CT-e: Atingido limite de {max_iterations} iterações para {inf}. Última NSU: {ult_nsu_cte}")
+            logger.warning(f"⚠️ [{inf}] CT-e: Atingido limite de {max_iterations} iterações. Última NSU: {ult_nsu_cte}")
+        else:
+            logger.info(f"🏁 [{inf}] CT-e: Loop finalizado após {iteration_count} iterações")
                 
     except Exception as e:
+        logger.error(f"❌ [{inf}] ERRO CRÍTICO ao processar CT-e: {e}")
         logger.exception(f"Erro ao processar CT-e para {inf}: {e}")
 
 
