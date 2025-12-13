@@ -160,6 +160,10 @@ def run_search(progress_cb: Optional[Callable[[str], None]] = None) -> Dict[str,
             
             # Obtém o logger do nfe_search
             logger = logging.getLogger('nfe_search')
+            
+            # CRÍTICO: Remove handlers antigos para evitar duplicação/recursão
+            logger.handlers.clear()
+            
             handler = ProgressHandler()
             handler.setFormatter(logging.Formatter('%(levelname)s: %(message)s'))
             logger.addHandler(handler)
