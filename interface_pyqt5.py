@@ -1806,12 +1806,12 @@ class MainWindow(QMainWindow):
                     self._search_stats['total_docs'] += 1
                     self._update_search_summary()
                     
-            except Exception as e:
-                print(f"[DEBUG] Erro ao atualizar estatísticas: {e}")
+            except Exception:
+                pass  # REMOVIDO print() para evitar recursão via ProgressCapture
             
             # Detecta se a busca foi finalizada e vai dormir
             if "Busca de NSU finalizada" in line or "Próxima busca será agendada" in line:
-                print(f"[DEBUG] Busca finalizada detectada: {line}")
+                # REMOVIDO print() para evitar recursão via ProgressCapture
                 # Marca que a busca finalizou
                 self._search_in_progress = False
                 
@@ -1831,13 +1831,13 @@ class MainWindow(QMainWindow):
                 match = re.search(r'(\d+)\s*minutos', line)
                 if match:
                     minutos = int(match.group(1))
-                    print(f"[DEBUG] Próxima busca em {minutos} minutos")
+                    # REMOVIDO print() para evitar recursão
                     # Calcula próxima busca
                     self._next_search_time = datetime.now() + timedelta(minutes=minutos)
-                    print(f"[DEBUG] _next_search_time definido: {self._next_search_time}")
+                    # REMOVIDO print() para evitar recursão
                     self.set_status(f"Próxima busca em {minutos} minutos...", 0)  # 0 = permanente
                 else:
-                    print("[DEBUG] Não foi possível extrair tempo de espera")
+                    # REMOVIDO print() para evitar recursão
                     self.set_status("Busca finalizada. Aguardando próxima...", 0)
                 
                 # Diálogo removido - usando apenas status bar
