@@ -1237,21 +1237,37 @@ class XMLProcessor:
         return stat
 
     def parse_protNFe(self, xml_obj):
+        """
+        Parse protocolo de NFe. Retorna (chNFe, cStat, xMotivo).
+        Se xml_obj for None ou inválido, retorna (None, None, None).
+        """
         logger.debug("Parseando protocolo NF-e")
-        # Se já for Element, use direto
-        if isinstance(xml_obj, etree._Element):
-            tree = xml_obj
-        else:
-            tree = etree.fromstring(xml_obj.encode('utf-8'))
-        prot = tree.find('.//{http://www.portalfiscal.inf.br/nfe}protNFe')
-        if prot is None:
-            logger.debug("nenhum protNFe encontrado")
+        
+        # Validação: se recebeu None, retorna valores nulos
+        if xml_obj is None:
+            logger.warning("parse_protNFe recebeu None como entrada")
             return None, None, None
-        chNFe   = prot.findtext('{http://www.portalfiscal.inf.br/nfe}chNFe') or ''
-        cStat   = prot.findtext('{http://www.portalfiscal.inf.br/nfe}cStat') or ''
-        xMotivo = prot.findtext('{http://www.portalfiscal.inf.br/nfe}xMotivo') or ''
-        logger.debug(f"Parse protocolo → chNFe={chNFe}, cStat={cStat}, xMotivo={xMotivo}")
-        return chNFe, cStat, xMotivo
+        
+        try:
+            # Se já for Element, use direto
+            if isinstance(xml_obj, etree._Element):
+                tree = xml_obj
+            else:
+                tree = etree.fromstring(xml_obj.encode('utf-8'))
+            
+            prot = tree.find('.//{http://www.portalfiscal.inf.br/nfe}protNFe')
+            if prot is None:
+                logger.debug("nenhum protNFe encontrado")
+                return None, None, None
+            
+            chNFe   = prot.findtext('{http://www.portalfiscal.inf.br/nfe}chNFe') or ''
+            cStat   = prot.findtext('{http://www.portalfiscal.inf.br/nfe}cStat') or ''
+            xMotivo = prot.findtext('{http://www.portalfiscal.inf.br/nfe}xMotivo') or ''
+            logger.debug(f"Parse protocolo → chNFe={chNFe}, cStat={cStat}, xMotivo={xMotivo}")
+            return chNFe, cStat, xMotivo
+        except Exception as e:
+            logger.error(f"Erro ao parsear protNFe: {e}")
+            return None, None, None
     
     def extract_status_from_xml(self, xml_str):
         """
@@ -1695,6 +1711,12 @@ def run_single_cycle():
                 svc = NFeService(path, senha, cnpj, cuf)
                 logger.debug(f"Consultando protocolo para NF-e {chave} (informante {inf})")
                 prot = svc.fetch_prot_nfe(chave)
+                
+                # Valida se recebeu resposta antes de processar
+                if not prot:
+                    logger.warning(f"Sem resposta ao consultar protocolo da chave {chave}")
+                    continue
+                
                 chNFe, cStat, xMotivo = parser.parse_protNFe(prot)
                 if cStat and xMotivo:
                     db.set_nf_status(chave, cStat, xMotivo)
