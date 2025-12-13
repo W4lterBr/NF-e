@@ -68,20 +68,24 @@ def setup_logger():
     
     logger = logging.getLogger(__name__)
     
-    if not logger.hasHandlers():
+    # Sempre garantir que há handlers
+    has_file_handler = any(isinstance(h, logging.FileHandler) for h in logger.handlers)
+    has_console_handler = any(isinstance(h, logging.StreamHandler) and not isinstance(h, logging.FileHandler) for h in logger.handlers)
+    
+    if not has_file_handler:
         # Handler para arquivo
         file_handler = logging.FileHandler(log_filename, encoding='utf-8')
         file_handler.setLevel(logging.DEBUG)
         file_formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
         file_handler.setFormatter(file_formatter)
-        
+        logger.addHandler(file_handler)
+    
+    if not has_console_handler:
         # Handler para console
         console_handler = logging.StreamHandler()
         console_handler.setLevel(logging.INFO)
         console_formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
         console_handler.setFormatter(console_formatter)
-        
-        logger.addHandler(file_handler)
         logger.addHandler(console_handler)
     
     logger.setLevel(logging.DEBUG)
