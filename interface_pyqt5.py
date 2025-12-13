@@ -346,6 +346,17 @@ class MainWindow(QMainWindow):
         btn_certs = QPushButton("Certificados…"); btn_certs.clicked.connect(self.open_certificates)
         btn_logs = QPushButton("Abrir logs"); btn_logs.clicked.connect(self.open_logs_folder)
         btn_open_xmls = QPushButton("Abrir XMLs"); btn_open_xmls.clicked.connect(self.open_xmls_folder)
+        
+        # Seletor de intervalo entre buscas
+        from PyQt5.QtWidgets import QSpinBox
+        intervalo_label = QLabel("Intervalo de busca:")
+        self.spin_intervalo = QSpinBox()
+        self.spin_intervalo.setMinimum(1)
+        self.spin_intervalo.setMaximum(23)
+        self.spin_intervalo.setSuffix(" horas")
+        self.spin_intervalo.setValue(self._load_intervalo_config())
+        self.spin_intervalo.valueChanged.connect(self._save_intervalo_config)
+        self.spin_intervalo.setToolTip("Intervalo mínimo: 1 hora | Intervalo máximo: 23 horas")
 
         # Icons (fallback to standard icons if custom not found)
         def _icon(name: str, std=None) -> QIcon:
@@ -372,6 +383,8 @@ class MainWindow(QMainWindow):
         t.addWidget(self.status_dd)
         t.addWidget(self.tipo_dd)
         t.addStretch(1)
+        t.addWidget(intervalo_label)
+        t.addWidget(self.spin_intervalo)
         t.addWidget(self.btn_refresh)
         t.addWidget(btn_busca)
         t.addWidget(btn_busca_completa)
@@ -1283,6 +1296,24 @@ class MainWindow(QMainWindow):
         except Exception as e:
             print(f"[DEBUG] Erro ao obter última busca: {e}")
             return "Pronto"
+    
+    def _load_intervalo_config(self) -> int:
+        """Carrega intervalo de busca configurado (em horas). Padrão: 1 hora."""
+        try:
+            intervalo_minutos = self.db.get_next_search_interval()
+            # Converte de minutos para horas
+            return max(1, min(23, intervalo_minutos // 60))
+        except Exception:
+            return 1  # Padrão: 1 hora
+    
+    def _save_intervalo_config(self, horas: int):
+        """Salva intervalo de busca configurado (converte horas para minutos)."""
+        try:
+            minutos = horas * 60
+            self.db.set_next_search_interval(minutos)
+            self.set_status(f"Intervalo de busca atualizado: {horas} hora(s)", 3000)
+        except Exception as e:
+            QMessageBox.warning(self, "Erro", f"Não foi possível salvar intervalo: {e}")
 
     def _apply_theme(self):
         # Global stylesheet for a clean modern look
@@ -1677,10 +1708,12 @@ class MainWindow(QMainWindow):
         from datetime import datetime, timedelta
         
         try:
-            print("[DEBUG] _auto_start_search chamado")
+            # Usa o intervalo configurado pelo usuário (em horas)
+            intervalo_horas = self.spin_intervalo.value()
+            intervalo_minutos = intervalo_horas * 60
+            
             # Verificar última execução
             last_search = self.db.get_last_search_time()
-            print(f"[DEBUG] Última busca registrada: {last_search}")
             
             if last_search:
                 # Converter para datetime
@@ -1688,15 +1721,9 @@ class MainWindow(QMainWindow):
                     last_dt = datetime.fromisoformat(last_search)
                     now = datetime.now()
                     diff_minutes = (now - last_dt).total_seconds() / 60
-                    intervalo = self.db.get_next_search_interval()  # 60 minutos por padrão
-                    
-                    print(f"[DEBUG] Tempo desde última busca: {diff_minutes:.2f} minutos")
-                    print(f"[DEBUG] Intervalo configurado: {intervalo} minutos")
-                    print(f"[DEBUG] Cálculo: {now} - {last_dt} = {diff_minutes:.2f} min")
                     
                     # Se já passou o intervalo, inicia busca imediatamente
-                    if diff_minutes >= intervalo:
-                        print("[DEBUG] Intervalo atingido, iniciando busca")
+                    if diff_minutes >= intervalo_minutos:
                         self._search_in_progress = True
                         self.set_status(f"Última busca: {diff_minutes:.0f} minutos atrás. Iniciando busca automática...", 5000)
                         # Registra o horário da busca
@@ -1705,19 +1732,15 @@ class MainWindow(QMainWindow):
                         QTimer.singleShot(500, self.do_search)
                     else:
                         # Ainda está no intervalo de espera, calcula próxima busca
-                        minutos_restantes = intervalo - diff_minutes
+                        minutos_restantes = intervalo_minutos - diff_minutes
                         self._next_search_time = now + timedelta(minutes=minutos_restantes)
-                        print(f"[DEBUG] Próxima busca em {minutos_restantes:.2f} minutos")
-                        print(f"[DEBUG] _next_search_time definido: {self._next_search_time}")
                         self.set_status(f"Última busca há {diff_minutes:.0f} minutos. Próxima em {minutos_restantes:.0f} minutos.", 5000)
                         
                         # Agenda a próxima busca
                         delay_ms = int(minutos_restantes * 60 * 1000)
-                        print(f"[DEBUG] Agendando próxima busca em {delay_ms}ms")
                         QTimer.singleShot(delay_ms, self._auto_start_search)
                         
                 except Exception as e:
-                    print(f"[DEBUG] Erro ao processar última busca: {e}")
                     import traceback
                     traceback.print_exc()
                     self._search_in_progress = True
@@ -1726,7 +1749,6 @@ class MainWindow(QMainWindow):
                     QTimer.singleShot(500, self.do_search)
             else:
                 # Primeira execução
-                print("[DEBUG] Primeira execução, iniciando busca")
                 self._search_in_progress = True
                 self.set_status("Primeira execução. Iniciando busca automática...", 3000)
                 # Registra o horário da busca
@@ -1809,9 +1831,8 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass  # REMOVIDO print() para evitar recursão via ProgressCapture
             
-            # Detecta se a busca foi finalizada e vai dormir
-            if "Busca de NSU finalizada" in line or "Próxima busca será agendada" in line:
-                # REMOVIDO print() para evitar recursão via ProgressCapture
+            # Detecta se a busca foi finalizada
+            if "Busca de NSU finalizada" in line or "Próxima busca será agendada" in line or "Busca concluída" in line:
                 # Marca que a busca finalizou
                 self._search_in_progress = False
                 
@@ -1826,21 +1847,23 @@ class MainWindow(QMainWindow):
                     f"Tempo: {elapsed:.0f}s"
                 )
                 
-                # Extrai tempo de espera (em minutos)
-                import re
-                match = re.search(r'(\d+)\s*minutos', line)
-                if match:
-                    minutos = int(match.group(1))
-                    # REMOVIDO print() para evitar recursão
-                    # Calcula próxima busca
-                    self._next_search_time = datetime.now() + timedelta(minutes=minutos)
-                    # REMOVIDO print() para evitar recursão
-                    self.set_status(f"Próxima busca em {minutos} minutos...", 0)  # 0 = permanente
-                else:
-                    # REMOVIDO print() para evitar recursão
-                    self.set_status("Busca finalizada. Aguardando próxima...", 0)
+                # Usa o intervalo configurado pelo usuário (em horas)
+                intervalo_horas = self.spin_intervalo.value()
+                intervalo_minutos = intervalo_horas * 60
                 
-                # Diálogo removido - usando apenas status bar
+                # Calcula próxima busca baseado no intervalo configurado
+                self._next_search_time = datetime.now() + timedelta(minutes=intervalo_minutos)
+                
+                # Atualiza status
+                if intervalo_horas == 1:
+                    self.set_status(f"Próxima busca em {intervalo_horas} hora", 0)
+                else:
+                    self.set_status(f"Próxima busca em {intervalo_horas} horas", 0)
+                
+                # Agenda a próxima busca automaticamente
+                delay_ms = int(intervalo_minutos * 60 * 1000)
+                QTimer.singleShot(delay_ms, self._auto_start_search)
+                
                 return
             
             # Linha de progresso é exibida apenas nos logs (não mais em janela)

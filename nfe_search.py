@@ -1584,91 +1584,17 @@ def processar_cte(db, cert_data):
 
 def main():
     """
-    Executa ciclo contínuo de busca de NFe/CTe com intervalo de 65 minutos.
-    Mantém o processo ativo indefinidamente.
+    FUNÇÃO DESCONTINUADA - NÃO USAR!
+    A interface (interface_pyqt5.py) agora controla quando executar as buscas.
+    Use run_single_cycle() através da interface.
+    
+    Antiga função que executava ciclo contínuo de busca de NFe/CTe.
+    Mantida apenas para referência histórica.
     """
-    INTERVALO = 3900  # 65 minutos em segundos
-    
-    data_dir = get_data_dir()
-    db = DatabaseManager(data_dir / "notas.db")
-    parser = XMLProcessor()
-    
-    while True:
-        try:
-            logger.info(f"=== Início da busca: {datetime.now().isoformat()} ===")
-            logger.info(f"Diretório de dados: {data_dir}")
-            
-            # 1) Distribuição - NFe E CTe
-            for cnpj, path, senha, inf, cuf in db.get_certificados():
-                logger.debug(f"Processando certificado: CNPJ={cnpj}, arquivo={path}, informante={inf}, cUF={cuf}")
-                
-                # 1.1) Busca NFe
-                svc      = NFeService(path, senha, cnpj, cuf)
-                last_nsu = db.get_last_nsu(inf)
-                resp     = svc.fetch_by_cnpj("CNPJ" if len(cnpj)==14 else "CPF", last_nsu)
-                if not resp:
-                    logger.warning(f"Sem resposta NFe para {inf}")
-                else:
-                    cStat = parser.extract_cStat(resp)
-                    ult   = parser.extract_last_nsu(resp)
-                    if cStat == '656':
-                        logger.info(f"{inf}: Consumo indevido NFe (656), manter NSU em {last_nsu}")
-                    else:
-                        if ult:
-                            db.set_last_nsu(inf, ult)
-                        for nsu, xml in parser.extract_docs(resp):
-                            try:
-                                validar_xml_auto(xml, 'leiauteNFe_v4.00.xsd')
-                                tree   = etree.fromstring(xml.encode('utf-8'))
-                                infnfe = tree.find('.//{http://www.portalfiscal.inf.br/nfe}infNFe')
-                                if infnfe is None:
-                                    logger.debug("infNFe não encontrado no XML, pulando")
-                                    continue
-                                chave  = infnfe.attrib.get('Id','')[-44:]
-                                db.registrar_xml(chave, cnpj)
-                            except Exception:
-                                logger.exception("Erro ao processar docZip NFe")
-                
-                # 1.2) Busca CTe em paralelo
-                try:
-                    processar_cte(db, (cnpj, path, senha, inf, cuf))
-                except Exception as e:
-                    logger.exception(f"Erro geral ao processar CT-e para {inf}: {e}")
-            
-            # 2) Consulta de Protocolo
-            faltam = db.get_chaves_missing_status()
-            if not faltam:
-                logger.info("Nenhuma chave faltando status")
-            else:
-                for chave, cnpj in faltam:
-                    cert = db.find_cert_by_cnpj(cnpj)
-                    if not cert:
-                        logger.warning(f"Certificado não encontrado para {cnpj}, ignorando {chave}")
-                        continue
-                    _, path, senha, inf, cuf = cert
-                    svc = NFeService(path, senha, cnpj, cuf)
-                    logger.debug(f"Consultando protocolo para NF-e {chave} (informante {inf})")
-                    prot_xml = svc.fetch_prot_nfe(chave)
-                    if not prot_xml:
-                        continue
-                    ch, cStat, xMotivo = parser.parse_protNFe(prot_xml)
-                    if ch:
-                        db.set_nf_status(ch, cStat, xMotivo)
-            
-            logger.info(f"=== Busca concluída: {datetime.now().isoformat()} ===")
-            print(f"Busca de NSU finalizada. Dormindo por 65 minutos...")
-            logger.info(f"Busca de NSU finalizada. Dormindo por {INTERVALO//60} minutos...")
-            
-            # Aguarda intervalo antes da próxima busca
-            time.sleep(INTERVALO)
-            
-        except KeyboardInterrupt:
-            logger.info("Busca interrompida pelo usuário")
-            break
-        except Exception as e:
-            logger.exception(f"Erro durante ciclo de busca: {e}")
-            logger.info("Aguardando 5 minutos antes de tentar novamente...")
-            time.sleep(300)  # Aguarda 5 minutos em caso de erro
+    print("AVISO: main() está descontinuada!")
+    print("Use a interface gráfica (interface_pyqt5.py) para executar buscas.")
+    print("A interface controla o agendamento automático conforme intervalo configurado.")
+    return
 
 
 def consultar_nfe_por_chave(chave: str, certificado_path: str, senha: str, cnpj: str, cuf: str) -> str:
@@ -1775,7 +1701,7 @@ def run_single_cycle():
                     logger.info(f"✅ Status atualizado: {chave} → {cStat} - {xMotivo}")
         
         logger.info(f"=== Busca concluída: {datetime.now().isoformat()} ===")
-        logger.info(f"Busca de NSU finalizada. Próxima busca será agendada pela interface...")
+        logger.info(f"Próxima busca será agendada pela interface conforme intervalo configurado...")
         
     except Exception as e:
         logger.exception(f"Erro durante ciclo de busca: {e}")
@@ -1783,8 +1709,16 @@ def run_single_cycle():
 
 
 if __name__ == "__main__":
-    data_dir = get_data_dir()
-    db = DatabaseManager(data_dir / "notas.db")
-    parser = XMLProcessor()
-    logger.info(f"Diretório de dados: {data_dir}")
-    ciclo_nsu(db, parser, intervalo=3900)  # 3900 segundos = 65 minutos
+    print("=" * 60)
+    print("AVISO: Este módulo não deve ser executado diretamente!")
+    print("=" * 60)
+    print()
+    print("Use a interface gráfica (interface_pyqt5.py) para:")
+    print("  1. Configurar o intervalo de busca (1 a 23 horas)")
+    print("  2. Executar buscas automáticas")
+    print("  3. Visualizar resultados")
+    print()
+    print("Para iniciar a interface, execute:")
+    print("  python interface_pyqt5.py")
+    print()
+    print("=" * 60)
