@@ -362,6 +362,15 @@ class MainWindow(QMainWindow):
         self.status_dd.currentTextChanged.connect(self.refresh_table)
         self.tipo_dd = QComboBox(); self.tipo_dd.addItems(["Todos","NFe","CTe","NFS-e"])
         self.tipo_dd.currentTextChanged.connect(self.refresh_table)
+        
+        # Seletor de quantidade de linhas exibidas
+        limit_label = QLabel("Exibir:")
+        self.limit_dd = QComboBox()
+        self.limit_dd.addItems(["50", "100", "500", "1000", "Todos"])
+        self.limit_dd.setCurrentText("100")  # Padrão: 100 linhas
+        self.limit_dd.currentTextChanged.connect(self.refresh_table)
+        self.limit_dd.setToolTip("Quantidade de documentos a exibir na tabela")
+        
         self.btn_refresh = QPushButton("Atualizar"); self.btn_refresh.clicked.connect(self.refresh_all)
         btn_busca = QPushButton("Buscar na SEFAZ"); btn_busca.clicked.connect(self.do_search)
         btn_busca_completa = QPushButton("Busca Completa"); btn_busca_completa.clicked.connect(self.do_busca_completa)
@@ -408,6 +417,8 @@ class MainWindow(QMainWindow):
         t.addWidget(self.search_edit)
         t.addWidget(self.status_dd)
         t.addWidget(self.tipo_dd)
+        t.addWidget(limit_label)
+        t.addWidget(self.limit_dd)
         t.addStretch(1)
         t.addWidget(self.check_consultar_status)
         t.addWidget(intervalo_label)
@@ -907,6 +918,10 @@ class MainWindow(QMainWindow):
         st = (self.status_dd.currentText() or "Todos").lower()
         tp = (self.tipo_dd.currentText() or "Todos").lower().replace('-', '')
         
+        # Limite de linhas
+        limit_text = self.limit_dd.currentText()
+        limit = None if limit_text == "Todos" else int(limit_text)
+        
         out: List[Dict[str, Any]] = []
         for it in (self.notes or []):
             # NÃO MOSTRAR eventos na interface (apenas armazenar em disco)
@@ -933,6 +948,11 @@ class MainWindow(QMainWindow):
                 if tp == "nfse" and raw not in ("NFSE", "NFS-E"):
                     continue
             out.append(it)
+            
+            # Aplica limite se definido
+            if limit and len(out) >= limit:
+                break
+        
         return out
 
     def _populate_certs_tree(self):
@@ -1421,7 +1441,7 @@ class MainWindow(QMainWindow):
         return None
 
     def _on_table_context_menu(self, pos):
-        """Menu de contexto para buscar XML completo de resumos"""
+        """Menu de contexto com opções para a nota/CT-e selecionada"""
         # Pega o item clicado
         item_at_pos = self.table.itemAt(pos)
         if not item_at_pos:
@@ -1435,19 +1455,26 @@ class MainWindow(QMainWindow):
         item = flt[row]
         xml_status = (item.get('xml_status') or '').upper()
         
-        # Só mostra menu se for RESUMO
-        if xml_status != 'RESUMO':
-            return
-        
         # Cria menu
         menu = QMenu(self)
-        action_buscar = menu.addAction("🔍 Buscar XML Completo na SEFAZ")
+        
+        # Opção: Buscar XML Completo (só para RESUMO)
+        if xml_status == 'RESUMO':
+            action_buscar = menu.addAction("🔍 Buscar XML Completo na SEFAZ")
+        else:
+            action_buscar = None
+        
+        # Opção: Eventos (sempre disponível)
+        menu.addSeparator()
+        action_eventos = menu.addAction("📋 Ver Eventos")
         
         # Mostra menu e pega ação
         action = menu.exec_(self.table.viewport().mapToGlobal(pos))
         
         if action == action_buscar:
             self._buscar_xml_completo(item)
+        elif action == action_eventos:
+            self._mostrar_eventos(item)
     
     def _buscar_xml_completo(self, item: Dict[str, Any]):
         """Busca o XML completo de um resumo na SEFAZ"""
@@ -1556,6 +1583,134 @@ class MainWindow(QMainWindow):
         except Exception as e:
             self.set_status(f"Erro: {str(e)}", 5000)
             QMessageBox.critical(self, "Erro", f"Erro ao buscar XML completo:\n\n{str(e)}")
+    
+    def _mostrar_eventos(self, item: Dict[str, Any]):
+        """Mostra os eventos vinculados a uma NFe/CT-e"""
+        chave = item.get('chave', '')
+        if not chave or len(chave) != 44:
+            QMessageBox.warning(self, "Eventos", "Chave de acesso inválida!")
+            return
+        
+        informante = item.get('informante', '')
+        tipo = (item.get('tipo') or 'NFe').strip().upper().replace('-', '')
+        numero = item.get('numero', chave[:10])
+        
+        # Busca eventos nos XMLs locais
+        eventos_encontrados = []
+        
+        try:
+            # Procura na pasta Eventos dentro da estrutura de XMLs
+            xmls_root = BASE_DIR / "xmls" / informante
+            if xmls_root.exists():
+                # Busca em todas as pastas de eventos
+                for eventos_folder in xmls_root.rglob("Eventos"):
+                    for xml_file in eventos_folder.glob("*.xml"):
+                        try:
+                            xml_content = xml_file.read_text(encoding='utf-8')
+                            # Verifica se a chave está no XML
+                            if chave in xml_content:
+                                # Extrai informações do evento
+                                from lxml import etree
+                                tree = etree.fromstring(xml_content.encode('utf-8'))
+                                
+                                # Tenta diferentes estruturas de evento
+                                ns = {'nfe': 'http://www.portalfiscal.inf.br/nfe'}
+                                
+                                # Tipo de evento
+                                tp_evento = tree.findtext('.//nfe:tpEvento', namespaces=ns) or 'N/A'
+                                # Descrição do evento
+                                desc_evento = tree.findtext('.//nfe:descEvento', namespaces=ns) or tree.findtext('.//nfe:xEvento', namespaces=ns) or 'N/A'
+                                # Data/hora do evento
+                                dh_evento = tree.findtext('.//nfe:dhEvento', namespaces=ns) or tree.findtext('.//nfe:dhRegEvento', namespaces=ns) or 'N/A'
+                                # Status
+                                cstat = tree.findtext('.//nfe:cStat', namespaces=ns) or 'N/A'
+                                xmotivo = tree.findtext('.//nfe:xMotivo', namespaces=ns) or 'N/A'
+                                
+                                # Mapeia tipo de evento para descrição amigável
+                                tipos_eventos = {
+                                    '110111': '❌ Cancelamento',
+                                    '110110': '✏️ Carta de Correção',
+                                    '210200': '📬 Confirmação da Operação',
+                                    '210210': '❓ Ciência da Operação',
+                                    '210220': '⛔ Desconhecimento da Operação',
+                                    '210240': '🚫 Operação não Realizada',
+                                    '110140': '🔒 EPEC (Contingência)',
+                                }
+                                
+                                evento_desc = tipos_eventos.get(tp_evento, f"Evento {tp_evento}")
+                                
+                                eventos_encontrados.append({
+                                    'arquivo': xml_file.name,
+                                    'tipo': evento_desc,
+                                    'descricao': desc_evento,
+                                    'data': dh_evento[:19] if len(dh_evento) >= 19 else dh_evento,
+                                    'status': f"{cstat} - {xmotivo}",
+                                    'caminho': str(xml_file)
+                                })
+                        except Exception:
+                            continue
+        except Exception as e:
+            QMessageBox.warning(self, "Erro", f"Erro ao buscar eventos:\n{e}")
+            return
+        
+        # Cria dialog para mostrar eventos
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"Eventos - {tipo} {numero}")
+        dialog.resize(800, 400)
+        
+        layout = QVBoxLayout(dialog)
+        
+        # Informações do documento
+        info_label = QLabel(f"<b>{tipo} Nº {numero}</b><br>Chave: {chave}")
+        layout.addWidget(info_label)
+        
+        if not eventos_encontrados:
+            no_eventos_label = QLabel("ℹ️ Nenhum evento encontrado para este documento.")
+            no_eventos_label.setStyleSheet("padding: 20px; color: #666;")
+            layout.addWidget(no_eventos_label)
+        else:
+            # Tabela de eventos
+            eventos_table = QTableWidget()
+            eventos_table.setColumnCount(4)
+            eventos_table.setHorizontalHeaderLabels(["Tipo", "Descrição", "Data/Hora", "Status"])
+            eventos_table.setRowCount(len(eventos_encontrados))
+            eventos_table.setEditTriggers(QTableWidget.NoEditTriggers)
+            eventos_table.setSelectionBehavior(QTableWidget.SelectRows)
+            
+            for i, evento in enumerate(eventos_encontrados):
+                eventos_table.setItem(i, 0, QTableWidgetItem(evento['tipo']))
+                eventos_table.setItem(i, 1, QTableWidgetItem(evento['descricao']))
+                eventos_table.setItem(i, 2, QTableWidgetItem(evento['data']))
+                eventos_table.setItem(i, 3, QTableWidgetItem(evento['status']))
+            
+            eventos_table.resizeColumnsToContents()
+            eventos_table.horizontalHeader().setStretchLastSection(True)
+            
+            layout.addWidget(eventos_table)
+            
+            # Botão para abrir pasta de eventos
+            btn_abrir_pasta = QPushButton("📁 Abrir pasta de eventos")
+            btn_abrir_pasta.clicked.connect(lambda: self._abrir_pasta_eventos(informante))
+            layout.addWidget(btn_abrir_pasta)
+        
+        # Botão fechar
+        btn_fechar = QPushButton("Fechar")
+        btn_fechar.clicked.connect(dialog.close)
+        layout.addWidget(btn_fechar)
+        
+        dialog.exec_()
+    
+    def _abrir_pasta_eventos(self, informante: str):
+        """Abre a pasta de eventos do informante no Windows Explorer"""
+        try:
+            eventos_path = BASE_DIR / "xmls" / informante
+            if eventos_path.exists():
+                if sys.platform == "win32":
+                    os.startfile(str(eventos_path))  # type: ignore[attr-defined]
+                else:
+                    subprocess.Popen(["xdg-open", str(eventos_path)])
+        except Exception as e:
+            QMessageBox.warning(self, "Erro", f"Erro ao abrir pasta: {e}")
 
     def _on_table_double_clicked(self, row: int, col: int):
         # Obtém o item pela linha clicada da lista filtrada
