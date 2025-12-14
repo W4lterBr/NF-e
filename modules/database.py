@@ -293,3 +293,27 @@ class DatabaseManager:
                 return int(row[0]) if row else 65
         except Exception:
             return 65
+    
+    def get_config(self, chave: str, default: str = None) -> Optional[str]:
+        """Get a configuration value."""
+        try:
+            with self._connect() as conn:
+                row = conn.execute(
+                    "SELECT valor FROM config WHERE chave = ?", (chave,)
+                ).fetchone()
+                return row[0] if row else default
+        except Exception:
+            return default
+    
+    def set_config(self, chave: str, valor: str) -> bool:
+        """Set a configuration value."""
+        try:
+            with self._connect() as conn:
+                conn.execute(
+                    "INSERT OR REPLACE INTO config (chave, valor) VALUES (?, ?)",
+                    (chave, valor)
+                )
+                conn.commit()
+                return True
+        except Exception:
+            return False

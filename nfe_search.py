@@ -1750,34 +1750,39 @@ def run_single_cycle():
         logger.info("✅ Fase 1 concluída: Todos os documentos foram buscados!")
         
         # 2) Consulta de Protocolo - AGORA SIM, depois de buscar tudo
-        logger.info("📋 Fase 2: Consultando status das chaves (protocolo)...")
-        logger.debug("Verificando chaves sem status...")
-        faltam = db.get_chaves_missing_status()
-        logger.debug(f"Encontradas {len(faltam) if faltam else 0} chaves sem status")
-        
-        if not faltam:
-            logger.info("Nenhuma chave faltando status")
+        # Verifica se o usuário habilitou a consulta de status
+        consultar_status = db.get_config('consultar_status_protocolo', '1')
+        if consultar_status != '1':
+            logger.info("⏭️ Fase 2: Consulta de status desabilitada pelo usuário (pulando)")
         else:
-            logger.info(f"📋 Consultando status de {len(faltam)} chave(s)...")
-            for idx, (chave, cnpj) in enumerate(faltam, 1):
-                logger.info(f"[{idx}/{len(faltam)}] Consultando chave {chave}...")
-                cert = db.find_cert_by_cnpj(cnpj)
-                if not cert:
-                    logger.warning(f"Certificado não encontrado para {cnpj}, ignorando {chave}")
-                    continue
-                _, path, senha, inf, cuf = cert
-                svc = NFeService(path, senha, cnpj, cuf)
-                logger.debug(f"Consultando protocolo para NF-e {chave} (informante {inf})")
-                prot = svc.fetch_prot_nfe(chave)
-                
-                # Valida se recebeu resposta antes de processar
-                if not prot:
-                    logger.warning(f"Sem resposta ao consultar protocolo da chave {chave}")
-                    continue
-                
-                chNFe, cStat, xMotivo = parser.parse_protNFe(prot)
-                if cStat and xMotivo:
-                    db.set_nf_status(chave, cStat, xMotivo)
+            logger.info("📋 Fase 2: Consultando status das chaves (protocolo)...")
+            logger.debug("Verificando chaves sem status...")
+            faltam = db.get_chaves_missing_status()
+            logger.debug(f"Encontradas {len(faltam) if faltam else 0} chaves sem status")
+            
+            if not faltam:
+                logger.info("Nenhuma chave faltando status")
+            else:
+                logger.info(f"📋 Consultando status de {len(faltam)} chave(s)...")
+                for idx, (chave, cnpj) in enumerate(faltam, 1):
+                    logger.info(f"[{idx}/{len(faltam)}] Consultando chave {chave}...")
+                    cert = db.find_cert_by_cnpj(cnpj)
+                    if not cert:
+                        logger.warning(f"Certificado não encontrado para {cnpj}, ignorando {chave}")
+                        continue
+                    _, path, senha, inf, cuf = cert
+                    svc = NFeService(path, senha, cnpj, cuf)
+                    logger.debug(f"Consultando protocolo para NF-e {chave} (informante {inf})")
+                    prot = svc.fetch_prot_nfe(chave)
+                    
+                    # Valida se recebeu resposta antes de processar
+                    if not prot:
+                        logger.warning(f"Sem resposta ao consultar protocolo da chave {chave}")
+                        continue
+                    
+                    chNFe, cStat, xMotivo = parser.parse_protNFe(prot)
+                    if cStat and xMotivo:
+                        db.set_nf_status(chave, cStat, xMotivo)
                     logger.info(f"✅ Status atualizado: {chave} → {cStat} - {xMotivo}")
         
         logger.info("✅ Fase 2 concluída: Status das chaves atualizado!")

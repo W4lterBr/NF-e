@@ -381,6 +381,16 @@ class MainWindow(QMainWindow):
         self.spin_intervalo.setValue(self._load_intervalo_config())
         self.spin_intervalo.valueChanged.connect(self._save_intervalo_config)
         self.spin_intervalo.setToolTip("Intervalo mínimo: 1 hora | Intervalo máximo: 23 horas")
+        
+        # Checkbox para habilitar/desabilitar consulta de status
+        from PyQt5.QtWidgets import QCheckBox
+        self.check_consultar_status = QCheckBox("Consultar status (protocolo)")
+        self.check_consultar_status.setChecked(self._load_consultar_status_config())
+        self.check_consultar_status.stateChanged.connect(self._save_consultar_status_config)
+        self.check_consultar_status.setToolTip(
+            "Se habilitado, consulta o status de notas sem status após buscar documentos.\n"
+            "DICA: Desabilite se a consulta estiver travando a busca de novos documentos."
+        )
 
         # Icons (fallback to standard icons if custom not found)
         def _icon(name: str, std=None) -> QIcon:
@@ -407,6 +417,7 @@ class MainWindow(QMainWindow):
         t.addWidget(self.status_dd)
         t.addWidget(self.tipo_dd)
         t.addStretch(1)
+        t.addWidget(self.check_consultar_status)
         t.addWidget(intervalo_label)
         t.addWidget(self.spin_intervalo)
         t.addWidget(self.btn_refresh)
@@ -1337,6 +1348,25 @@ class MainWindow(QMainWindow):
             self.set_status(f"Intervalo de busca atualizado: {horas} hora(s)", 3000)
         except Exception as e:
             QMessageBox.warning(self, "Erro", f"Não foi possível salvar intervalo: {e}")
+    
+    def _load_consultar_status_config(self) -> bool:
+        """Carrega configuração se deve consultar status de protocolo. Padrão: True."""
+        try:
+            valor = self.db.get_config('consultar_status_protocolo', '1')
+            return valor == '1'
+        except Exception:
+            return True  # Padrão: habilitado
+    
+    def _save_consultar_status_config(self, state: int):
+        """Salva configuração de consulta de status (0=desabilitado, 2=habilitado)."""
+        try:
+            # Qt.CheckState: 0=Unchecked, 2=Checked
+            valor = '1' if state == 2 else '0'
+            self.db.set_config('consultar_status_protocolo', valor)
+            status_text = "habilitada" if state == 2 else "desabilitada"
+            self.set_status(f"Consulta de status {status_text}", 3000)
+        except Exception as e:
+            QMessageBox.warning(self, "Erro", f"Não foi possível salvar configuração: {e}")
 
     def _apply_theme(self):
         # Global stylesheet for a clean modern look
