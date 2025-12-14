@@ -1713,13 +1713,14 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Erro", f"Erro ao abrir pasta: {e}")
 
     def _on_table_double_clicked(self, row: int, col: int):
+        """Abre PDF (em thread separada para não travar a interface)"""
         # Obtém o item pela linha clicada da lista filtrada
         flt = self.filtered()
         item = flt[row] if 0 <= row < len(flt) else None
         if not item:
             return
         
-        # OTIMIZAÇÃO: Verifica primeiro se o PDF já existe localmente (mais rápido)
+        # OTIMIZAÇÃO: Verifica primeiro se o PDF já existe localmente (RÁPIDO - UI thread)
         chave = item.get('chave', '')
         informante = item.get('informante', '')
         tipo = (item.get('tipo') or 'NFe').strip().upper().replace('-', '')
@@ -1745,7 +1746,7 @@ class MainWindow(QMainWindow):
                             pdf_path = potential_pdf
                             break
         
-        # Se PDF existe, abre imediatamente (RÁPIDO!)
+        # Se PDF existe, abre imediatamente (RÁPIDO - não precisa de thread!)
         if pdf_path and pdf_path.exists():
             try:
                 pdf_str = str(pdf_path.absolute())
@@ -1759,184 +1760,207 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(self, "Erro ao abrir PDF", f"Erro: {e}")
                 return
         
-        # Se não tem PDF, precisa gerar (LENTO) - mostra aviso e progresso
-        self.set_status("⏳ Buscando XML completo e gerando PDF... Aguarde...")
+        # Se não tem PDF, precisa gerar (LENTO) - executa em thread separada
+        self.set_status("⏳ Processando... Por favor aguarde...")
         QApplication.processEvents()
         
-        xml_text = resolve_xml_text(item)
-        # Se não for completo, tenta buscar o completo via SEFAZ com o certificado selecionado (ou todos)
-        def _is_nfe_full(x: str) -> bool:
-            xl = (x or '').lower()
-            return ('<nfeproc' in xl) or ('<protnfe' in xl)
-        def _is_cte_full(x: str) -> bool:
-            xl = (x or '').lower()
-            return ('<proccte' in xl) or ('<protcte' in xl)
-        need_fetch = False
-        downloaded_from_sefaz = False
-        if not xml_text:
-            need_fetch = True
-        else:
-            if tipo == 'NFE' and not _is_nfe_full(xml_text):
-                need_fetch = True
-            if tipo == 'CTE' and not _is_cte_full(xml_text):
-                need_fetch = True
-        if need_fetch:
-            self.set_status("⏳ Baixando XML completo da SEFAZ... Aguarde...")
-            QApplication.processEvents()
-            try:
-                certs = self.db.load_certificates()
-                selected = getattr(self, '_selected_cert_cnpj', None)
-                if selected:
-                    try:
-                        certs.sort(key=lambda c: 0 if (str(c.get('cnpj_cpf') or '') == selected or str(c.get('informante') or '') == selected) else 1)
-                    except Exception:
-                        pass
-                prefer = ('nfeProc', 'NFe') if tipo == 'NFE' else ('procCTe', 'CTe')
-                for c in certs:
-                    payload = {
-                        'cert': {
-                            'path': c.get('caminho') or '',
-                            'senha': c.get('senha') or '',
-                            'cnpj': c.get('cnpj_cpf') or '',
-                            'cuf': c.get('cUF_autor') or ''
-                        },
-                        'chave': (item.get('chave') or ''),
-                        'prefer': list(prefer)
-                    }
-                    res = sandbox.run_task('fetch_by_chave', payload, timeout=240)
-                    if res.get('ok') and res.get('data', {}).get('xml'):
-                        xml_text = res['data']['xml']
-                        downloaded_from_sefaz = True
-                        break
-            except Exception:
-                pass
-        if not xml_text:
-            self.set_status("")
-            QMessageBox.warning(self, "PDF", "XML completo não encontrado (local/SEFAZ).")
-            return
+        # Cria worker thread para não travar a interface
+        self._process_pdf_async(item)
         
-        # Save downloaded XML and PDF to xmls folder if fetched from SEFAZ
-        saved_xml_path = None
-        if downloaded_from_sefaz:
-            self.set_status("💾 Salvando XML baixado...")
-            QApplication.processEvents()
-            try:
-                chave = (item.get('chave') or '').strip()
-                informante = (item.get('informante') or '').strip()
-                data_emissao = (item.get('data_emissao') or '')[:10]  # YYYY-MM-DD
-                tipo = (item.get('tipo') or 'NFe').strip().upper().replace('-', '')  # NFE ou CTE
-                if chave and informante:
-                    # Extract YYYY-MM from date
-                    year_month = data_emissao[:7] if len(data_emissao) >= 7 else datetime.now().strftime("%Y-%m")
-                    # Create folder structure: xmls/<CNPJ>/<TIPO>/<YYYY-MM>/
-                    xmls_root = BASE_DIR / "xmls" / informante / tipo / year_month
-                    xmls_root.mkdir(parents=True, exist_ok=True)
-                    # Save XML
-                    xml_file = xmls_root / f"{chave}.xml"
-                    xml_file.write_text(xml_text, encoding='utf-8')
-                    saved_xml_path = str(xml_file)
-                    # Register in database
-                    self.db.register_xml_download(chave, saved_xml_path, informante)
-                    # Update note status to COMPLETO
-                    upd = {
-                        'chave': chave,
-                        'xml_status': 'COMPLETO',
-                        'informante': informante,
-                    }
-                    # Copy other fields from item
-                    for k in ['ie_tomador', 'nome_emitente', 'cnpj_emitente', 'numero',
-                              'data_emissao', 'tipo', 'valor', 'cfop', 'vencimento',
-                              'ncm', 'status', 'natureza', 'uf', 'base_icms', 'valor_icms']:
-                        if k in item:
-                            upd[k] = item[k]
-                    self.db.save_note(upd)
-            except Exception:
-                pass
+        # Se não tem PDF, precisa gerar (LENTO) - executa em thread separada
+        self.set_status("⏳ Processando... Por favor aguarde...")
+        QApplication.processEvents()
         
-        try:
-            # Determine PDF path (RÁPIDO - só determina caminho)
-            if saved_xml_path:
-                # PDF next to XML
-                pdf_path = Path(saved_xml_path).with_suffix('.pdf')
-            else:
-                # Try to find existing XML/PDF in xmls folder
-                if chave and informante:
-                    # Search in xmls/<CNPJ>/<TIPO>/*/*.xml (nova estrutura)
-                    # e também xmls/<CNPJ>/*/*.xml (estrutura antiga - compatibilidade)
-                    xmls_root = BASE_DIR / "xmls" / informante
-                    found_xml = None
-                    if xmls_root.exists():
-                        # Tenta primeiro na estrutura nova com tipo
-                        tipo_folder = xmls_root / tipo
-                        if tipo_folder.exists():
-                            for xml_file in tipo_folder.rglob(f"{chave}.xml"):
-                                found_xml = xml_file
-                                break
-                        # Se não encontrou, busca na estrutura antiga (sem tipo)
-                        if not found_xml:
-                            for xml_file in xmls_root.rglob(f"{chave}.xml"):
-                                found_xml = xml_file
-                                break
-                    if found_xml:
-                        pdf_path = found_xml.with_suffix('.pdf')
-                    else:
-                        # Use temp folder - SEMPRE usar pasta temp do Windows
-                        import tempfile
-                        tmp = Path(tempfile.gettempdir()) / "BOT_Busca_NFE_PDFs"
-                        tmp.mkdir(parents=True, exist_ok=True)
-                        pdf_path = tmp / f"{tipo}-{chave}.pdf"
-                else:
-                    # Use temp folder - SEMPRE usar pasta temp do Windows
-                    import tempfile
-                    tmp = Path(tempfile.gettempdir()) / "BOT_Busca_NFE_PDFs"
-                    tmp.mkdir(parents=True, exist_ok=True)
-                    pdf_path = tmp / f"{(item.get('tipo') or 'NFe')}-{item.get('chave','')}.pdf"
+        # Cria worker thread para não travar a interface
+        self._process_pdf_async(item)
+    
+    def _process_pdf_async(self, item: Dict[str, Any]):
+        """Processa PDF em thread separada para não travar a UI"""
+        
+        class PDFWorker(QThread):
+            finished = pyqtSignal(dict)  # {ok, pdf_path, error}
+            status_update = pyqtSignal(str)  # Para atualizar status na UI
             
-            # Check if PDF already exists (verificação redundante, mas mantém compatibilidade)
-            if pdf_path.exists():
+            def __init__(self, parent_window, item_data):
+                super().__init__()
+                self.parent_window = parent_window
+                self.item = item_data
+            
+            def run(self):
                 try:
-                    pdf_str = str(pdf_path.absolute())
-                    if sys.platform == "win32":
-                        os.startfile(pdf_str)  # type: ignore[attr-defined]
+                    chave = self.item.get('chave', '')
+                    informante = self.item.get('informante', '')
+                    tipo = (self.item.get('tipo') or 'NFe').strip().upper().replace('-', '')
+                    
+                    # Resolve XML
+                    self.status_update.emit("🔍 Buscando XML...")
+                    xml_text = resolve_xml_text(self.item)
+                    
+                    # Verifica se precisa buscar XML completo
+                    def _is_nfe_full(x: str) -> bool:
+                        xl = (x or '').lower()
+                        return ('<nfeproc' in xl) or ('<protnfe' in xl)
+                    def _is_cte_full(x: str) -> bool:
+                        xl = (x or '').lower()
+                        return ('<proccte' in xl) or ('<protcte' in xl)
+                    
+                    need_fetch = False
+                    downloaded_from_sefaz = False
+                    
+                    if not xml_text:
+                        need_fetch = True
                     else:
-                        subprocess.Popen(["xdg-open", pdf_str])
-                    self.set_status("PDF aberto", 1000)
+                        if tipo == 'NFE' and not _is_nfe_full(xml_text):
+                            need_fetch = True
+                        if tipo == 'CTE' and not _is_cte_full(xml_text):
+                            need_fetch = True
+                    
+                    if need_fetch:
+                        self.status_update.emit("⏳ Baixando XML completo da SEFAZ...")
+                        try:
+                            certs = self.parent_window.db.load_certificates()
+                            selected = getattr(self.parent_window, '_selected_cert_cnpj', None)
+                            if selected:
+                                try:
+                                    certs.sort(key=lambda c: 0 if (str(c.get('cnpj_cpf') or '') == selected or str(c.get('informante') or '') == selected) else 1)
+                                except Exception:
+                                    pass
+                            prefer = ('nfeProc', 'NFe') if tipo == 'NFE' else ('procCTe', 'CTe')
+                            for c in certs:
+                                payload = {
+                                    'cert': {
+                                        'path': c.get('caminho') or '',
+                                        'senha': c.get('senha') or '',
+                                        'cnpj': c.get('cnpj_cpf') or '',
+                                        'cuf': c.get('cUF_autor') or ''
+                                    },
+                                    'chave': chave,
+                                    'prefer': list(prefer)
+                                }
+                                res = sandbox.run_task('fetch_by_chave', payload, timeout=240)
+                                if res.get('ok') and res.get('data', {}).get('xml'):
+                                    xml_text = res['data']['xml']
+                                    downloaded_from_sefaz = True
+                                    break
+                        except Exception:
+                            pass
+                    
+                    if not xml_text:
+                        self.finished.emit({"ok": False, "error": "XML completo não encontrado (local/SEFAZ)."})
+                        return
+                    
+                    # Save downloaded XML
+                    saved_xml_path = None
+                    if downloaded_from_sefaz:
+                        self.status_update.emit("💾 Salvando XML...")
+                        try:
+                            data_emissao = (self.item.get('data_emissao') or '')[:10]
+                            if chave and informante:
+                                year_month = data_emissao[:7] if len(data_emissao) >= 7 else datetime.now().strftime("%Y-%m")
+                                xmls_root = BASE_DIR / "xmls" / informante / tipo / year_month
+                                xmls_root.mkdir(parents=True, exist_ok=True)
+                                xml_file = xmls_root / f"{chave}.xml"
+                                xml_file.write_text(xml_text, encoding='utf-8')
+                                saved_xml_path = str(xml_file)
+                                self.parent_window.db.register_xml_download(chave, saved_xml_path, informante)
+                                upd = {'chave': chave, 'xml_status': 'COMPLETO', 'informante': informante}
+                                for k in ['ie_tomador', 'nome_emitente', 'cnpj_emitente', 'numero',
+                                          'data_emissao', 'tipo', 'valor', 'cfop', 'vencimento',
+                                          'ncm', 'status', 'natureza', 'uf', 'base_icms', 'valor_icms']:
+                                    if k in self.item:
+                                        upd[k] = self.item[k]
+                                self.parent_window.db.save_note(upd)
+                        except Exception:
+                            pass
+                    
+                    # Determine PDF path
+                    if saved_xml_path:
+                        pdf_path = Path(saved_xml_path).with_suffix('.pdf')
+                    else:
+                        if chave and informante:
+                            xmls_root = BASE_DIR / "xmls" / informante
+                            found_xml = None
+                            if xmls_root.exists():
+                                tipo_folder = xmls_root / tipo
+                                if tipo_folder.exists():
+                                    for xml_file in tipo_folder.rglob(f"{chave}.xml"):
+                                        found_xml = xml_file
+                                        break
+                                if not found_xml:
+                                    for xml_file in xmls_root.rglob(f"{chave}.xml"):
+                                        found_xml = xml_file
+                                        break
+                            if found_xml:
+                                pdf_path = found_xml.with_suffix('.pdf')
+                            else:
+                                import tempfile
+                                tmp = Path(tempfile.gettempdir()) / "BOT_Busca_NFE_PDFs"
+                                tmp.mkdir(parents=True, exist_ok=True)
+                                pdf_path = tmp / f"{tipo}-{chave}.pdf"
+                        else:
+                            import tempfile
+                            tmp = Path(tempfile.gettempdir()) / "BOT_Busca_NFE_PDFs"
+                            tmp.mkdir(parents=True, exist_ok=True)
+                            pdf_path = tmp / f"{tipo}-{chave}.pdf"
+                    
+                    # Check if PDF exists (pode ter sido criado entre a verificação inicial e agora)
+                    if pdf_path.exists():
+                        self.finished.emit({"ok": True, "pdf_path": str(pdf_path)})
+                        return
+                    
+                    # Generate PDF
+                    self.status_update.emit("📄 Gerando PDF...")
+                    payload: Dict[str, Any] = {
+                        "xml": xml_text,
+                        "tipo": (self.item.get("tipo") or "NFe"),
+                        "out_path": str(pdf_path),
+                        "force_simple_fallback": False,
+                    }
+                    res = sandbox.run_task("generate_pdf", payload, timeout=240)
+                    if res.get("ok"):
+                        if pdf_path.exists():
+                            self.finished.emit({"ok": True, "pdf_path": str(pdf_path)})
+                        else:
+                            self.finished.emit({"ok": False, "error": "PDF não foi gerado"})
+                    else:
+                        self.finished.emit({"ok": False, "error": f"Falha ao gerar PDF: {res.get('error')}"})
+                
                 except Exception as e:
-                    QMessageBox.warning(self, "Erro ao abrir PDF", f"Erro: {e}")
-                return
-            
-            # Generate PDF if not exists
-            self.set_status("📄 Gerando PDF... Aguarde...")
-            QApplication.processEvents()
-            
-            payload: Dict[str, Any] = {
-                "xml": xml_text,
-                "tipo": (item.get("tipo") or "NFe"),
-                "out_path": str(pdf_path),
-                "force_simple_fallback": False,
-            }
-            res = sandbox.run_task("generate_pdf", payload, timeout=240)
-            if res.get("ok"):
-                if not pdf_path.exists():
-                    self.set_status("")
-                    QMessageBox.warning(self, "Erro", "PDF não foi gerado")
-                    return
+                    import traceback
+                    self.finished.emit({"ok": False, "error": f"Erro: {str(e)}\n{traceback.format_exc()}"})
+        
+        # Cria e inicia worker
+        worker = PDFWorker(self, item)
+        
+        def on_status(msg: str):
+            self.set_status(msg)
+        
+        def on_finished(result: dict):
+            if result.get("ok"):
+                pdf_path = result.get("pdf_path")
                 try:
-                    pdf_str = str(pdf_path.absolute())
                     if sys.platform == "win32":
-                        os.startfile(pdf_str)  # type: ignore[attr-defined]
+                        os.startfile(pdf_path)  # type: ignore[attr-defined]
                     else:
-                        subprocess.Popen(["xdg-open", pdf_str])
+                        subprocess.Popen(["xdg-open", pdf_path])
                     self.set_status("✅ PDF gerado e aberto com sucesso!", 2000)
                 except Exception as e:
                     self.set_status("")
                     QMessageBox.warning(self, "Erro ao abrir PDF", f"Erro: {e}")
             else:
                 self.set_status("")
-                QMessageBox.critical(self, "PDF", f"Falha ao gerar PDF: {res.get('error')}")
-        except Exception as e:
-            self.set_status("")
-            QMessageBox.critical(self, "PDF", f"Erro: {e}")
+                error_msg = result.get("error", "Erro desconhecido")
+                QMessageBox.critical(self, "Erro", error_msg)
+        
+        worker.status_update.connect(on_status)
+        worker.finished.connect(on_finished)
+        worker.start()
+        
+        # Mantém referência para evitar garbage collection
+        if not hasattr(self, '_pdf_workers'):
+            self._pdf_workers = []
+        self._pdf_workers.append(worker)
+        worker.finished.connect(lambda: self._pdf_workers.remove(worker) if worker in self._pdf_workers else None)
 
     def _auto_start_search(self):
         """Inicia busca automaticamente ao iniciar o sistema."""
