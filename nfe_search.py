@@ -1194,6 +1194,33 @@ class DatabaseManager:
             if row[0] == cnpj:
                 return row
         return None
+    
+    def get_config(self, chave, default=None):
+        """Obtém valor de configuração do banco de dados"""
+        try:
+            with self._connect() as conn:
+                row = conn.execute(
+                    "SELECT valor FROM config WHERE chave = ?", (chave,)
+                ).fetchone()
+                return row[0] if row else default
+        except Exception as e:
+            logger.debug(f"Erro ao buscar config '{chave}': {e}")
+            return default
+    
+    def set_config(self, chave, valor):
+        """Salva valor de configuração no banco de dados"""
+        try:
+            with self._connect() as conn:
+                conn.execute(
+                    "INSERT OR REPLACE INTO config (chave, valor) VALUES (?, ?)",
+                    (chave, valor)
+                )
+                conn.commit()
+                logger.debug(f"Config salva: {chave} = {valor}")
+                return True
+        except Exception as e:
+            logger.error(f"Erro ao salvar config '{chave}': {e}")
+            return False
 
 # -------------------------------------------------------------------
 # Processador de XML
