@@ -23,6 +23,26 @@ if errorlevel 1 (
     pip install pyinstaller
 )
 
+REM Verifica e instala Pillow se necessário (para conversão de ícone)
+pip show pillow >nul 2>&1
+if errorlevel 1 (
+    echo Instalando Pillow para conversao de icone...
+    pip install pillow
+)
+
+REM Converte Logo.png em Logo.ico se existir
+if exist Logo.png (
+    echo Convertendo Logo.png para Logo.ico...
+    python -c "from PIL import Image; img = Image.open('Logo.png'); img.save('Logo.ico', format='ICO', sizes=[(256,256), (128,128), (64,64), (48,48), (32,32), (16,16)])"
+    if errorlevel 1 (
+        echo AVISO: Falha ao converter icone, continuando...
+    ) else (
+        echo Icone Logo.ico criado com sucesso!
+    )
+) else (
+    echo AVISO: Logo.png nao encontrado, compilando sem icone personalizado
+)
+
 REM Limpa builds anteriores
 echo [3/4] Limpando builds anteriores...
 if exist build rmdir /s /q build

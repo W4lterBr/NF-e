@@ -307,6 +307,12 @@ class MainWindow(QMainWindow):
         
         self._update_window_title()
         self.resize(1200, 720)
+        
+        # Define o ícone da janela principal
+        icon_path = BASE_DIR / 'Logo.png'
+        if icon_path.exists():
+            self.setWindowIcon(QIcon(str(icon_path)))
+        
         ensure_logs_dir()
 
         self.db = UIDB(DB_PATH)
@@ -669,7 +675,7 @@ class MainWindow(QMainWindow):
             self.tray_icon = QSystemTrayIcon(self)
             
             # Tenta carregar ícone personalizado, senão usa ícone padrão
-            icon_path = BASE_DIR / 'Icone' / 'app_icon.png'
+            icon_path = BASE_DIR / 'Logo.png'
             if icon_path.exists():
                 self.tray_icon.setIcon(QIcon(str(icon_path)))
             else:

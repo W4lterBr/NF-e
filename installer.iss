@@ -34,6 +34,8 @@ ArchitecturesInstallIn64BitMode=x64
 ; Configurações de interface
 DisableProgramGroupPage=yes
 DisableWelcomePage=no
+SetupIconFile=Logo.ico
+UninstallDisplayIcon={app}\{#MyAppExeName}
 
 [Languages]
 Name: "brazilianportuguese"; MessagesFile: "compiler:Languages\BrazilianPortuguese.isl"
