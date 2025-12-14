@@ -1563,6 +1563,51 @@ class MainWindow(QMainWindow):
         item = flt[row] if 0 <= row < len(flt) else None
         if not item:
             return
+        
+        # OTIMIZAÇÃO: Verifica primeiro se o PDF já existe localmente (mais rápido)
+        chave = item.get('chave', '')
+        informante = item.get('informante', '')
+        tipo = (item.get('tipo') or 'NFe').strip().upper().replace('-', '')
+        
+        # Tenta localizar PDF existente rapidamente
+        pdf_path = None
+        if chave and informante:
+            xmls_root = BASE_DIR / "xmls" / informante
+            if xmls_root.exists():
+                # Busca na estrutura nova (com tipo)
+                tipo_folder = xmls_root / tipo
+                if tipo_folder.exists():
+                    for xml_file in tipo_folder.rglob(f"{chave}.xml"):
+                        potential_pdf = xml_file.with_suffix('.pdf')
+                        if potential_pdf.exists():
+                            pdf_path = potential_pdf
+                            break
+                # Se não encontrou, busca na estrutura antiga (sem tipo)
+                if not pdf_path:
+                    for xml_file in xmls_root.rglob(f"{chave}.xml"):
+                        potential_pdf = xml_file.with_suffix('.pdf')
+                        if potential_pdf.exists():
+                            pdf_path = potential_pdf
+                            break
+        
+        # Se PDF existe, abre imediatamente (RÁPIDO!)
+        if pdf_path and pdf_path.exists():
+            try:
+                pdf_str = str(pdf_path.absolute())
+                if sys.platform == "win32":
+                    os.startfile(pdf_str)  # type: ignore[attr-defined]
+                else:
+                    subprocess.Popen(["xdg-open", pdf_str])
+                self.set_status("PDF aberto", 1000)
+                return
+            except Exception as e:
+                QMessageBox.warning(self, "Erro ao abrir PDF", f"Erro: {e}")
+                return
+        
+        # Se não tem PDF, precisa gerar (LENTO) - mostra aviso e progresso
+        self.set_status("⏳ Buscando XML completo e gerando PDF... Aguarde...")
+        QApplication.processEvents()
+        
         xml_text = resolve_xml_text(item)
         # Se não for completo, tenta buscar o completo via SEFAZ com o certificado selecionado (ou todos)
         def _is_nfe_full(x: str) -> bool:
@@ -1573,7 +1618,6 @@ class MainWindow(QMainWindow):
             return ('<proccte' in xl) or ('<protcte' in xl)
         need_fetch = False
         downloaded_from_sefaz = False
-        tipo = (item.get('tipo') or 'NFe').strip().upper().replace('-', '')
         if not xml_text:
             need_fetch = True
         else:
@@ -1582,6 +1626,8 @@ class MainWindow(QMainWindow):
             if tipo == 'CTE' and not _is_cte_full(xml_text):
                 need_fetch = True
         if need_fetch:
+            self.set_status("⏳ Baixando XML completo da SEFAZ... Aguarde...")
+            QApplication.processEvents()
             try:
                 certs = self.db.load_certificates()
                 selected = getattr(self, '_selected_cert_cnpj', None)
@@ -1610,12 +1656,15 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
         if not xml_text:
+            self.set_status("")
             QMessageBox.warning(self, "PDF", "XML completo não encontrado (local/SEFAZ).")
             return
         
         # Save downloaded XML and PDF to xmls folder if fetched from SEFAZ
         saved_xml_path = None
         if downloaded_from_sefaz:
+            self.set_status("💾 Salvando XML baixado...")
+            QApplication.processEvents()
             try:
                 chave = (item.get('chave') or '').strip()
                 informante = (item.get('informante') or '').strip()
@@ -1650,15 +1699,12 @@ class MainWindow(QMainWindow):
                 pass
         
         try:
-            # Determine PDF path
+            # Determine PDF path (RÁPIDO - só determina caminho)
             if saved_xml_path:
                 # PDF next to XML
                 pdf_path = Path(saved_xml_path).with_suffix('.pdf')
             else:
                 # Try to find existing XML/PDF in xmls folder
-                chave = item.get('chave', '')
-                informante = item.get('informante', '')
-                tipo = (item.get('tipo') or 'NFe').strip().upper().replace('-', '')  # NFE ou CTE
                 if chave and informante:
                     # Search in xmls/<CNPJ>/<TIPO>/*/*.xml (nova estrutura)
                     # e também xmls/<CNPJ>/*/*.xml (estrutura antiga - compatibilidade)
@@ -1691,25 +1737,21 @@ class MainWindow(QMainWindow):
                     tmp.mkdir(parents=True, exist_ok=True)
                     pdf_path = tmp / f"{(item.get('tipo') or 'NFe')}-{item.get('chave','')}.pdf"
             
-            # Check if PDF already exists
+            # Check if PDF already exists (verificação redundante, mas mantém compatibilidade)
             if pdf_path.exists():
-                self.set_status("Abrindo PDF existente", 1000)
                 try:
                     pdf_str = str(pdf_path.absolute())
-                    # Garantir que é um arquivo PDF
-                    if not pdf_str.lower().endswith('.pdf'):
-                        QMessageBox.warning(self, "Erro", f"Arquivo não é PDF: {pdf_str}")
-                        return
                     if sys.platform == "win32":
                         os.startfile(pdf_str)  # type: ignore[attr-defined]
                     else:
                         subprocess.Popen(["xdg-open", pdf_str])
+                    self.set_status("PDF aberto", 1000)
                 except Exception as e:
                     QMessageBox.warning(self, "Erro ao abrir PDF", f"Erro: {e}")
                 return
             
             # Generate PDF if not exists
-            self.set_status("Gerando PDF… (primeira vez pode demorar)")
+            self.set_status("📄 Gerando PDF... Aguarde...")
             QApplication.processEvents()
             
             payload: Dict[str, Any] = {
@@ -1720,22 +1762,19 @@ class MainWindow(QMainWindow):
             }
             res = sandbox.run_task("generate_pdf", payload, timeout=240)
             if res.get("ok"):
-                pdf_str = str(pdf_path.absolute())
-                # Garantir que o PDF foi criado
                 if not pdf_path.exists():
+                    self.set_status("")
                     QMessageBox.warning(self, "Erro", "PDF não foi gerado")
                     return
-                # Garantir que é um arquivo PDF
-                if not pdf_str.lower().endswith('.pdf'):
-                    QMessageBox.warning(self, "Erro", f"Arquivo gerado não é PDF: {pdf_str}")
-                    return
-                self.set_status("PDF gerado com sucesso", 2000)
                 try:
+                    pdf_str = str(pdf_path.absolute())
                     if sys.platform == "win32":
                         os.startfile(pdf_str)  # type: ignore[attr-defined]
                     else:
                         subprocess.Popen(["xdg-open", pdf_str])
+                    self.set_status("✅ PDF gerado e aberto com sucesso!", 2000)
                 except Exception as e:
+                    self.set_status("")
                     QMessageBox.warning(self, "Erro ao abrir PDF", f"Erro: {e}")
             else:
                 self.set_status("")
