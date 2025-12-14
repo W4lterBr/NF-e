@@ -1181,6 +1181,17 @@ class DatabaseManager:
             return rows
 
     def set_nf_status(self, chave, cStat, xMotivo):
+        """Salva status de NF-e no banco. Valida que os dados não estejam vazios."""
+        # Validação: não salva status vazios ou None
+        if not chave or not cStat or not xMotivo:
+            logger.warning(f"Tentativa de salvar status vazio: chave={chave}, cStat={cStat}, xMotivo={xMotivo}")
+            return False
+        
+        # Validação: strings não podem ser apenas espaços em branco
+        if not str(cStat).strip() or not str(xMotivo).strip():
+            logger.warning(f"Tentativa de salvar status com espaços vazios: {chave} → '{cStat}' - '{xMotivo}'")
+            return False
+        
         with self._connect() as conn:
             conn.execute(
                 "INSERT OR REPLACE INTO nf_status (chNFe,cStat,xMotivo) VALUES (?,?,?)",
@@ -1188,6 +1199,7 @@ class DatabaseManager:
             )
             conn.commit()
             logger.debug(f"Status gravado: {chave} → {cStat} / {xMotivo}")
+            return True
 
     def find_cert_by_cnpj(self, cnpj):
         for row in self.get_certificados():
@@ -1808,9 +1820,13 @@ def run_single_cycle():
                         continue
                     
                     chNFe, cStat, xMotivo = parser.parse_protNFe(prot)
-                    if cStat and xMotivo:
+                    
+                    # Só salva status se tiver dados válidos (não vazios, não None)
+                    if chNFe and cStat and xMotivo and cStat.strip() and xMotivo.strip():
                         db.set_nf_status(chave, cStat, xMotivo)
-                    logger.info(f"✅ Status atualizado: {chave} → {cStat} - {xMotivo}")
+                        logger.info(f"✅ Status atualizado: {chave} → {cStat} - {xMotivo}")
+                    else:
+                        logger.debug(f"⏭️ Status vazio/inválido para {chave}: cStat={cStat}, xMotivo={xMotivo}")
         
         logger.info("✅ Fase 2 concluída: Status das chaves atualizado!")
         logger.info(f"=== Busca concluída: {datetime.now().isoformat()} ===")
