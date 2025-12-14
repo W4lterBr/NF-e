@@ -366,10 +366,6 @@ class MainWindow(QMainWindow):
         btn_busca = QPushButton("Buscar na SEFAZ"); btn_busca.clicked.connect(self.do_search)
         btn_busca_completa = QPushButton("Busca Completa"); btn_busca_completa.clicked.connect(self.do_busca_completa)
         btn_busca_chave = QPushButton("Busca por chave"); btn_busca_chave.clicked.connect(self.buscar_por_chave)
-        btn_batch_pdf = QPushButton("PDFs em lote…"); btn_batch_pdf.clicked.connect(self.do_batch_pdf)
-        btn_certs = QPushButton("Certificados…"); btn_certs.clicked.connect(self.open_certificates)
-        btn_logs = QPushButton("Abrir logs"); btn_logs.clicked.connect(self.open_logs_folder)
-        btn_open_xmls = QPushButton("Abrir XMLs"); btn_open_xmls.clicked.connect(self.open_xmls_folder)
         
         # Seletor de intervalo entre buscas
         from PyQt5.QtWidgets import QSpinBox
@@ -407,10 +403,6 @@ class MainWindow(QMainWindow):
             self.btn_refresh.setIcon(_icon('refresh.png', QStyle.SP_BrowserReload))
             btn_busca.setIcon(_icon('search.png', QStyle.SP_FileDialogContentsView))
             btn_busca_completa.setIcon(_icon('search.png', QStyle.SP_FileDialogContentsView))
-            btn_batch_pdf.setIcon(_icon('pdf.png', QStyle.SP_DialogSaveButton))
-            btn_certs.setIcon(_icon('certificate.png', QStyle.SP_DialogOkButton))
-            btn_logs.setIcon(_icon('log.png', QStyle.SP_MessageBoxInformation))
-            btn_open_xmls.setIcon(_icon('xml.png', QStyle.SP_FileIcon))
         except Exception:
             pass
         t.addWidget(self.search_edit)
@@ -424,10 +416,6 @@ class MainWindow(QMainWindow):
         t.addWidget(btn_busca)
         t.addWidget(btn_busca_completa)
         t.addWidget(btn_busca_chave)
-        t.addWidget(btn_batch_pdf)
-        t.addWidget(btn_certs)
-        t.addWidget(btn_logs)
-        t.addWidget(btn_open_xmls)
         v.addLayout(t)
 
         # Tabs: create a tab widget to host different views (emitidos por terceiros / pela empresa)
