@@ -1708,6 +1708,7 @@ def run_single_cycle():
             logger.debug(f"Processando certificado: CNPJ={cnpj}, arquivo={path}, informante={inf}, cUF={cuf}")
             
             # 1.1) Busca NFe
+            logger.info(f"📄 Iniciando busca de NF-e para {cnpj}")
             svc      = NFeService(path, senha, cnpj, cuf)
             last_nsu = db.get_last_nsu(inf)
             resp     = svc.fetch_by_cnpj("CNPJ" if len(cnpj)==14 else "CPF", last_nsu)
@@ -1719,6 +1720,7 @@ def run_single_cycle():
                 if cStat == '656':
                     logger.info(f"{inf}: Consumo indevido NFe (656), manter NSU em {last_nsu}")
                 else:
+                    docs_count = 0
                     if ult:
                         db.set_last_nsu(inf, ult)
                     for nsu, xml in parser.extract_docs(resp):
@@ -1731,8 +1733,13 @@ def run_single_cycle():
                                 continue
                             chave  = infnfe.attrib.get('Id','')[-44:]
                             db.registrar_xml(chave, cnpj)
+                            docs_count += 1
                         except Exception:
                             logger.exception("Erro ao processar docZip NFe")
+                    if docs_count > 0:
+                        logger.info(f"✅ [{cnpj}] NF-e: {docs_count} documento(s) processado(s)")
+                    else:
+                        logger.info(f"✅ [{cnpj}] NF-e sincronizado: nenhum documento novo")
             
             # 1.2) Busca CTe
             try:
