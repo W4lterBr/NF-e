@@ -1702,7 +1702,8 @@ def run_single_cycle():
         logger.info(f"=== Início da busca: {datetime.now().isoformat()} ===")
         logger.info(f"Diretório de dados: {data_dir}")
         
-        # 1) Distribuição - NFe E CTe
+        # 1) Distribuição - NFe E CTe de TODOS os certificados
+        logger.info("📥 Fase 1: Buscando documentos (NFe e CT-e) de todos os certificados...")
         for cnpj, path, senha, inf, cuf in db.get_certificados():
             logger.debug(f"Processando certificado: CNPJ={cnpj}, arquivo={path}, informante={inf}, cUF={cuf}")
             
@@ -1733,15 +1734,16 @@ def run_single_cycle():
                         except Exception:
                             logger.exception("Erro ao processar docZip NFe")
             
-            # 1.2) Busca CTe em paralelo
+            # 1.2) Busca CTe
             try:
                 processar_cte(db, (cnpj, path, senha, inf, cuf))
             except Exception as e:
                 logger.exception(f"Erro geral ao processar CT-e para {inf}: {e}")
         
-        logger.info("✅ Todos os certificados processados, iniciando consulta de protocolos...")
+        logger.info("✅ Fase 1 concluída: Todos os documentos foram buscados!")
         
-        # 2) Consulta de Protocolo
+        # 2) Consulta de Protocolo - AGORA SIM, depois de buscar tudo
+        logger.info("📋 Fase 2: Consultando status das chaves (protocolo)...")
         logger.debug("Verificando chaves sem status...")
         faltam = db.get_chaves_missing_status()
         logger.debug(f"Encontradas {len(faltam) if faltam else 0} chaves sem status")
@@ -1771,6 +1773,7 @@ def run_single_cycle():
                     db.set_nf_status(chave, cStat, xMotivo)
                     logger.info(f"✅ Status atualizado: {chave} → {cStat} - {xMotivo}")
         
+        logger.info("✅ Fase 2 concluída: Status das chaves atualizado!")
         logger.info(f"=== Busca concluída: {datetime.now().isoformat()} ===")
         logger.info(f"Próxima busca será agendada pela interface conforme intervalo configurado...")
         
