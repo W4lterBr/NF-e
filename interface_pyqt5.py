@@ -1595,14 +1595,19 @@ class MainWindow(QMainWindow):
         tipo = (item.get('tipo') or 'NFe').strip().upper().replace('-', '')
         numero = item.get('numero', chave[:10])
         
+        # Mostra indicador de busca
+        self.set_status("🔍 Procurando eventos...")
+        QApplication.processEvents()  # Atualiza UI
+        
         # Busca eventos nos XMLs locais
         eventos_encontrados = []
         
         try:
-            # Procura na pasta Eventos dentro da estrutura de XMLs
-            xmls_root = BASE_DIR / "xmls" / informante
+            # Procura em TODAS as pastas de eventos (não só do informante)
+            # porque eventos podem estar na pasta do destinatário
+            xmls_root = BASE_DIR / "xmls"
             if xmls_root.exists():
-                # Busca em todas as pastas de eventos
+                # Busca em todas as pastas de eventos de todos os CNPJs
                 for eventos_folder in xmls_root.rglob("Eventos"):
                     for xml_file in eventos_folder.glob("*.xml"):
                         try:
@@ -1650,8 +1655,15 @@ class MainWindow(QMainWindow):
                         except Exception:
                             continue
         except Exception as e:
+            self.set_status("❌ Erro ao buscar eventos", 3000)
             QMessageBox.warning(self, "Erro", f"Erro ao buscar eventos:\n{e}")
             return
+        finally:
+            # Limpa status após busca
+            if eventos_encontrados:
+                self.set_status(f"✅ {len(eventos_encontrados)} evento(s) encontrado(s)", 2000)
+            else:
+                self.set_status("ℹ️ Nenhum evento encontrado", 2000)
         
         # Cria dialog para mostrar eventos
         dialog = QDialog(self)
