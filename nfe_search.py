@@ -1756,13 +1756,14 @@ def run_single_cycle():
             else:
                 cStat = parser.extract_cStat(resp)
                 ult   = parser.extract_last_nsu(resp)
-                if cStat == '656':
-                    logger.info(f"{inf}: Consumo indevido NFe (656), manter NSU em {last_nsu}")
-                else:
-                    docs_count = 0
-                    if ult:
-                        db.set_last_nsu(inf, ult)
-                    for nsu, xml in parser.extract_docs(resp):
+                
+                # SEMPRE processa documentos, mesmo com erro 656
+                docs_count = 0
+                docs_list = parser.extract_docs(resp)
+                
+                if docs_list:
+                    logger.debug(f"📦 [{cnpj}] NF-e: Encontrados {len(docs_list)} documento(s) na resposta")
+                    for nsu, xml in docs_list:
                         try:
                             validar_xml_auto(xml, 'leiauteNFe_v4.00.xsd')
                             tree   = etree.fromstring(xml.encode('utf-8'))
@@ -1772,9 +1773,26 @@ def run_single_cycle():
                                 continue
                             chave  = infnfe.attrib.get('Id','')[-44:]
                             db.registrar_xml(chave, cnpj)
+                            
+                            # Salva XML e nota detalhada
+                            salvar_xml_por_certificado(xml, cnpj)
+                            nota = extrair_nota_detalhada(xml, parser, db, chave, inf)
+                            nota['informante'] = inf
+                            db.salvar_nota_detalhada(nota)
+                            
                             docs_count += 1
                         except Exception:
                             logger.exception("Erro ao processar docZip NFe")
+                
+                # Atualiza NSU se houver
+                if ult and ult != last_nsu:
+                    db.set_last_nsu(inf, ult)
+                    logger.debug(f"📊 [{cnpj}] NF-e: NSU atualizado {last_nsu} → {ult}")
+                
+                # Verifica status APÓS processar documentos
+                if cStat == '656':
+                    logger.warning(f"⚠️ [{cnpj}] NF-e: Consumo indevido (656), mas {docs_count} doc(s) processado(s)")
+                else:
                     if docs_count > 0:
                         logger.info(f"✅ [{cnpj}] NF-e: {docs_count} documento(s) processado(s)")
                     else:
