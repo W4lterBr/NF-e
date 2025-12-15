@@ -1750,17 +1750,17 @@ def run_single_cycle():
             logger.info(f"📄 Iniciando busca de NF-e para {cnpj}")
             svc      = NFeService(path, senha, cnpj, cuf)
             last_nsu = db.get_last_nsu(inf)
-            logger.debug(f"📊 [{cnpj}] NF-e: NSU atual = {last_nsu}")
-            logger.debug(f"🔐 [{cnpj}] NF-e: Certificado = {path}, cUF = {cuf}")
+            logger.info(f"📊 [{cnpj}] NF-e: NSU atual = {last_nsu}")
+            logger.info(f"🔐 [{cnpj}] NF-e: Certificado = {path}, cUF = {cuf}")
             
             resp     = svc.fetch_by_cnpj("CNPJ" if len(cnpj)==14 else "CPF", last_nsu)
             if not resp:
                 logger.warning(f"Sem resposta NFe para {inf}")
             else:
                 # Log da resposta para debug
-                logger.debug(f"📥 [{cnpj}] NF-e: Resposta recebida ({len(resp)} bytes)")
-                logger.debug(f"📄 [{cnpj}] NF-e: Primeiros 500 caracteres da resposta:")
-                logger.debug(resp[:500] if len(resp) > 500 else resp)
+                logger.info(f"📥 [{cnpj}] NF-e: Resposta recebida ({len(resp)} bytes)")
+                logger.info(f"📄 [{cnpj}] NF-e: Primeiros 800 caracteres da resposta:")
+                logger.info(resp[:800] if len(resp) > 800 else resp)
                 
                 cStat = parser.extract_cStat(resp)
                 ult   = parser.extract_last_nsu(resp)
@@ -1772,15 +1772,15 @@ def run_single_cycle():
                 docs_count = 0
                 docs_list = parser.extract_docs(resp)
                 
-                logger.debug(f"📦 [{cnpj}] NF-e: extract_docs() retornou {len(docs_list) if docs_list else 0} documento(s)")
+                logger.info(f"📦 [{cnpj}] NF-e: extract_docs() retornou {len(docs_list) if docs_list else 0} documento(s)")
                 
                 if docs_list:
-                    logger.debug(f"📦 [{cnpj}] NF-e: Encontrados {len(docs_list)} documento(s) na resposta")
+                    logger.info(f"📦 [{cnpj}] NF-e: Encontrados {len(docs_list)} documento(s) na resposta")
                     for idx, (nsu, xml) in enumerate(docs_list, 1):
-                        logger.debug(f"📄 [{cnpj}] NF-e: Processando doc {idx}/{len(docs_list)}, NSU={nsu}")
+                        logger.info(f"📄 [{cnpj}] NF-e: Processando doc {idx}/{len(docs_list)}, NSU={nsu}")
                         try:
                             validar_xml_auto(xml, 'leiauteNFe_v4.00.xsd')
-                            logger.debug(f"✅ [{cnpj}] NF-e: XML válido (NSU={nsu})")
+                            logger.info(f"✅ [{cnpj}] NF-e: XML válido (NSU={nsu})")
                             
                             tree   = etree.fromstring(xml.encode('utf-8'))
                             infnfe = tree.find('.//{http://www.portalfiscal.inf.br/nfe}infNFe')
@@ -1788,12 +1788,12 @@ def run_single_cycle():
                                 logger.warning(f"⚠️ [{cnpj}] NF-e: infNFe não encontrado no XML (NSU={nsu}), pulando")
                                 continue
                             chave  = infnfe.attrib.get('Id','')[-44:]
-                            logger.debug(f"🔑 [{cnpj}] NF-e: Chave extraída = {chave}")
+                            logger.info(f"🔑 [{cnpj}] NF-e: Chave extraída = {chave}")
                             
                             db.registrar_xml(chave, cnpj)
                             
                             # Salva XML e nota detalhada
-                            logger.debug(f"💾 [{cnpj}] NF-e: Salvando XML e nota detalhada (chave={chave})")
+                            logger.info(f"💾 [{cnpj}] NF-e: Salvando XML e nota detalhada (chave={chave})")
                             salvar_xml_por_certificado(xml, cnpj)
                             nota = extrair_nota_detalhada(xml, parser, db, chave, inf)
                             nota['informante'] = inf
@@ -1804,7 +1804,7 @@ def run_single_cycle():
                         except Exception as e:
                             logger.exception(f"❌ [{cnpj}] NF-e: Erro ao processar docZip NSU={nsu}: {e}")
                 else:
-                    logger.debug(f"📭 [{cnpj}] NF-e: Nenhum documento na resposta (docs_list vazio ou None)")
+                    logger.info(f"📭 [{cnpj}] NF-e: Nenhum documento na resposta (docs_list vazio ou None)")
                 
                 # Atualiza NSU se houver
                 if ult and ult != last_nsu:
