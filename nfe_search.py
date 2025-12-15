@@ -8,7 +8,7 @@ import sqlite3
 import time
 import warnings
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
 
 # Suprime avisos de SSL não verificado
 import urllib3
@@ -1748,6 +1748,17 @@ def run_single_cycle():
             
             # 1.1) Busca NFe
             logger.info(f"📄 Iniciando busca de NF-e para {cnpj}")
+            
+            # Verifica se pode consultar (não teve erro 656 recente)
+            if not db.pode_consultar_certificado(inf, db.get_last_nsu(inf)):
+                logger.info(f"⏭️ [{cnpj}] NF-e: Pulando consulta - aguardando cooldown de erro 656 anterior")
+                # Pula para CT-e
+                try:
+                    processar_cte(db, (cnpj, path, senha, inf, cuf))
+                except Exception as e:
+                    logger.exception(f"Erro geral ao processar CT-e para {inf}: {e}")
+                continue
+            
             svc      = NFeService(path, senha, cnpj, cuf)
             last_nsu = db.get_last_nsu(inf)
             logger.info(f"📊 [{cnpj}] NF-e: NSU atual = {last_nsu}")
@@ -1817,6 +1828,9 @@ def run_single_cycle():
                 
                 # Verifica status APÓS processar documentos
                 if cStat == '656':
+                    # Registra erro 656 para bloquear consultas por 65 minutos
+                    db.registrar_erro_656(inf, last_nsu)
+                    
                     if docs_count > 0:
                         logger.warning(f"⚠️ [{cnpj}] NF-e: Consumo indevido (656), mas {docs_count} doc(s) processado(s)")
                     else:
@@ -1828,6 +1842,7 @@ def run_single_cycle():
                         logger.debug(f"   1. Consultando muito frequentemente (< 1 hora)")
                         logger.debug(f"   2. Sem documentos novos disponíveis")
                         logger.debug(f"   3. NSU já está no final da fila")
+                        logger.warning(f"🔒 [{cnpj}] NF-e bloqueada por 65 minutos - próxima consulta possível às {(datetime.now() + timedelta(minutes=65)).strftime('%H:%M:%S')}")
                 else:
                     if docs_count > 0:
                         logger.info(f"✅ [{cnpj}] NF-e: {docs_count} documento(s) processado(s)")
