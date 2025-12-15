@@ -1750,12 +1750,17 @@ def run_single_cycle():
             logger.info(f"📄 Iniciando busca de NF-e para {cnpj}")
             svc      = NFeService(path, senha, cnpj, cuf)
             last_nsu = db.get_last_nsu(inf)
+            logger.debug(f"📊 [{cnpj}] NF-e: NSU atual = {last_nsu}")
+            
             resp     = svc.fetch_by_cnpj("CNPJ" if len(cnpj)==14 else "CPF", last_nsu)
             if not resp:
                 logger.warning(f"Sem resposta NFe para {inf}")
             else:
                 cStat = parser.extract_cStat(resp)
                 ult   = parser.extract_last_nsu(resp)
+                max_nsu = parser.extract_max_nsu(resp)
+                
+                logger.debug(f"📊 [{cnpj}] NF-e: cStat={cStat}, ultNSU={ult}, maxNSU={max_nsu}")
                 
                 # SEMPRE processa documentos, mesmo com erro 656
                 docs_count = 0
@@ -1791,7 +1796,13 @@ def run_single_cycle():
                 
                 # Verifica status APÓS processar documentos
                 if cStat == '656':
-                    logger.warning(f"⚠️ [{cnpj}] NF-e: Consumo indevido (656), mas {docs_count} doc(s) processado(s)")
+                    if docs_count > 0:
+                        logger.warning(f"⚠️ [{cnpj}] NF-e: Consumo indevido (656), mas {docs_count} doc(s) processado(s)")
+                    else:
+                        # Erro 656 sem documentos = SEFAZ bloqueando por excesso de consultas
+                        # Isso é normal se estiver consultando com frequência
+                        logger.info(f"⏸️ [{cnpj}] NF-e: Consumo indevido (656) - aguardar intervalo antes de nova consulta")
+                        logger.debug(f"   NSU={last_nsu}, ultNSU={ult}, maxNSU={max_nsu}")
                 else:
                     if docs_count > 0:
                         logger.info(f"✅ [{cnpj}] NF-e: {docs_count} documento(s) processado(s)")
