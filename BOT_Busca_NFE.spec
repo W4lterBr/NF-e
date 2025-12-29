@@ -68,7 +68,7 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name='BOT Busca NFE',
+    name='Busca XML',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
