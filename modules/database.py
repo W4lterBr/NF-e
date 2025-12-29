@@ -5,6 +5,19 @@ from pathlib import Path
 from typing import Dict, Any, List, Optional
 from datetime import datetime
 
+# Importa módulo de criptografia PORTÁVEL (para distribuição em .exe)
+try:
+    from .crypto_portable import get_portable_crypto as get_crypto
+    CRYPTO_AVAILABLE = True
+except ImportError:
+    # Fallback para chave local (desenvolvimento)
+    try:
+        from .crypto_utils import get_crypto
+        CRYPTO_AVAILABLE = True
+    except ImportError:
+        CRYPTO_AVAILABLE = False
+        print("⚠️ Módulo de criptografia não disponível")
+
 
 class DatabaseManager:
     """Database manager for NFe system - UI compatible."""
@@ -32,6 +45,22 @@ class DatabaseManager:
             # Adiciona coluna criado_em se não existir (migração)
             try:
                 conn.execute("ALTER TABLE certificados ADD COLUMN criado_em TEXT")
+                conn.commit()
+            except Exception:
+                # Coluna já existe, ignora
+                pass
+            
+            # Adiciona coluna razao_social se não existir (migração)
+            try:
+                conn.execute("ALTER TABLE certificados ADD COLUMN razao_social TEXT")
+                conn.commit()
+            except Exception:
+                # Coluna já existe, ignora
+                pass
+            
+            # Adiciona coluna nome_certificado se não existir (migração)
+            try:
+                conn.execute("ALTER TABLE certificados ADD COLUMN nome_certificado TEXT")
                 conn.commit()
             except Exception:
                 # Coluna já existe, ignora
@@ -86,6 +115,28 @@ class DatabaseManager:
                 xml_status TEXT,
                 atualizado_em TEXT
             )''')
+            
+            # Tabela de manifestações registradas
+            conn.execute('''CREATE TABLE IF NOT EXISTS manifestacoes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chave TEXT NOT NULL,
+                tipo_evento TEXT NOT NULL,
+                informante TEXT NOT NULL,
+                data_manifestacao TEXT NOT NULL,
+                status TEXT,
+                protocolo TEXT,
+                UNIQUE(chave, tipo_evento, informante)
+            )''')
+            
+            # Índice para busca rápida
+            try:
+                conn.execute('''CREATE INDEX IF NOT EXISTS idx_manifestacoes_chave 
+                             ON manifestacoes(chave)''')
+                conn.execute('''CREATE INDEX IF NOT EXISTS idx_manifestacoes_informante 
+                             ON manifestacoes(informante)''')
+            except Exception:
+                pass
+            
             conn.commit()
     
     def load_notes(self, limit: int = 1000) -> List[Dict[str, Any]]:
@@ -103,11 +154,51 @@ class DatabaseManager:
         with self._connect() as conn:
             conn.row_factory = sqlite3.Row
             cursor = conn.execute("SELECT * FROM certificados ORDER BY informante")
-            return [dict(row) for row in cursor.fetchall()]
+            certificates = [dict(row) for row in cursor.fetchall()]
+            
+            # Descriptografa senhas e corrige senhas em texto plano
+            if CRYPTO_AVAILABLE:
+                crypto = get_crypto()
+                for cert in certificates:
+                    if cert.get('senha'):
+                        try:
+                            # Verifica se senha está criptografada
+                            if crypto.is_encrypted(cert['senha']):
+                                # Descriptografa normalmente
+                                cert['senha'] = crypto.decrypt(cert['senha'])
+                            else:
+                                # Senha em texto plano - precisa ser criptografada
+                                print(f"⚠️ Senha do certificado {cert.get('informante')} está em texto plano. Criptografando...")
+                                senha_plain = cert['senha']
+                                senha_encrypted = crypto.encrypt(senha_plain)
+                                
+                                # Atualiza no banco de dados
+                                with self._connect() as conn_update:
+                                    conn_update.execute(
+                                        "UPDATE certificados SET senha = ? WHERE id = ?",
+                                        (senha_encrypted, cert['id'])
+                                    )
+                                    conn_update.commit()
+                                
+                                # Mantém senha descriptografada em memória
+                                cert['senha'] = senha_plain
+                                print(f"   ✅ Senha criptografada e salva no banco")
+                        except Exception as e:
+                            print(f"⚠️ Erro ao processar senha do certificado {cert.get('informante')}: {e}")
+                            # Mantém a senha como está em caso de erro
+                            pass
+            
+            return certificates
     
     def save_certificate(self, data: Dict[str, Any]) -> bool:
         """Save certificate to database. Returns True if successful."""
         try:
+            # Criptografa senha antes de salvar
+            senha_to_save = data.get('senha', '')
+            if senha_to_save and CRYPTO_AVAILABLE:
+                crypto = get_crypto()
+                senha_to_save = crypto.encrypt(senha_to_save)
+            
             with self._connect() as conn:
                 # Check for duplicates by informante
                 existing = conn.execute(
@@ -126,21 +217,23 @@ class DatabaseManager:
                     # Update existing
                     conn.execute('''UPDATE certificados 
                         SET cnpj_cpf = ?, caminho = ?, senha = ?, 
-                            cUF_autor = ?, ativo = ?
+                            cUF_autor = ?, ativo = ?, razao_social = ?
                         WHERE id = ?''',
                         (data.get('cnpj_cpf'), data.get('caminho'), 
-                         data.get('senha'), data.get('cUF_autor'),
-                         data.get('ativo', 1), data.get('id'))
+                         senha_to_save, data.get('cUF_autor'),
+                         data.get('ativo', 1), data.get('razao_social'),
+                         data.get('id'))
                     )
                 else:
                     # Insert new
                     conn.execute('''INSERT INTO certificados 
-                        (informante, cnpj_cpf, caminho, senha, cUF_autor, ativo, criado_em)
-                        VALUES (?, ?, ?, ?, ?, ?, ?)''',
+                        (informante, cnpj_cpf, caminho, senha, cUF_autor, ativo, criado_em, razao_social, nome_certificado)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
                         (data.get('informante'), data.get('cnpj_cpf'),
-                         data.get('caminho'), data.get('senha'),
+                         data.get('caminho'), senha_to_save,
                          data.get('cUF_autor'), data.get('ativo', 1),
-                         datetime.now().isoformat())
+                         datetime.now().isoformat(), data.get('razao_social'),
+                         data.get('nome_certificado'))
                     )
                 conn.commit()
                 return True
@@ -294,6 +387,57 @@ class DatabaseManager:
         except Exception:
             return 65
     
+    def check_manifestacao_exists(self, chave: str, tipo_evento: str, informante: str) -> bool:
+        """
+        Verifica se manifestação já foi registrada.
+        
+        Args:
+            chave: Chave de acesso da NF-e
+            tipo_evento: Tipo do evento (ex: '210210' para Ciência da Operação)
+            informante: CNPJ/CPF do informante
+        
+        Returns:
+            bool: True se manifestação já existe, False caso contrário
+        """
+        try:
+            with self._connect() as conn:
+                result = conn.execute(
+                    "SELECT COUNT(*) FROM manifestacoes WHERE chave = ? AND tipo_evento = ? AND informante = ?",
+                    (chave, tipo_evento, informante)
+                ).fetchone()
+                return result[0] > 0
+        except Exception:
+            return False
+    
+    def register_manifestacao(self, chave: str, tipo_evento: str, informante: str, 
+                             status: str = 'ENVIADA', protocolo: str = None) -> bool:
+        """
+        Registra manifestação para prevenir duplicatas.
+        
+        Args:
+            chave: Chave de acesso da NF-e
+            tipo_evento: Tipo do evento (ex: '210210')
+            informante: CNPJ/CPF do informante
+            status: Status da manifestação
+            protocolo: Número do protocolo SEFAZ
+        
+        Returns:
+            bool: True se registrado com sucesso, False se já existe
+        """
+        try:
+            from datetime import datetime
+            with self._connect() as conn:
+                conn.execute('''INSERT INTO manifestacoes 
+                    (chave, tipo_evento, informante, data_manifestacao, status, protocolo)
+                    VALUES (?, ?, ?, ?, ?, ?)''',
+                    (chave, tipo_evento, informante, datetime.now().isoformat(), status, protocolo)
+                )
+                conn.commit()
+                return True
+        except Exception:
+            # Manifestação já existe (UNIQUE constraint violated)
+            return False
+    
     def get_config(self, chave: str, default: str = None) -> Optional[str]:
         """Get a configuration value."""
         try:
@@ -317,3 +461,37 @@ class DatabaseManager:
                 return True
         except Exception:
             return False
+    
+    def set_next_search_interval(self, minutos: int) -> bool:
+        """Define o intervalo de busca automática em minutos."""
+        return self.set_config('search_interval_minutes', str(minutos))
+    
+    def get_next_search_interval(self) -> int:
+        """Obtém o intervalo de busca automática em minutos. Padrão: 60 minutos (1 hora)."""
+        try:
+            valor = self.get_config('search_interval_minutes', '60')
+            return int(valor)
+        except Exception:
+            return 60
+    
+    def get_cert_nome_by_informante(self, informante: str) -> Optional[str]:
+        """Busca o nome personalizado do certificado pelo informante.
+        
+        Args:
+            informante: CNPJ/CPF do informante
+            
+        Returns:
+            Nome do certificado ou None se não houver nome personalizado
+        """
+        try:
+            with self._connect() as conn:
+                cursor = conn.execute(
+                    "SELECT nome_certificado FROM certificados WHERE informante = ?",
+                    (informante,)
+                )
+                row = cursor.fetchone()
+                if row and row[0]:
+                    return row[0]
+                return None
+        except Exception:
+            return None

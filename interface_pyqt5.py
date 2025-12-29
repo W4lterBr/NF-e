@@ -15,7 +15,8 @@ from PyQt5.QtWidgets import (
     QAbstractItemView, QLineEdit, QComboBox, QProgressBar, QTextEdit,
     QDialog, QMessageBox, QFileDialog, QInputDialog, QStatusBar,
     QTreeWidget, QTreeWidgetItem, QSplitter, QAction, QMenu, QSystemTrayIcon,
-    QProgressDialog, QStyledItemDelegate, QStyleOptionViewItem
+    QProgressDialog, QStyledItemDelegate, QStyleOptionViewItem, QScrollArea, QFrame,
+    QGroupBox, QRadioButton
 )
 from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal, QSettings, QSize
 from PyQt5.QtGui import QIcon, QColor, QBrush, QFont, QCloseEvent
@@ -316,6 +317,11 @@ class MainWindow(QMainWindow):
         ensure_logs_dir()
 
         self.db = UIDB(DB_PATH)
+        
+        # Cache de PDFs para abertura rápida {chave: pdf_path}
+        self._pdf_cache = {}
+        self._cache_building = False
+        self._cache_worker = None  # Referência para a thread do cache
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -458,6 +464,12 @@ class MainWindow(QMainWindow):
         self.table.customContextMenuRequested.connect(self._on_table_context_menu)
         # Use o sinal específico da tabela com linha/coluna
         self.table.cellDoubleClicked.connect(self._on_table_double_clicked)
+        
+        # Tooltip instantâneo (100ms de delay)
+        QApplication.instance().setStyleSheet(QApplication.instance().styleSheet() + 
+            "QToolTip { border: 1px solid #333; padding: 4px; border-radius: 3px; }")
+        # Configura delay mínimo para tooltips aparecerem rapidamente
+        self.table.setMouseTracking(True)
         hh = self.table.horizontalHeader()
         try:
             hh.setSectionResizeMode(QHeaderView.Interactive)
@@ -482,10 +494,46 @@ class MainWindow(QMainWindow):
         tab1_layout.addWidget(self.table)
         self.tabs.addTab(tab1, "Emitidos por terceiros")
 
-        # Second tab: placeholder (emitidos pela empresa)
+        # Second tab: Emitidos pela empresa
         tab2 = QWidget()
         tab2_layout = QVBoxLayout(tab2)
-        tab2_layout.addWidget(QLabel("Emitidos pela empresa - (vazio)"))
+        
+        # Cria tabela para notas emitidas pela empresa
+        self.table_emitidos = QTableWidget()
+        headers_emitidos = [
+            "XML","Num","D/Emit","Tipo","Valor","Venc.","Status",
+            "Destinatário CNPJ","Destinatário Nome","Natureza","UF","Base ICMS",
+            "Valor ICMS","CFOP","NCM","Tomador IE","Chave"
+        ]
+        self.table_emitidos.setColumnCount(len(headers_emitidos))
+        self.table_emitidos.setHorizontalHeaderLabels(headers_emitidos)
+        self.table_emitidos.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table_emitidos.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table_emitidos.setSortingEnabled(True)
+        self.table_emitidos.horizontalHeader().setDefaultAlignment(Qt.AlignCenter)
+        self.table_emitidos.setItemDelegateForColumn(0, CenterIconDelegate(self.table_emitidos))
+        self.table_emitidos.setItemDelegateForColumn(6, CenterIconDelegate(self.table_emitidos))
+        self.table_emitidos.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.table_emitidos.customContextMenuRequested.connect(self._on_table_emitidos_context_menu)
+        self.table_emitidos.cellDoubleClicked.connect(self._on_table_emitidos_double_clicked)
+        self.table_emitidos.setMouseTracking(True)
+        
+        # Configura larguras das colunas
+        try:
+            hh_emitidos = self.table_emitidos.horizontalHeader()
+            hh_emitidos.setSectionResizeMode(QHeaderView.Interactive)
+            hh_emitidos.setStretchLastSection(False)
+            self.table_emitidos.setColumnWidth(0, 50)
+            self.table_emitidos.setColumnWidth(1, 80)
+            self.table_emitidos.setColumnWidth(2, 92)
+            self.table_emitidos.setColumnWidth(4, 100)
+            self.table_emitidos.setColumnWidth(5, 92)
+            self.table_emitidos.setColumnWidth(6, 50)
+            self.table_emitidos.setColumnWidth(7, 130)
+        except Exception:
+            pass
+        
+        tab2_layout.addWidget(self.table_emitidos)
         self.tabs.addTab(tab2, "Emitidos pela empresa")
 
         v.addWidget(self.tabs)
@@ -624,9 +672,9 @@ class MainWindow(QMainWindow):
         thread.start()
 
     def _atualizar_ufs_certificados(self):
-        """Atualiza as UFs dos certificados existentes consultando a API Brasil."""
+        """Atualiza as UFs e razões sociais dos certificados existentes consultando a API Brasil."""
         try:
-            print("[DEBUG] Atualizando UFs dos certificados existentes...")
+            print("[DEBUG] Atualizando UFs e razões sociais dos certificados existentes...")
             
             # Mapeia UF para código
             uf_to_codigo = {
@@ -645,6 +693,7 @@ class MainWindow(QMainWindow):
                 cert_id = cert.get('id')
                 cnpj = cert.get('cnpj_cpf', '')
                 uf_atual = cert.get('cUF_autor', '')
+                razao_atual = cert.get('razao_social', '')
                 
                 if len(cnpj) == 14:  # É CNPJ
                     try:
@@ -655,23 +704,41 @@ class MainWindow(QMainWindow):
                             data = response.json()
                             uf = data.get('uf')
                             codigo_uf = uf_to_codigo.get(uf)
+                            razao_social = data.get('razao_social', '')
                             
-                            if codigo_uf and codigo_uf != uf_atual:
-                                print(f"[DEBUG] Atualizando UF do certificado {cnpj}: {uf_atual} -> {codigo_uf} ({uf})")
-                                # Atualiza no banco usando context manager
+                            # Flags para controlar o que precisa atualizar
+                            atualizar_uf = codigo_uf and codigo_uf != uf_atual
+                            atualizar_razao = razao_social and not razao_atual
+                            
+                            if atualizar_uf or atualizar_razao:
+                                if atualizar_uf:
+                                    print(f"[DEBUG] Atualizando UF do certificado {cnpj}: {uf_atual} -> {codigo_uf} ({uf})")
+                                if atualizar_razao:
+                                    print(f"[DEBUG] Adicionando razão social do certificado {cnpj}: {razao_social}")
+                                
+                                # Atualiza no banco
                                 with sqlite3.connect(str(DB_PATH)) as conn:
-                                    conn.execute("UPDATE certificados SET cUF_autor = ? WHERE id = ?", (codigo_uf, cert_id))
+                                    if atualizar_uf and atualizar_razao:
+                                        conn.execute("UPDATE certificados SET cUF_autor = ?, razao_social = ? WHERE id = ?", 
+                                                   (codigo_uf, razao_social, cert_id))
+                                    elif atualizar_uf:
+                                        conn.execute("UPDATE certificados SET cUF_autor = ? WHERE id = ?", 
+                                                   (codigo_uf, cert_id))
+                                    elif atualizar_razao:
+                                        conn.execute("UPDATE certificados SET razao_social = ? WHERE id = ?", 
+                                                   (razao_social, cert_id))
                                     conn.commit()
-                            elif codigo_uf == uf_atual:
-                                print(f"[DEBUG] UF do certificado {cnpj} já está correta: {uf_atual}")
-                            else:
-                                print(f"[DEBUG] Não foi possível mapear UF {uf} para código")
+                            elif codigo_uf == uf_atual and razao_atual:
+                                print(f"[DEBUG] Certificado {cnpj} já está completo (UF: {uf_atual}, Razão: {razao_atual[:40]}...)")
                     except Exception as e:
-                        print(f"[DEBUG] Erro ao atualizar UF do certificado {cnpj}: {e}")
+                        print(f"[DEBUG] Erro ao atualizar certificado {cnpj}: {e}")
             
-            print("[DEBUG] Atualização de UFs concluída")
+            print("[DEBUG] Atualização de certificados concluída")
+            
+            # Recarrega a árvore de certificados para exibir as razões sociais
+            self._populate_certs_tree()
         except Exception as e:
-            print(f"[ERRO] Erro ao atualizar UFs dos certificados: {e}")
+            print(f"[ERRO] Erro ao atualizar certificados: {e}")
     
     def set_status(self, msg: str, timeout_ms: int = 0):
         self.status_label.setText(msg)
@@ -757,12 +824,37 @@ class MainWindow(QMainWindow):
         
         if reply == QMessageBox.Yes:
             print("[DEBUG] Encerrando aplicação")
+            
+            # Finaliza threads ativas
+            if self._cache_worker and self._cache_worker.isRunning():
+                print("[DEBUG] Finalizando thread do cache...")
+                self._cache_worker.wait(1000)  # Aguarda até 1 segundo
+                if self._cache_worker.isRunning():
+                    self._cache_worker.terminate()
+            
+            if hasattr(self, '_load_worker') and self._load_worker and self._load_worker.isRunning():
+                print("[DEBUG] Finalizando thread de carregamento...")
+                self._load_worker.wait(1000)
+                if self._load_worker.isRunning():
+                    self._load_worker.terminate()
+            
             if hasattr(self, 'tray_icon'):
                 self.tray_icon.hide()
             QApplication.quit()
     
     def closeEvent(self, event: QCloseEvent):
         """Intercepta o evento de fechar a janela."""
+        # Finaliza threads ativas
+        if self._cache_worker and self._cache_worker.isRunning():
+            self._cache_worker.wait(1000)  # Aguarda até 1 segundo
+            if self._cache_worker.isRunning():
+                self._cache_worker.terminate()  # Força finalização se necessário
+        
+        if hasattr(self, '_load_worker') and self._load_worker and self._load_worker.isRunning():
+            self._load_worker.wait(1000)
+            if self._load_worker.isRunning():
+                self._load_worker.terminate()
+        
         # Ao invés de fechar, minimiza para bandeja
         event.ignore()
         self.hide()
@@ -806,9 +898,9 @@ class MainWindow(QMainWindow):
             traceback.print_exc()
 
     def _setup_tasks_menu(self):
-        # Cria um menu 'Tarefas' no menu bar com as ações principais
+        # Cria um menu 'Configurações' no menu bar com as ações principais
         menubar = self.menuBar()
-        tarefas = menubar.addMenu("Tarefas")
+        tarefas = menubar.addMenu("Configurações")
 
         # Helper para criar ações com ícone opcional
         def add_action(menu: QMenu, text: str, slot, shortcut: Optional[str] = None, icon_name: Optional[str] = None):
@@ -837,7 +929,9 @@ class MainWindow(QMainWindow):
         add_action(tarefas, "Busca por chave", self.buscar_por_chave, "Ctrl+K", "search.png")
         add_action(tarefas, "Certificados…", self.open_certificates, "Ctrl+Shift+C", "certificate.png")
         tarefas.addSeparator()
-        add_action(tarefas, "🔄 Atualizações", self.check_updates, "Ctrl+U", "update.png")
+        add_action(tarefas, "� Armazenamento…", self.open_storage_config, "Ctrl+Shift+A", "xml.png")
+        tarefas.addSeparator()
+        add_action(tarefas, "�🔄 Atualizações", self.check_updates, "Ctrl+U", "update.png")
         tarefas.addSeparator()
         add_action(tarefas, "Limpar", self.limpar_dados, "Ctrl+Shift+L", "xml.png")
         tarefas.addSeparator()
@@ -896,7 +990,13 @@ class MainWindow(QMainWindow):
                 except Exception:
                     pass
                 self.refresh_table()
+                self.refresh_emitidos_table()  # Popula também a tabela de emitidos
                 self.set_status(f"{len(self.notes)} registros carregados", 3000)
+                
+                # Constrói cache de PDFs em background (não bloqueia UI)
+                if self.notes and not self._cache_building:
+                    self._build_pdf_cache_async()
+                    
             except Exception as e:
                 QMessageBox.critical(self, "Erro", f"Falha ao carregar dados: {e}")
             finally:
@@ -954,6 +1054,120 @@ class MainWindow(QMainWindow):
                 break
         
         return out
+    
+    def filtered_emitidos(self) -> List[Dict[str, Any]]:
+        """Filtra notas emitidas pela empresa (onde cnpj_emitente pertence a um certificado)"""
+        q = (self.search_edit.text() or "").lower().strip()
+        selected_cert = getattr(self, '_selected_cert_cnpj', None)
+        st = (self.status_dd.currentText() or "Todos").lower()
+        tp = (self.tipo_dd.currentText() or "Todos").lower().replace('-', '')
+        
+        # Limite de linhas
+        limit_text = self.limit_dd.currentText()
+        limit = None if limit_text == "Todos" else int(limit_text)
+        
+        # Função para normalizar CNPJ (remove pontuação)
+        def normalizar_cnpj(cnpj: str) -> str:
+            return ''.join(c for c in str(cnpj or '') if c.isdigit())
+        
+        # Carrega CNPJs dos certificados cadastrados
+        try:
+            certs = self.db.load_certificates()
+            company_cnpjs = {normalizar_cnpj(c.get('cnpj_cpf') or '') for c in certs}
+            company_cnpjs.discard('')  # Remove string vazia se houver
+            print(f"[DEBUG] Certificados encontrados: {len(certs)}")
+            print(f"[DEBUG] CNPJs da empresa (normalizados): {company_cnpjs}")
+            
+            # Verifica total no banco (sem limite)
+            try:
+                with self.db._connect() as conn:
+                    total_db = conn.execute("SELECT COUNT(*) FROM notas_detalhadas WHERE xml_status != 'EVENTO'").fetchone()[0]
+                    print(f"[DEBUG] Total de notas no banco (sem limite): {total_db}")
+            except Exception as e2:
+                print(f"[DEBUG] Erro ao contar notas no banco: {e2}")
+        except Exception as e:
+            print(f"[DEBUG] Erro ao carregar certificados: {e}")
+            company_cnpjs = set()
+        
+        out: List[Dict[str, Any]] = []
+        total_notes = len(self.notes or [])
+        print(f"[DEBUG] Total de notas carregadas: {total_notes}")
+        
+        # DEBUG: Mostra exemplos de CNPJs emitentes no banco
+        sample_cnpjs = set()
+        for i, note in enumerate(self.notes or []):
+            if i < 10:  # Primeiras 10 notas
+                cnpj_raw = note.get('cnpj_emitente') or ''
+                cnpj_norm = normalizar_cnpj(cnpj_raw)
+                if cnpj_norm:
+                    sample_cnpjs.add(f"{cnpj_norm} (original: {cnpj_raw})")
+        if sample_cnpjs:
+            print(f"[DEBUG] Exemplos de CNPJ emitente nas primeiras 10 notas:")
+            for cnpj in list(sample_cnpjs)[:5]:
+                print(f"[DEBUG]   - {cnpj}")
+        
+        # Verifica se há ALGUMA nota emitida no banco (direto no SQL)
+        try:
+            cnpjs_str = "','".join(company_cnpjs)
+            query = f"SELECT COUNT(*) FROM notas_detalhadas WHERE cnpj_emitente IN ('{cnpjs_str}') AND xml_status != 'EVENTO'"
+            with self.db._connect() as conn:
+                count_emitidas_db = conn.execute(query).fetchone()[0]
+                print(f"[DEBUG] Notas emitidas pela empresa no banco (direto SQL): {count_emitidas_db}")
+        except Exception as e3:
+            print(f"[DEBUG] Erro ao verificar notas emitidas no banco: {e3}")
+        
+        emitidas_count = 0
+        for it in (self.notes or []):
+            # NÃO MOSTRAR eventos na interface
+            xml_status = (it.get('xml_status') or '').upper()
+            if xml_status == 'EVENTO':
+                continue
+            
+            # FILTRO PRINCIPAL: Nota emitida pela empresa (cnpj_emitente é um dos certificados)
+            cnpj_emit_raw = it.get('cnpj_emitente') or ''
+            cnpj_emit = normalizar_cnpj(cnpj_emit_raw)
+            
+            if cnpj_emit in company_cnpjs:
+                emitidas_count += 1
+                if emitidas_count <= 3:  # Log das primeiras 3
+                    print(f"[DEBUG] Nota emitida encontrada: {cnpj_emit} - Num: {it.get('numero')}")
+            
+            if cnpj_emit not in company_cnpjs:
+                continue
+            
+            if selected_cert:
+                # Para emitidos, filtra por cnpj_emitente (não informante)
+                if cnpj_emit != str(selected_cert).strip():
+                    continue
+            
+            if q:
+                # Busca por nome do destinatário ou número ou CNPJ destinatário
+                # Note: para notas emitidas, precisamos buscar dados do destinatário
+                # Como não temos campo específico, busca em nome_emitente e cnpj_emitente
+                # (que neste contexto seria informação do destinatário se fosse estruturado)
+                if q not in (it.get("nome_emitente", "").lower()) and q not in (str(it.get("numero", "")).lower()) and q not in (it.get("cnpj_emitente", "").lower()):
+                    continue
+            
+            if st != "todos" and st not in (it.get("status", "").lower()):
+                continue
+            
+            if tp != "todos":
+                raw = (it.get("tipo", "") or "").strip().upper().replace('_','').replace(' ','')
+                if tp == "nfe" and raw not in ("NFE", "NF-E"):
+                    continue
+                if tp == "cte" and raw not in ("CTE", "CT-E"):
+                    continue
+                if tp == "nfse" and raw not in ("NFSE", "NFS-E"):
+                    continue
+            
+            out.append(it)
+            
+            # Aplica limite se definido
+            if limit and len(out) >= limit:
+                break
+        
+        print(f"[DEBUG] Total de notas emitidas FILTRADAS: {len(out)} (de {emitidas_count} encontradas)")
+        return out
 
     def _populate_certs_tree(self):
         # Preenche a árvore com certificados do banco (ativos)
@@ -978,18 +1192,30 @@ class MainWindow(QMainWindow):
             if current_selection is None:
                 all_item.setSelected(True)
             
-            # Ordena por informante
+            # Ordena por razao_social ou informante
             def keyf(c: Dict[str, Any]):
-                return (str(c.get('informante') or '') + ' ' + str(c.get('cnpj_cpf') or '')).lower()
+                razao = (c.get('razao_social') or '').strip()
+                informante = (c.get('informante') or '').strip()
+                cnpj = (c.get('cnpj_cpf') or '').strip()
+                return (razao or informante or cnpj).lower()
             
             for c in sorted(certs, key=keyf):
                 informante = (c.get('informante') or '').strip()
                 cnpj = (c.get('cnpj_cpf') or '').strip()
-                label = informante or cnpj or 'Sem nome'
-                if cnpj and informante and informante != cnpj:
-                    label = f"{informante} ({cnpj})"
+                razao_social = (c.get('razao_social') or '').strip()
+                
+                # Prioriza razão social, depois informante, depois CNPJ
+                if razao_social:
+                    label = f"{razao_social}"
+                elif informante and informante != cnpj:
+                    label = f"{informante}"
+                elif cnpj:
+                    label = cnpj
+                else:
+                    label = 'Sem nome'
+                
                 node = QTreeWidgetItem([label])
-                node.setToolTip(0, str(c.get('caminho') or ''))
+                node.setToolTip(0, f"CNPJ: {cnpj}\nCaminho: {c.get('caminho') or ''}")
                 node.setData(0, 32, informante)  # Salva informante, não cnpj_cpf
                 self.tree_certs.addTopLevelItem(node)
                 
@@ -1085,6 +1311,33 @@ class MainWindow(QMainWindow):
                 pass
             self._table_filling = False
             self.set_status(f"{len(items)} registros carregados", 2000)
+    
+    def refresh_emitidos_table(self):
+        """Popula a tabela de notas emitidas pela empresa (usa mesma lógica de _populate_row)"""
+        print("[DEBUG] ========== REFRESH_EMITIDOS_TABLE CHAMADO ==========")
+        items = self.filtered_emitidos()
+        print(f"[DEBUG] Populando tabela_emitidos com {len(items)} itens")
+        
+        try:
+            sorting_enabled = self.table_emitidos.isSortingEnabled()
+            self.table_emitidos.setSortingEnabled(False)
+        except Exception:
+            sorting_enabled = False
+        
+        try:
+            self.table_emitidos.clearContents()
+            self.table_emitidos.setRowCount(len(items))
+        except Exception:
+            pass
+        
+        # Popula diretamente (sem timer, pois geralmente há menos itens)
+        for r, it in enumerate(items):
+            self._populate_emitidos_row(r, it)
+        
+        try:
+            self.table_emitidos.setSortingEnabled(sorting_enabled)
+        except Exception:
+            pass
 
     def _populate_row(self, r: int, it: Dict[str, Any]):
         def cell(c: Any) -> QTableWidgetItem:
@@ -1096,13 +1349,16 @@ class MainWindow(QMainWindow):
         if xml_status == "COMPLETO":
             status_text = ""  # Apenas ícone, sem texto
             bg_color = QColor(214, 245, 224)  # Verde claro
+            tooltip_text = "✅ XML Completo disponível"
         else:  # RESUMO
             status_text = ""  # Apenas ícone, sem texto
             bg_color = QColor(235, 235, 235)  # Cinza claro
+            tooltip_text = "⚠️ Apenas Resumo - clique para baixar XML completo"
         
         c0 = cell(status_text)
         c0.setBackground(QBrush(bg_color))
         c0.setTextAlignment(Qt.AlignCenter)
+        c0.setToolTip(tooltip_text)
         try:
             icon_path = BASE_DIR / 'Icone' / 'xml.png'
             if icon_path.exists():
@@ -1236,6 +1492,164 @@ class MainWindow(QMainWindow):
         self.table.setItem(r,14, cell(it.get("ncm")))
         self.table.setItem(r,15, cell(it.get("ie_tomador")))
         self.table.setItem(r,16, cell(it.get("chave")))
+    
+    def _populate_emitidos_row(self, r: int, it: Dict[str, Any]):
+        """Popula uma linha da tabela de emitidos (mesma estrutura que _populate_row)"""
+        def cell(c: Any) -> QTableWidgetItem:
+            return QTableWidgetItem(str(c or ""))
+        
+        xml_status = (it.get("xml_status") or "RESUMO").upper()
+        
+        # Define texto e cores baseado no tipo
+        if xml_status == "COMPLETO":
+            status_text = ""
+            bg_color = QColor(214, 245, 224)
+            tooltip_text = "✅ XML Completo disponível"
+        else:
+            status_text = ""
+            bg_color = QColor(235, 235, 235)
+            tooltip_text = "⚠️ Apenas Resumo - clique para baixar XML completo"
+        
+        c0 = cell(status_text)
+        c0.setBackground(QBrush(bg_color))
+        c0.setTextAlignment(Qt.AlignCenter)
+        c0.setToolTip(tooltip_text)
+        try:
+            icon_path = BASE_DIR / 'Icone' / 'xml.png'
+            if icon_path.exists():
+                c0.setIcon(QIcon(str(icon_path)))
+        except Exception:
+            pass
+        self.table_emitidos.setItem(r, 0, c0)
+        
+        # Coluna Número - ordenação numérica
+        numero = it.get("numero") or ""
+        try:
+            numero_int = int(str(numero)) if numero else 0
+        except Exception:
+            numero_int = 0
+        self.table_emitidos.setItem(r, 1, NumericTableWidgetItem(str(numero), float(numero_int)))
+        
+        # Coluna Data Emissão - ordenação por timestamp
+        data_emissao_raw = it.get("data_emissao") or ""
+        data_emissao_br = self._format_date_br(data_emissao_raw)
+        try:
+            if data_emissao_raw and len(data_emissao_raw) >= 10:
+                from datetime import datetime
+                dt = datetime.strptime(data_emissao_raw[:10], "%Y-%m-%d")
+                timestamp = dt.timestamp()
+            else:
+                timestamp = 0.0
+        except Exception:
+            timestamp = 0.0
+        self.table_emitidos.setItem(r, 2, NumericTableWidgetItem(data_emissao_br, timestamp))
+        
+        self.table_emitidos.setItem(r, 3, cell(it.get("tipo")))
+        
+        # Coluna Valor - ordenação numérica com exibição formatada
+        valor_raw = it.get("valor")
+        valor_formatado = ""
+        valor_num = 0.0
+        try:
+            if valor_raw:
+                valor_str = str(valor_raw).replace("R$", "").strip()
+                valor_str = valor_str.replace(".", "").replace(",", ".")
+                valor_num = float(valor_str)
+                valor_formatado = f"R$ {valor_num:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+            else:
+                valor_formatado = ""
+        except Exception:
+            try:
+                valor_num = float(str(valor_raw).replace(",", "."))
+                valor_formatado = f"R$ {valor_num:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+            except:
+                valor_formatado = str(valor_raw or "")
+                valor_num = 0.0
+        c_val = NumericTableWidgetItem(valor_formatado, valor_num)
+        c_val.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.table_emitidos.setItem(r, 4, c_val)
+        
+        # Coluna Vencimento - ordenação por timestamp
+        vencimento_raw = it.get("vencimento") or ""
+        vencimento_br = self._format_date_br(vencimento_raw)
+        try:
+            if vencimento_raw and len(vencimento_raw) >= 10:
+                from datetime import datetime
+                dt = datetime.strptime(vencimento_raw[:10], "%Y-%m-%d")
+                timestamp = dt.timestamp()
+            else:
+                timestamp = 0.0
+        except Exception:
+            timestamp = 0.0
+        self.table_emitidos.setItem(r, 5, NumericTableWidgetItem(vencimento_br, timestamp))
+        
+        # Coluna Status - ícone visual com cor de fundo
+        status_low = (it.get("status") or '').lower()
+        
+        if 'cancelad' in status_low:
+            c_status = cell("✕")
+            c_status.setForeground(QBrush(QColor(200, 0, 0)))
+            c_status.setBackground(QBrush(QColor(255, 220, 220)))
+            c_status.setFont(QFont("Arial", 16, QFont.Bold))
+        elif 'autorizad' in status_low:
+            c_status = cell("✓")
+            c_status.setForeground(QBrush(QColor(0, 150, 0)))
+            c_status.setBackground(QBrush(QColor(214, 245, 224)))
+            c_status.setFont(QFont("Arial", 16, QFont.Bold))
+        elif 'denegad' in status_low or 'rejeitad' in status_low:
+            c_status = cell("⚠")
+            c_status.setForeground(QBrush(QColor(200, 120, 0)))
+            c_status.setBackground(QBrush(QColor(255, 245, 200)))
+            c_status.setFont(QFont("Arial", 14, QFont.Bold))
+        else:
+            c_status = cell("•")
+            c_status.setForeground(QBrush(QColor(120, 120, 120)))
+            c_status.setBackground(QBrush(QColor(240, 240, 240)))
+            c_status.setFont(QFont("Arial", 14, QFont.Bold))
+        
+        c_status.setTextAlignment(Qt.AlignCenter)
+        self.table_emitidos.setItem(r, 6, c_status)
+        
+        # IMPORTANTE: Para emitidos, mostramos informante (que é o destinatário)
+        # Os headers já foram renomeados para "Destinatário CNPJ" e "Destinatário Nome"
+        self.table_emitidos.setItem(r, 7, cell(it.get("informante")))
+        # Para o nome do destinatário, tentamos obter de outro campo se existir
+        # Por enquanto, deixamos vazio ou usamos algum campo disponível
+        self.table_emitidos.setItem(r, 8, cell(""))  # Nome destinatário (não disponível na estrutura atual)
+        
+        self.table_emitidos.setItem(r, 9, cell(it.get("natureza")))
+        self.table_emitidos.setItem(r,10, cell(self._codigo_uf_to_sigla(it.get("uf") or "")))
+        
+        # Coluna Base ICMS - ordenação numérica
+        base_icms_text = it.get("base_icms") or ""
+        base_icms_num = 0.0
+        try:
+            base_clean = str(base_icms_text).replace("R$", "").replace(".", "").replace(",", ".").strip()
+            if base_clean:
+                base_icms_num = float(base_clean)
+        except Exception:
+            pass
+        c_base = NumericTableWidgetItem(base_icms_text, base_icms_num)
+        c_base.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.table_emitidos.setItem(r,11, c_base)
+        
+        # Coluna Valor ICMS - ordenação numérica
+        valor_icms_text = it.get("valor_icms") or ""
+        valor_icms_num = 0.0
+        try:
+            icms_clean = str(valor_icms_text).replace("R$", "").replace(".", "").replace(",", ".").strip()
+            if icms_clean:
+                valor_icms_num = float(icms_clean)
+        except Exception:
+            pass
+        c_icms = NumericTableWidgetItem(valor_icms_text, valor_icms_num)
+        c_icms.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.table_emitidos.setItem(r,12, c_icms)
+        
+        self.table_emitidos.setItem(r,13, cell(it.get("cfop")))
+        self.table_emitidos.setItem(r,14, cell(it.get("ncm")))
+        self.table_emitidos.setItem(r,15, cell(it.get("ie_tomador")))
+        self.table_emitidos.setItem(r,16, cell(it.get("chave")))
 
     def _fill_table_step(self):
         try:
@@ -1458,7 +1872,11 @@ class MainWindow(QMainWindow):
         # Cria menu
         menu = QMenu(self)
         
+        # Opção: Ver Detalhes Completos (sempre disponível)
+        action_detalhes = menu.addAction("📄 Ver Detalhes Completos")
+        
         # Opção: Buscar XML Completo (só para RESUMO)
+        menu.addSeparator()
         if xml_status == 'RESUMO':
             action_buscar = menu.addAction("🔍 Buscar XML Completo na SEFAZ")
         else:
@@ -1471,10 +1889,184 @@ class MainWindow(QMainWindow):
         # Mostra menu e pega ação
         action = menu.exec_(self.table.viewport().mapToGlobal(pos))
         
-        if action == action_buscar:
+        if action == action_detalhes:
+            self._mostrar_detalhes_nota(item)
+        elif action == action_buscar:
             self._buscar_xml_completo(item)
         elif action == action_eventos:
             self._mostrar_eventos(item)
+    
+    def _on_table_emitidos_context_menu(self, pos):
+        """Menu de contexto para a tabela de notas emitidas pela empresa"""
+        # Pega o item clicado
+        item_at_pos = self.table_emitidos.itemAt(pos)
+        if not item_at_pos:
+            return
+        
+        row = item_at_pos.row()
+        flt = self.filtered_emitidos()
+        if row < 0 or row >= len(flt):
+            return
+        
+        item = flt[row]
+        xml_status = (item.get('xml_status') or '').upper()
+        
+        # Cria menu
+        menu = QMenu(self)
+        
+        # Opção: Ver Detalhes Completos (sempre disponível)
+        action_detalhes = menu.addAction("📄 Ver Detalhes Completos")
+        
+        # Opção: Buscar XML Completo (só para RESUMO)
+        menu.addSeparator()
+        if xml_status == 'RESUMO':
+            action_buscar = menu.addAction("🔍 Buscar XML Completo na SEFAZ")
+        else:
+            action_buscar = None
+        
+        # Opção: Eventos (sempre disponível)
+        menu.addSeparator()
+        action_eventos = menu.addAction("📋 Ver Eventos")
+        
+        # Mostra menu e pega ação
+        action = menu.exec_(self.table_emitidos.viewport().mapToGlobal(pos))
+        
+        if action == action_detalhes:
+            self._mostrar_detalhes_nota(item)
+        elif action == action_buscar:
+            self._buscar_xml_completo(item)
+        elif action == action_eventos:
+            self._mostrar_eventos(item)
+    
+    def _mostrar_detalhes_nota(self, item: Dict[str, Any]):
+        """Exibe uma janela com todos os detalhes da nota fiscal"""
+        if not item:
+            return
+        
+        # Cria janela de diálogo
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"Detalhes - Nota {item.get('numero', 'N/A')}")
+        dialog.setMinimumWidth(700)
+        dialog.setMinimumHeight(600)
+        
+        # Layout principal
+        layout = QVBoxLayout(dialog)
+        
+        # Área de scroll para o conteúdo
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll_widget = QWidget()
+        scroll_layout = QVBoxLayout(scroll_widget)
+        
+        # Função helper para adicionar campo
+        def add_field(label: str, value: Any, is_header: bool = False):
+            container = QWidget()
+            h_layout = QHBoxLayout(container)
+            h_layout.setContentsMargins(5, 5, 5, 5)
+            
+            label_widget = QLabel(f"<b>{label}:</b>")
+            label_widget.setMinimumWidth(180)
+            
+            value_str = str(value or "")
+            value_widget = QLabel(value_str)
+            value_widget.setWordWrap(True)
+            value_widget.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            
+            if is_header:
+                font = value_widget.font()
+                font.setPointSize(font.pointSize() + 2)
+                font.setBold(True)
+                value_widget.setFont(font)
+                label_widget.setFont(font)
+            
+            h_layout.addWidget(label_widget)
+            h_layout.addWidget(value_widget, 1)
+            
+            scroll_layout.addWidget(container)
+        
+        # Função para adicionar separador
+        def add_separator(title: str = ""):
+            line = QFrame()
+            line.setFrameShape(QFrame.HLine)
+            line.setFrameShadow(QFrame.Sunken)
+            scroll_layout.addWidget(line)
+            
+            if title:
+                title_label = QLabel(f"<h3>{title}</h3>")
+                scroll_layout.addWidget(title_label)
+        
+        # === INFORMAÇÕES PRINCIPAIS ===
+        add_field("Número da Nota", item.get('numero', 'N/A'), is_header=True)
+        add_field("Tipo", item.get('tipo', 'N/A'))
+        add_field("Status", item.get('status', 'N/A'))
+        add_field("Status XML", item.get('xml_status', 'N/A'))
+        
+        add_separator("Emissor")
+        add_field("Nome do Emitente", item.get('nome_emitente', 'N/A'))
+        add_field("CNPJ Emitente", item.get('cnpj_emitente', 'N/A'))
+        add_field("UF", self._codigo_uf_to_sigla(item.get('uf', '')))
+        
+        add_separator("Valores")
+        add_field("Valor Total", item.get('valor', 'N/A'))
+        add_field("Base ICMS", item.get('base_icms', 'N/A'))
+        add_field("Valor ICMS", item.get('valor_icms', 'N/A'))
+        
+        add_separator("Datas")
+        add_field("Data de Emissão", self._format_date_br(item.get('data_emissao', '')))
+        add_field("Data de Vencimento", self._format_date_br(item.get('vencimento', '')))
+        add_field("Atualizado em", item.get('atualizado_em', 'N/A'))
+        
+        add_separator("Informações Fiscais")
+        add_field("CFOP", item.get('cfop', 'N/A'))
+        add_field("NCM", item.get('ncm', 'N/A'))
+        add_field("Natureza da Operação", item.get('natureza', 'N/A'))
+        add_field("IE Tomador", item.get('ie_tomador', 'N/A'))
+        
+        add_separator("Informações do Sistema")
+        add_field("Informante (CNPJ Consulta)", item.get('informante', 'N/A'))
+        add_field("Chave de Acesso", item.get('chave', 'N/A'))
+        
+        # CNPJ Destinatário (se disponível)
+        if item.get('cnpj_destinatario'):
+            add_field("CNPJ Destinatário", item.get('cnpj_destinatario', 'N/A'))
+        
+        # Finaliza scroll
+        scroll_layout.addStretch()
+        scroll.setWidget(scroll_widget)
+        layout.addWidget(scroll)
+        
+        # Botões
+        button_box = QWidget()
+        button_layout = QHBoxLayout(button_box)
+        
+        # Botão Copiar Chave
+        btn_copy_chave = QPushButton("📋 Copiar Chave")
+        btn_copy_chave.clicked.connect(lambda: self._copiar_para_clipboard(item.get('chave', '')))
+        button_layout.addWidget(btn_copy_chave)
+        
+        # Botão Copiar CNPJ
+        btn_copy_cnpj = QPushButton("📋 Copiar CNPJ Emitente")
+        btn_copy_cnpj.clicked.connect(lambda: self._copiar_para_clipboard(item.get('cnpj_emitente', '')))
+        button_layout.addWidget(btn_copy_cnpj)
+        
+        button_layout.addStretch()
+        
+        # Botão Fechar
+        btn_close = QPushButton("✖ Fechar")
+        btn_close.clicked.connect(dialog.accept)
+        button_layout.addWidget(btn_close)
+        
+        layout.addWidget(button_box)
+        
+        # Exibe o diálogo
+        dialog.exec_()
+    
+    def _copiar_para_clipboard(self, texto: str):
+        """Copia texto para a área de transferência"""
+        if texto:
+            clipboard = QApplication.clipboard()
+            clipboard.setText(texto)
+            self.set_status(f"✅ Copiado: {texto}", 2000)
     
     def _buscar_xml_completo(self, item: Dict[str, Any]):
         """Busca o XML completo de um resumo na SEFAZ"""
@@ -1723,64 +2315,256 @@ class MainWindow(QMainWindow):
                     subprocess.Popen(["xdg-open", str(eventos_path)])
         except Exception as e:
             QMessageBox.warning(self, "Erro", f"Erro ao abrir pasta: {e}")
+    
+    def _build_pdf_cache_async(self):
+        """Constrói cache de PDFs em background para abertura rápida"""
+        if self._cache_building:
+            return
+        
+        self._cache_building = True
+        
+        class CacheBuilder(QThread):
+            cache_ready = pyqtSignal(dict)  # {chave: pdf_path}
+            
+            def __init__(self, notes, base_dir):
+                super().__init__()
+                self.notes = notes
+                self.base_dir = base_dir
+            
+            def run(self):
+                cache = {}
+                try:
+                    for note in self.notes:
+                        chave = note.get('chave', '')
+                        informante = note.get('informante', '')
+                        data_emissao = (note.get('data_emissao') or '')[:10]
+                        tipo = (note.get('tipo') or 'NFe').strip().upper().replace('-', '')
+                        
+                        if not (chave and informante and data_emissao):
+                            continue
+                        
+                        # Extrai ano-mês
+                        try:
+                            year_month = data_emissao[:7] if len(data_emissao) >= 7 else None
+                            if year_month:
+                                # Verifica caminho direto (com tipo)
+                                pdf_path = self.base_dir / "xmls" / informante / tipo / year_month / f"{chave}.pdf"
+                                if pdf_path.exists():
+                                    cache[chave] = str(pdf_path)
+                                    continue
+                                
+                                # Verifica caminho antigo (sem tipo)
+                                pdf_path = self.base_dir / "xmls" / informante / year_month / f"{chave}.pdf"
+                                if pdf_path.exists():
+                                    cache[chave] = str(pdf_path)
+                                    continue
+                        except Exception:
+                            pass
+                except Exception as e:
+                    print(f"[DEBUG] Erro ao construir cache de PDFs: {e}")
+                
+                self.cache_ready.emit(cache)
+        
+        def on_cache_ready(cache: dict):
+            self._pdf_cache = cache
+            self._cache_building = False
+            self._cache_worker = None
+            print(f"[DEBUG] Cache de PDFs construído: {len(cache)} arquivos indexados")
+        
+        self._cache_worker = CacheBuilder(self.notes, BASE_DIR)
+        self._cache_worker.cache_ready.connect(on_cache_ready)
+        self._cache_worker.start()
 
     def _on_table_double_clicked(self, row: int, col: int):
-        """Abre PDF (em thread separada para não travar a interface)"""
+        """Abre PDF (verifica existência primeiro, só gera se necessário) - OTIMIZADO"""
         # Obtém o item pela linha clicada da lista filtrada
         flt = self.filtered()
         item = flt[row] if 0 <= row < len(flt) else None
         if not item:
             return
         
-        # OTIMIZAÇÃO: Verifica primeiro se o PDF já existe localmente (RÁPIDO - UI thread)
         chave = item.get('chave', '')
+        if not chave:
+            return
+        
+        # OTIMIZAÇÃO 1: Verifica cache primeiro (INSTANTÂNEO)
+        if chave in self._pdf_cache:
+            cached_pdf = Path(self._pdf_cache[chave])
+            if cached_pdf.exists():
+                try:
+                    pdf_str = str(cached_pdf.absolute())
+                    if sys.platform == "win32":
+                        os.startfile(pdf_str)  # type: ignore[attr-defined]
+                    else:
+                        subprocess.Popen(["xdg-open", pdf_str])
+                    self.set_status("✅ PDF aberto (cache)", 1000)
+                    return
+                except Exception as e:
+                    QMessageBox.warning(self, "Erro ao abrir PDF", f"Erro: {e}")
+                    return
+        
+        # OTIMIZAÇÃO 2: Busca direta baseada na data de emissão (MUITO MAIS RÁPIDO)
         informante = item.get('informante', '')
         tipo = (item.get('tipo') or 'NFe').strip().upper().replace('-', '')
+        data_emissao = (item.get('data_emissao') or '')[:10]
         
-        # Tenta localizar PDF existente rapidamente
         pdf_path = None
-        if chave and informante:
+        
+        if chave and informante and data_emissao:
+            # Extrai ano-mês da data de emissão
+            try:
+                year_month = data_emissao[:7] if len(data_emissao) >= 7 else None
+                if year_month:
+                    # Busca direta na pasta específica do mês (SEM recursão)
+                    specific_path = BASE_DIR / "xmls" / informante / tipo / year_month / f"{chave}.pdf"
+                    if specific_path.exists():
+                        pdf_path = specific_path
+                    else:
+                        # Tenta sem o tipo (estrutura antiga)
+                        old_path = BASE_DIR / "xmls" / informante / year_month / f"{chave}.pdf"
+                        if old_path.exists():
+                            pdf_path = old_path
+            except Exception:
+                pass
+        
+        # OTIMIZAÇÃO 3: Apenas se não encontrou acima, busca em toda estrutura (LENTO - último recurso)
+        if not pdf_path and chave and informante:
             xmls_root = BASE_DIR / "xmls" / informante
             if xmls_root.exists():
-                # Busca na estrutura nova (com tipo)
-                tipo_folder = xmls_root / tipo
-                if tipo_folder.exists():
-                    for xml_file in tipo_folder.rglob(f"{chave}.xml"):
-                        potential_pdf = xml_file.with_suffix('.pdf')
-                        if potential_pdf.exists():
-                            pdf_path = potential_pdf
-                            break
-                # Se não encontrou, busca na estrutura antiga (sem tipo)
+                # Lista todas as pastas de ano-mês
+                for year_month_folder in sorted(xmls_root.glob("*/20*"), reverse=True):
+                    potential_pdf = year_month_folder / f"{chave}.pdf"
+                    if potential_pdf.exists():
+                        pdf_path = potential_pdf
+                        break
+                # Se ainda não encontrou, busca com tipo
                 if not pdf_path:
-                    for xml_file in xmls_root.rglob(f"{chave}.xml"):
-                        potential_pdf = xml_file.with_suffix('.pdf')
-                        if potential_pdf.exists():
-                            pdf_path = potential_pdf
-                            break
+                    tipo_folder = xmls_root / tipo
+                    if tipo_folder.exists():
+                        for year_month_folder in sorted(tipo_folder.glob("20*"), reverse=True):
+                            potential_pdf = year_month_folder / f"{chave}.pdf"
+                            if potential_pdf.exists():
+                                pdf_path = potential_pdf
+                                break
         
-        # Se PDF existe, abre imediatamente (RÁPIDO - não precisa de thread!)
+        # Se PDF existe, abre imediatamente e adiciona ao cache
         if pdf_path and pdf_path.exists():
             try:
+                # Adiciona ao cache para próximas aberturas
+                self._pdf_cache[chave] = str(pdf_path)
+                
                 pdf_str = str(pdf_path.absolute())
                 if sys.platform == "win32":
                     os.startfile(pdf_str)  # type: ignore[attr-defined]
                 else:
                     subprocess.Popen(["xdg-open", pdf_str])
-                self.set_status("PDF aberto", 1000)
+                self.set_status("✅ PDF aberto", 1000)
                 return
             except Exception as e:
                 QMessageBox.warning(self, "Erro ao abrir PDF", f"Erro: {e}")
                 return
         
         # Se não tem PDF, precisa gerar (LENTO) - executa em thread separada
-        self.set_status("⏳ Processando... Por favor aguarde...")
+        self.set_status("⏳ PDF não encontrado. Gerando... Por favor aguarde...")
         QApplication.processEvents()
         
         # Cria worker thread para não travar a interface
         self._process_pdf_async(item)
+    
+    def _on_table_emitidos_double_clicked(self, row: int, col: int):
+        """Abre PDF da tabela de notas emitidas (mesma lógica que _on_table_double_clicked)"""
+        # Obtém o item pela linha clicada da lista filtrada de emitidos
+        flt = self.filtered_emitidos()
+        item = flt[row] if 0 <= row < len(flt) else None
+        if not item:
+            return
+        
+        chave = item.get('chave', '')
+        if not chave:
+            return
+        
+        # OTIMIZAÇÃO 1: Verifica cache primeiro (INSTANTÂNEO)
+        if chave in self._pdf_cache:
+            cached_pdf = Path(self._pdf_cache[chave])
+            if cached_pdf.exists():
+                try:
+                    pdf_str = str(cached_pdf.absolute())
+                    if sys.platform == "win32":
+                        os.startfile(pdf_str)  # type: ignore[attr-defined]
+                    else:
+                        subprocess.Popen(["xdg-open", pdf_str])
+                    self.set_status("✅ PDF aberto (cache)", 1000)
+                    return
+                except Exception as e:
+                    QMessageBox.warning(self, "Erro ao abrir PDF", f"Erro: {e}")
+                    return
+        
+        # OTIMIZAÇÃO 2: Busca direta baseada na data de emissão (MUITO MAIS RÁPIDO)
+        # Para notas emitidas, o cnpj_emitente é da empresa (quem emitiu)
+        # e o informante é quem recebeu (destinatário)
+        # O XML está salvo pelo informante (quem baixou)
+        informante = item.get('informante', '')
+        tipo = (item.get('tipo') or 'NFe').strip().upper().replace('-', '')
+        data_emissao = (item.get('data_emissao') or '')[:10]
+        
+        pdf_path = None
+        
+        if chave and informante and data_emissao:
+            # Extrai ano-mês da data de emissão
+            try:
+                year_month = data_emissao[:7] if len(data_emissao) >= 7 else None
+                if year_month:
+                    # Busca direta na pasta específica do mês (SEM recursão)
+                    specific_path = BASE_DIR / "xmls" / informante / tipo / year_month / f"{chave}.pdf"
+                    if specific_path.exists():
+                        pdf_path = specific_path
+                    else:
+                        # Tenta sem o tipo (estrutura antiga)
+                        old_path = BASE_DIR / "xmls" / informante / year_month / f"{chave}.pdf"
+                        if old_path.exists():
+                            pdf_path = old_path
+            except Exception:
+                pass
+        
+        # OTIMIZAÇÃO 3: Apenas se não encontrou acima, busca em toda estrutura (LENTO - último recurso)
+        if not pdf_path and chave and informante:
+            xmls_root = BASE_DIR / "xmls" / informante
+            if xmls_root.exists():
+                # Lista todas as pastas de ano-mês
+                for year_month_folder in sorted(xmls_root.glob("*/20*"), reverse=True):
+                    potential_pdf = year_month_folder / f"{chave}.pdf"
+                    if potential_pdf.exists():
+                        pdf_path = potential_pdf
+                        break
+                # Se ainda não encontrou, busca com tipo
+                if not pdf_path:
+                    tipo_folder = xmls_root / tipo
+                    if tipo_folder.exists():
+                        for year_month_folder in sorted(tipo_folder.glob("20*"), reverse=True):
+                            potential_pdf = year_month_folder / f"{chave}.pdf"
+                            if potential_pdf.exists():
+                                pdf_path = potential_pdf
+                                break
+        
+        # Se PDF existe, abre imediatamente e adiciona ao cache
+        if pdf_path and pdf_path.exists():
+            try:
+                # Adiciona ao cache para próximas aberturas
+                self._pdf_cache[chave] = str(pdf_path)
+                
+                pdf_str = str(pdf_path.absolute())
+                if sys.platform == "win32":
+                    os.startfile(pdf_str)  # type: ignore[attr-defined]
+                else:
+                    subprocess.Popen(["xdg-open", pdf_str])
+                self.set_status("✅ PDF aberto", 1000)
+                return
+            except Exception as e:
+                QMessageBox.warning(self, "Erro ao abrir PDF", f"Erro: {e}")
+                return
         
         # Se não tem PDF, precisa gerar (LENTO) - executa em thread separada
-        self.set_status("⏳ Processando... Por favor aguarde...")
+        self.set_status("⏳ PDF não encontrado. Gerando... Por favor aguarde...")
         QApplication.processEvents()
         
         # Cria worker thread para não travar a interface
@@ -1915,13 +2699,14 @@ class MainWindow(QMainWindow):
                             tmp.mkdir(parents=True, exist_ok=True)
                             pdf_path = tmp / f"{tipo}-{chave}.pdf"
                     
-                    # Check if PDF exists (pode ter sido criado entre a verificação inicial e agora)
+                    # Check if PDF exists (pode ter sido salvo junto com o XML)
                     if pdf_path.exists():
+                        self.status_update.emit("✅ PDF encontrado!")
                         self.finished.emit({"ok": True, "pdf_path": str(pdf_path)})
                         return
                     
                     # Generate PDF
-                    self.status_update.emit("📄 Gerando PDF...")
+                    self.status_update.emit("📄 Gerando PDF do XML...")
                     payload: Dict[str, Any] = {
                         "xml": xml_text,
                         "tipo": (self.item.get("tipo") or "NFe"),
@@ -2845,6 +3630,14 @@ class MainWindow(QMainWindow):
             self.set_status("")
             QMessageBox.critical(self, "Limpar", f"Erro ao limpar dados: {e}")
 
+    def open_storage_config(self):
+        """Abre diálogo de configuração de armazenamento"""
+        try:
+            dlg = StorageConfigDialog(self.db, self)
+            dlg.exec_()
+        except Exception as e:
+            QMessageBox.critical(self, "Armazenamento", f"Erro: {e}")
+
 
 class CertificateDialog(QDialog):
     def __init__(self, db: UIDB, parent=None):
@@ -2939,6 +3732,44 @@ class CertificateDialog(QDialog):
             }
         """)
         
+        btn_edit = QPushButton("✏️ Editar Selecionado")
+        btn_edit.setStyleSheet("""
+            QPushButton {
+                background-color: #2196F3;
+                color: white;
+                border: none;
+                padding: 10px 20px;
+                border-radius: 5px;
+                font-weight: bold;
+                font-size: 11px;
+            }
+            QPushButton:hover {
+                background-color: #1976D2;
+            }
+            QPushButton:pressed {
+                background-color: #1565C0;
+            }
+        """)
+        
+        btn_replace = QPushButton("🔄 Substituir Certificado")
+        btn_replace.setStyleSheet("""
+            QPushButton {
+                background-color: #FF9800;
+                color: white;
+                border: none;
+                padding: 10px 20px;
+                border-radius: 5px;
+                font-weight: bold;
+                font-size: 11px;
+            }
+            QPushButton:hover {
+                background-color: #F57C00;
+            }
+            QPushButton:pressed {
+                background-color: #E64A19;
+            }
+        """)
+        
         btn_del = QPushButton("🗑️ Remover Selecionado")
         btn_del.setStyleSheet("""
             QPushButton {
@@ -2978,11 +3809,15 @@ class CertificateDialog(QDialog):
         """)
         
         btn_add.clicked.connect(self._on_add)
+        btn_edit.clicked.connect(self._on_edit)
+        btn_replace.clicked.connect(self._on_replace)
         btn_del.clicked.connect(self._on_delete)
         btn_close.clicked.connect(self.accept)
         
         h.addStretch(1)
         h.addWidget(btn_add)
+        h.addWidget(btn_edit)
+        h.addWidget(btn_replace)
         h.addWidget(btn_del)
         h.addWidget(btn_close)
         v.addLayout(h)
@@ -3114,7 +3949,13 @@ class CertificateDialog(QDialog):
             self.table.setItem(r, 1, cell(cnpj_fmt))
             
             # Nome do Certificado
-            cert_name = self._extract_cert_name(c.get('caminho', ''))
+            # Prioriza o nome personalizado, senão extrai do arquivo
+            nome_cert = c.get('nome_certificado')
+            if nome_cert:
+                cert_name = nome_cert
+            else:
+                cert_name = self._extract_cert_name(c.get('caminho', ''))
+            
             name_cell = cell(cert_name)
             name_cell.setForeground(QBrush(QColor("#2196F3")))
             name_cell.setFont(QFont("Segoe UI", 9, QFont.Bold))
@@ -3179,6 +4020,138 @@ class CertificateDialog(QDialog):
                 )
             self.reload()
 
+    def _on_edit(self):
+        """Abre diálogo para editar certificado selecionado"""
+        idxs = self.table.selectionModel().selectedRows() if self.table.selectionModel() else []
+        if not idxs:
+            QMessageBox.warning(self, "Editar", "Selecione um certificado para editar!")
+            return
+        
+        row = idxs[0].row()
+        # Recupera ID armazenado no UserRole da primeira coluna
+        first_item = self.table.item(row, 0)
+        if not first_item:
+            return
+        cert_id = first_item.data(Qt.UserRole)
+        if not cert_id:
+            return
+        
+        # Busca dados do certificado no banco
+        try:
+            with sqlite3.connect(self.db.db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                cursor = conn.execute("SELECT * FROM certificados WHERE id = ?", (cert_id,))
+                cert_data = cursor.fetchone()
+                
+                if not cert_data:
+                    QMessageBox.warning(self, "Editar", "Certificado não encontrado!")
+                    return
+                
+                # Converte para dict
+                cert_dict = dict(cert_data)
+                
+        except Exception as e:
+            QMessageBox.critical(self, "Editar", f"Erro ao carregar certificado: {e}")
+            return
+        
+        # Abre diálogo de edição
+        dlg = EditCertificateDialog(self, cert_dict)
+        if dlg.exec_() == QDialog.Accepted:
+            updated_data = dlg.get_data()
+            if updated_data:
+                # Atualiza no banco
+                try:
+                    with sqlite3.connect(self.db.db_path) as conn:
+                        conn.execute("""
+                            UPDATE certificados 
+                            SET nome_certificado = ?, cUF_autor = ?
+                            WHERE id = ?
+                        """, (updated_data.get('nome_certificado'), 
+                              updated_data.get('cUF_autor'),
+                              cert_id))
+                        conn.commit()
+                    
+                    QMessageBox.information(
+                        self,
+                        "✅ Sucesso",
+                        "Certificado atualizado com sucesso!"
+                    )
+                    self.reload()
+                    
+                except Exception as e:
+                    QMessageBox.critical(self, "Erro", f"Erro ao atualizar certificado: {e}")
+
+    def _on_replace(self):
+        """Substitui o arquivo e senha do certificado mantendo o histórico"""
+        idxs = self.table.selectionModel().selectedRows() if self.table.selectionModel() else []
+        if not idxs:
+            QMessageBox.warning(self, "Substituir", "Selecione um certificado para substituir!")
+            return
+        
+        row = idxs[0].row()
+        # Recupera ID armazenado no UserRole da primeira coluna
+        first_item = self.table.item(row, 0)
+        if not first_item:
+            return
+        cert_id = first_item.data(Qt.UserRole)
+        if not cert_id:
+            return
+        
+        # Busca dados do certificado no banco
+        try:
+            with sqlite3.connect(self.db.db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                cursor = conn.execute("SELECT * FROM certificados WHERE id = ?", (cert_id,))
+                cert_data = cursor.fetchone()
+                
+                if not cert_data:
+                    QMessageBox.warning(self, "Substituir", "Certificado não encontrado!")
+                    return
+                
+                # Converte para dict
+                cert_dict = dict(cert_data)
+                
+        except Exception as e:
+            QMessageBox.critical(self, "Substituir", f"Erro ao carregar certificado: {e}")
+            return
+        
+        # Abre diálogo de substituição
+        dlg = ReplaceCertificateDialog(self, cert_dict)
+        if dlg.exec_() == QDialog.Accepted:
+            replacement_data = dlg.get_data()
+            if replacement_data:
+                # Atualiza no banco (apenas caminho e senha)
+                try:
+                    # Criptografa a senha antes de salvar
+                    from modules.crypto_portable import get_portable_crypto as get_crypto
+                    senha_to_save = replacement_data.get('senha', '')
+                    if senha_to_save:
+                        crypto = get_crypto()
+                        senha_to_save = crypto.encrypt(senha_to_save)
+                    
+                    with sqlite3.connect(self.db.db_path) as conn:
+                        conn.execute("""
+                            UPDATE certificados 
+                            SET caminho = ?, senha = ?
+                            WHERE id = ?
+                        """, (replacement_data.get('caminho'), 
+                              senha_to_save,
+                              cert_id))
+                        conn.commit()
+                    
+                    QMessageBox.information(
+                        self,
+                        "✅ Sucesso",
+                        f"Certificado substituído com sucesso!\n\n"
+                        f"✔️ Novo arquivo: {replacement_data.get('caminho')}\n"
+                        f"✔️ Nova validade: {replacement_data.get('validade', 'N/D')}\n\n"
+                        f"📂 Todo o histórico de notas foi mantido."
+                    )
+                    self.reload()
+                    
+                except Exception as e:
+                    QMessageBox.critical(self, "Erro", f"Erro ao substituir certificado: {e}")
+
     def _on_delete(self):
         idxs = self.table.selectionModel().selectedRows() if self.table.selectionModel() else []
         if not idxs:
@@ -3201,6 +4174,572 @@ class CertificateDialog(QDialog):
             QMessageBox.critical(self, "Remover", f"Erro ao remover: {e}")
             return
         self.reload()
+
+
+class ReplaceCertificateDialog(QDialog):
+    """Diálogo para substituir arquivo e senha do certificado"""
+    def __init__(self, parent=None, cert_data: dict = None):
+        super().__init__(parent)
+        self.cert_data = cert_data or {}
+        self.setWindowTitle("🔄 Substituir Certificado")
+        self.resize(700, 550)
+        
+        # Estilo moderno
+        self.setStyleSheet("""
+            QDialog {
+                background-color: #f8f9fa;
+            }
+            QLabel {
+                font-size: 12px;
+            }
+            QLineEdit {
+                padding: 8px;
+                border: 1px solid #ddd;
+                border-radius: 4px;
+                background-color: white;
+                font-size: 12px;
+            }
+            QLineEdit:focus {
+                border: 2px solid #FF9800;
+            }
+            QLineEdit:disabled {
+                background-color: #f5f5f5;
+                color: #666;
+            }
+            QPushButton {
+                padding: 8px 16px;
+                border-radius: 4px;
+                font-size: 11px;
+                font-weight: bold;
+            }
+        """)
+        
+        v = QVBoxLayout(self)
+        v.setSpacing(20)
+        v.setContentsMargins(30, 30, 30, 30)
+        
+        # Cabeçalho
+        header_label = QLabel("🔄 Substituir Certificado Digital")
+        header_font = header_label.font()
+        header_font.setPointSize(13)
+        header_font.setBold(True)
+        header_label.setFont(header_font)
+        v.addWidget(header_label)
+        
+        # Aviso importante
+        warning_box = QLabel(
+            "⚠️ <b>Importante:</b> Esta operação substitui apenas o arquivo .pfx e a senha.<br>"
+            "Todo o histórico de notas e configurações serão mantidos."
+        )
+        warning_box.setStyleSheet("""
+            QLabel {
+                background-color: #FFF3CD;
+                border: 2px solid #FFA726;
+                border-radius: 5px;
+                padding: 10px;
+                color: #856404;
+            }
+        """)
+        warning_box.setWordWrap(True)
+        v.addWidget(warning_box)
+        
+        # Info do certificado atual (somente leitura)
+        current_group = QGroupBox("📋 Certificado Atual")
+        current_group.setStyleSheet("""
+            QGroupBox {
+                font-weight: bold;
+                border: 2px solid #ddd;
+                border-radius: 5px;
+                margin-top: 10px;
+                padding-top: 10px;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0 5px;
+            }
+        """)
+        
+        current_layout = QVBoxLayout()
+        current_layout.setSpacing(8)
+        
+        # Informações do certificado atual
+        cnpj_label = QLabel(f"🆔 CNPJ/CPF: {self.cert_data.get('cnpj_cpf', 'N/D')}")
+        cnpj_label.setStyleSheet("color: #333; font-weight: normal;")
+        current_layout.addWidget(cnpj_label)
+        
+        inf_label = QLabel(f"👤 Informante: {self.cert_data.get('informante', 'N/D')}")
+        inf_label.setStyleSheet("color: #333; font-weight: normal;")
+        current_layout.addWidget(inf_label)
+        
+        razao = self.cert_data.get('razao_social', 'N/D')
+        if razao and razao != 'N/D' and len(razao) > 50:
+            razao = razao[:50] + "..."
+        razao_label = QLabel(f"🏢 Razão Social: {razao}")
+        razao_label.setStyleSheet("color: #333; font-weight: normal;")
+        current_layout.addWidget(razao_label)
+        
+        # Arquivo atual
+        arquivo_atual = self.cert_data.get('caminho', 'N/D')
+        if len(arquivo_atual) > 60:
+            arquivo_atual = "..." + arquivo_atual[-60:]
+        arquivo_label = QLabel(f"📄 Arquivo atual: {arquivo_atual}")
+        arquivo_label.setStyleSheet("color: #666; font-style: italic; font-weight: normal; font-size: 10px;")
+        arquivo_label.setWordWrap(True)
+        current_layout.addWidget(arquivo_label)
+        
+        current_group.setLayout(current_layout)
+        v.addWidget(current_group)
+        
+        # Novo certificado
+        new_group = QGroupBox("🆕 Novo Certificado")
+        new_group.setStyleSheet("""
+            QGroupBox {
+                font-weight: bold;
+                border: 2px solid #FF9800;
+                border-radius: 5px;
+                margin-top: 10px;
+                padding-top: 10px;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0 5px;
+            }
+        """)
+        
+        new_layout = QVBoxLayout()
+        new_layout.setSpacing(15)
+        
+        # Campo de arquivo
+        arquivo_label = QLabel("📁 Novo Arquivo do Certificado:")
+        arquivo_label.setStyleSheet("font-weight: bold; color: #333;")
+        new_layout.addWidget(arquivo_label)
+        
+        cert_layout = QHBoxLayout()
+        self.cert_edit = QLineEdit()
+        self.cert_edit.setPlaceholderText("Selecione o novo arquivo .pfx...")
+        self.cert_edit.setReadOnly(True)
+        
+        btn_browse = QPushButton("🔍 Procurar...")
+        btn_browse.setStyleSheet("""
+            QPushButton {
+                background-color: #FF9800;
+                color: white;
+            }
+            QPushButton:hover {
+                background-color: #F57C00;
+            }
+        """)
+        btn_browse.clicked.connect(self._browse_cert)
+        
+        cert_layout.addWidget(self.cert_edit, 1)
+        cert_layout.addWidget(btn_browse)
+        new_layout.addLayout(cert_layout)
+        
+        # Campo de senha
+        senha_label = QLabel("🔐 Nova Senha do Certificado:")
+        senha_label.setStyleSheet("font-weight: bold; color: #333;")
+        new_layout.addWidget(senha_label)
+        
+        self.senha_edit = QLineEdit()
+        self.senha_edit.setPlaceholderText("Digite a senha do novo certificado...")
+        self.senha_edit.setEchoMode(QLineEdit.Password)
+        new_layout.addWidget(self.senha_edit)
+        
+        # Botão para validar
+        validate_layout = QHBoxLayout()
+        validate_layout.addStretch()
+        btn_validate = QPushButton("🔎 Validar Novo Certificado")
+        btn_validate.setStyleSheet("""
+            QPushButton {
+                background-color: #2196F3;
+                color: white;
+                padding: 10px 20px;
+            }
+            QPushButton:hover {
+                background-color: #1976D2;
+            }
+        """)
+        btn_validate.clicked.connect(self._validate_cert)
+        validate_layout.addWidget(btn_validate)
+        validate_layout.addStretch()
+        new_layout.addLayout(validate_layout)
+        
+        # Label de validação
+        self.validation_label = QLabel("")
+        self.validation_label.setStyleSheet("padding: 5px; font-weight: normal;")
+        self.validation_label.setWordWrap(True)
+        new_layout.addWidget(self.validation_label)
+        
+        new_group.setLayout(new_layout)
+        v.addWidget(new_group)
+        
+        v.addStretch()
+        
+        # Botões finais
+        h = QHBoxLayout()
+        h.addStretch()
+        
+        self.btn_save = QPushButton("🔄 Substituir")
+        self.btn_save.setStyleSheet("""
+            QPushButton {
+                background-color: #4CAF50;
+                color: white;
+                padding: 10px 30px;
+            }
+            QPushButton:hover {
+                background-color: #45a049;
+            }
+            QPushButton:disabled {
+                background-color: #ccc;
+                color: #666;
+            }
+        """)
+        self.btn_save.clicked.connect(self.accept)
+        self.btn_save.setEnabled(False)  # Desabilitado até validar
+        
+        btn_cancel = QPushButton("❌ Cancelar")
+        btn_cancel.setStyleSheet("""
+            QPushButton {
+                background-color: #f44336;
+                color: white;
+                padding: 10px 30px;
+            }
+            QPushButton:hover {
+                background-color: #da190b;
+            }
+        """)
+        btn_cancel.clicked.connect(self.reject)
+        
+        h.addWidget(self.btn_save)
+        h.addWidget(btn_cancel)
+        v.addLayout(h)
+        
+        # Armazena dados de validação
+        self.validated_data = None
+    
+    def _browse_cert(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Selecionar Novo Certificado Digital",
+            "",
+            "Certificados (*.pfx *.p12);;Todos os arquivos (*.*)"
+        )
+        if path:
+            self.cert_edit.setText(path)
+            self.validation_label.setText("")
+            self.btn_save.setEnabled(False)
+            self.validated_data = None
+    
+    def _validate_cert(self):
+        """Valida o novo certificado"""
+        cert_path = self.cert_edit.text().strip()
+        senha = self.senha_edit.text().strip()
+        
+        if not cert_path:
+            self.validation_label.setText("⚠️ Selecione o arquivo do certificado!")
+            self.validation_label.setStyleSheet("color: #f44336; padding: 5px;")
+            return
+        
+        try:
+            from cryptography.hazmat.primitives.serialization import pkcs12
+            from cryptography.hazmat.backends import default_backend
+            from cryptography import x509
+            from datetime import datetime
+            import os
+            
+            if not os.path.exists(cert_path):
+                self.validation_label.setText("❌ Arquivo não encontrado!")
+                self.validation_label.setStyleSheet("color: #f44336; padding: 5px;")
+                return
+            
+            # Lê o arquivo
+            with open(cert_path, 'rb') as f:
+                pfx_data = f.read()
+            
+            # Tenta carregar o certificado
+            try:
+                private_key, certificate, additional_certs = pkcs12.load_key_and_certificates(
+                    pfx_data,
+                    senha.encode() if senha else None,
+                    default_backend()
+                )
+            except Exception as e:
+                self.validation_label.setText(f"❌ Erro ao carregar certificado!\n{str(e)[:100]}")
+                self.validation_label.setStyleSheet("color: #f44336; padding: 5px;")
+                return
+            
+            if not certificate:
+                self.validation_label.setText("❌ Certificado não encontrado no arquivo!")
+                self.validation_label.setStyleSheet("color: #f44336; padding: 5px;")
+                return
+            
+            # Extrai CNPJ do novo certificado
+            subject = certificate.subject
+            cn = None
+            for attr in subject:
+                if attr.oid._name == 'commonName':
+                    cn = attr.value
+                    break
+            
+            # Extrai CNPJ do CN
+            import re
+            novo_cnpj = None
+            if cn:
+                match = re.search(r'\d{14}', cn)
+                if match:
+                    novo_cnpj = match.group(0)
+            
+            # Valida se é o mesmo CNPJ
+            cnpj_atual = self.cert_data.get('informante', '')
+            if novo_cnpj != cnpj_atual:
+                self.validation_label.setText(
+                    f"❌ CNPJ incompatível!\n"
+                    f"Atual: {cnpj_atual}\n"
+                    f"Novo: {novo_cnpj or 'Não identificado'}"
+                )
+                self.validation_label.setStyleSheet("color: #f44336; padding: 5px;")
+                return
+            
+            # Extrai validade
+            validade = certificate.not_valid_after_utc
+            validade_str = validade.strftime("%d/%m/%Y")
+            
+            # Verifica se não está vencido
+            hoje = datetime.now(validade.tzinfo)
+            if validade < hoje:
+                self.validation_label.setText(
+                    f"⚠️ Certificado já vencido!\n"
+                    f"Vencimento: {validade_str}"
+                )
+                self.validation_label.setStyleSheet("color: #FF9800; padding: 5px;")
+                self.btn_save.setEnabled(False)
+                return
+            
+            # Sucesso!
+            dias_restantes = (validade.replace(tzinfo=None) - datetime.now()).days
+            self.validation_label.setText(
+                f"✅ Certificado válido!\n"
+                f"CNPJ: {novo_cnpj}\n"
+                f"Validade: {validade_str} ({dias_restantes} dias)"
+            )
+            self.validation_label.setStyleSheet("color: #4CAF50; padding: 5px; font-weight: bold;")
+            self.btn_save.setEnabled(True)
+            
+            # Armazena dados validados
+            self.validated_data = {
+                'caminho': cert_path,
+                'senha': senha,
+                'cnpj': novo_cnpj,
+                'validade': validade_str
+            }
+            
+        except Exception as e:
+            self.validation_label.setText(f"❌ Erro na validação: {str(e)[:100]}")
+            self.validation_label.setStyleSheet("color: #f44336; padding: 5px;")
+            import traceback
+            traceback.print_exc()
+    
+    def get_data(self) -> Optional[Dict[str, Any]]:
+        """Retorna os dados validados"""
+        return self.validated_data
+
+
+class EditCertificateDialog(QDialog):
+    """Diálogo para editar dados do certificado"""
+    def __init__(self, parent=None, cert_data: dict = None):
+        super().__init__(parent)
+        self.cert_data = cert_data or {}
+        self.setWindowTitle("✏️ Editar Certificado")
+        self.resize(600, 400)
+        
+        # Estilo moderno
+        self.setStyleSheet("""
+            QDialog {
+                background-color: #f8f9fa;
+            }
+            QLabel {
+                font-size: 12px;
+            }
+            QLineEdit {
+                padding: 8px;
+                border: 1px solid #ddd;
+                border-radius: 4px;
+                background-color: white;
+                font-size: 12px;
+            }
+            QLineEdit:focus {
+                border: 2px solid #2196F3;
+            }
+            QLineEdit:disabled {
+                background-color: #f5f5f5;
+                color: #666;
+            }
+            QPushButton {
+                padding: 8px 16px;
+                border-radius: 4px;
+                font-size: 11px;
+                font-weight: bold;
+            }
+        """)
+        
+        v = QVBoxLayout(self)
+        v.setSpacing(20)
+        v.setContentsMargins(30, 30, 30, 30)
+        
+        # Cabeçalho
+        header_label = QLabel("Editar dados do certificado")
+        header_font = header_label.font()
+        header_font.setPointSize(13)
+        header_font.setBold(True)
+        header_label.setFont(header_font)
+        v.addWidget(header_label)
+        
+        # Info do certificado (somente leitura)
+        info_group = QGroupBox("📋 Informações do Certificado")
+        info_group.setStyleSheet("""
+            QGroupBox {
+                font-weight: bold;
+                border: 2px solid #ddd;
+                border-radius: 5px;
+                margin-top: 10px;
+                padding-top: 10px;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0 5px;
+            }
+        """)
+        
+        info_layout = QVBoxLayout()
+        info_layout.setSpacing(10)
+        
+        # CNPJ/CPF
+        cnpj_label = QLabel(f"🆔 CNPJ/CPF: {self.cert_data.get('cnpj_cpf', 'N/D')}")
+        cnpj_label.setStyleSheet("color: #333; font-weight: normal;")
+        info_layout.addWidget(cnpj_label)
+        
+        # Informante
+        inf_label = QLabel(f"👤 Informante: {self.cert_data.get('informante', 'N/D')}")
+        inf_label.setStyleSheet("color: #333; font-weight: normal;")
+        info_layout.addWidget(inf_label)
+        
+        # Razão Social
+        razao = self.cert_data.get('razao_social', 'N/D')
+        if razao and razao != 'N/D' and len(razao) > 50:
+            razao = razao[:50] + "..."
+        razao_label = QLabel(f"🏢 Razão Social: {razao}")
+        razao_label.setStyleSheet("color: #333; font-weight: normal;")
+        info_layout.addWidget(razao_label)
+        
+        info_group.setLayout(info_layout)
+        v.addWidget(info_group)
+        
+        # Campos editáveis
+        edit_group = QGroupBox("✏️ Campos Editáveis")
+        edit_group.setStyleSheet("""
+            QGroupBox {
+                font-weight: bold;
+                border: 2px solid #2196F3;
+                border-radius: 5px;
+                margin-top: 10px;
+                padding-top: 10px;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0 5px;
+            }
+        """)
+        
+        edit_layout = QVBoxLayout()
+        edit_layout.setSpacing(15)
+        
+        # Nome do Certificado
+        nome_label = QLabel("📝 Nome do Certificado:")
+        nome_label.setStyleSheet("font-weight: bold; color: #333;")
+        edit_layout.addWidget(nome_label)
+        
+        self.nome_edit = QLineEdit()
+        self.nome_edit.setText(self.cert_data.get('nome_certificado', ''))
+        self.nome_edit.setPlaceholderText("Ex: Walter Transportes, Empresa Filial SP...")
+        self.nome_edit.setStyleSheet("""
+            QLineEdit {
+                background-color: #fffef0;
+                border: 2px solid #FFA726;
+            }
+            QLineEdit:focus {
+                border: 2px solid #FF9800;
+            }
+        """)
+        edit_layout.addWidget(self.nome_edit)
+        
+        # Nota sobre nome
+        nota_nome = QLabel("💡 Este nome será usado ao salvar arquivos em vez do CNPJ")
+        nota_nome.setStyleSheet("color: #666; font-style: italic; font-size: 10px;")
+        nota_nome.setWordWrap(True)
+        edit_layout.addWidget(nota_nome)
+        
+        # UF Autor
+        uf_label = QLabel("📍 UF Autor:")
+        uf_label.setStyleSheet("font-weight: bold; color: #333;")
+        edit_layout.addWidget(uf_label)
+        
+        self.uf_edit = QLineEdit()
+        self.uf_edit.setText(str(self.cert_data.get('cUF_autor', '')))
+        self.uf_edit.setPlaceholderText("Ex: 33 (Rio de Janeiro)")
+        edit_layout.addWidget(self.uf_edit)
+        
+        edit_group.setLayout(edit_layout)
+        v.addWidget(edit_group)
+        
+        v.addStretch()
+        
+        # Botões
+        h = QHBoxLayout()
+        h.addStretch()
+        
+        btn_save = QPushButton("💾 Salvar")
+        btn_save.setStyleSheet("""
+            QPushButton {
+                background-color: #4CAF50;
+                color: white;
+                padding: 10px 30px;
+            }
+            QPushButton:hover {
+                background-color: #45a049;
+            }
+        """)
+        btn_save.clicked.connect(self.accept)
+        
+        btn_cancel = QPushButton("❌ Cancelar")
+        btn_cancel.setStyleSheet("""
+            QPushButton {
+                background-color: #f44336;
+                color: white;
+                padding: 10px 30px;
+            }
+            QPushButton:hover {
+                background-color: #da190b;
+            }
+        """)
+        btn_cancel.clicked.connect(self.reject)
+        
+        h.addWidget(btn_save)
+        h.addWidget(btn_cancel)
+        v.addLayout(h)
+    
+    def get_data(self) -> Optional[Dict[str, Any]]:
+        """Retorna os dados editados"""
+        nome = self.nome_edit.text().strip()
+        uf = self.uf_edit.text().strip()
+        
+        return {
+            "nome_certificado": nome if nome else None,
+            "cUF_autor": uf if uf else self.cert_data.get('cUF_autor')
+        }
 
 
 class AddCertificateDialog(QDialog):
@@ -3345,25 +4884,54 @@ class AddCertificateDialog(QDialog):
         self.cnpj_edit.setReadOnly(True)
         grid.addWidget(self.cnpj_edit, 1, 1)
         
+        # Razão Social
+        grid.addWidget(QLabel("🏢 Razão Social:"), 2, 0)
+        self.razao_social_edit = QLineEdit()
+        self.razao_social_edit.setPlaceholderText("Será preenchido automaticamente...")
+        self.razao_social_edit.setReadOnly(True)
+        grid.addWidget(self.razao_social_edit, 2, 1)
+        
         # UF
-        grid.addWidget(QLabel("📍 UF Autor:"), 2, 0)
+        grid.addWidget(QLabel("📍 UF Autor:"), 3, 0)
         self.uf_edit = QLineEdit()
         self.uf_edit.setPlaceholderText("Ex: 33 (Rio de Janeiro)")
-        grid.addWidget(self.uf_edit, 2, 1)
+        grid.addWidget(self.uf_edit, 3, 1)
         
         # Titular
-        grid.addWidget(QLabel("📋 Titular:"), 3, 0)
+        grid.addWidget(QLabel("📋 Titular:"), 4, 0)
         self.titular_edit = QLineEdit()
         self.titular_edit.setPlaceholderText("Será preenchido automaticamente...")
         self.titular_edit.setReadOnly(True)
-        grid.addWidget(self.titular_edit, 3, 1)
+        grid.addWidget(self.titular_edit, 4, 1)
         
         # Validade
-        grid.addWidget(QLabel("📅 Válido até:"), 4, 0)
+        grid.addWidget(QLabel("📅 Válido até:"), 5, 0)
         self.validade_edit = QLineEdit()
         self.validade_edit.setPlaceholderText("Será preenchido automaticamente...")
         self.validade_edit.setReadOnly(True)
-        grid.addWidget(self.validade_edit, 4, 1)
+        grid.addWidget(self.validade_edit, 5, 1)
+        
+        # Nome do Certificado (campo editável)
+        grid.addWidget(QLabel("📝 Nome do Certificado:"), 6, 0)
+        self.nome_cert_edit = QLineEdit()
+        self.nome_cert_edit.setPlaceholderText("Ex: Walter Transportes, Empresa Filial SP...")
+        self.nome_cert_edit.setReadOnly(False)
+        self.nome_cert_edit.setStyleSheet("""
+            QLineEdit {
+                background-color: #fffef0;
+                border: 2px solid #FFA726;
+            }
+            QLineEdit:focus {
+                border: 2px solid #FF9800;
+            }
+        """)
+        grid.addWidget(self.nome_cert_edit, 6, 1)
+        
+        # Nota explicativa
+        nota_label = QLabel("💡 O nome do certificado será usado ao salvar arquivos em vez do CNPJ")
+        nota_label.setStyleSheet("color: #666; font-style: italic; font-size: 10px; padding-top: 5px;")
+        nota_label.setWordWrap(True)
+        grid.addWidget(nota_label, 7, 0, 1, 2)
         
         v.addLayout(grid)
         
@@ -3413,25 +4981,30 @@ class AddCertificateDialog(QDialog):
         if path:
             self.cert_edit.setText(path)
     
-    def _consultar_uf_cnpj(self, cnpj: str) -> Optional[str]:
-        """Consulta UF do CNPJ via API Brasil."""
+    def _consultar_uf_cnpj(self, cnpj: str) -> tuple[Optional[str], Optional[str]]:
+        """Consulta UF e Razão Social do CNPJ via API Brasil.
+        
+        Returns:
+            tuple: (uf, razao_social) ou (None, None) em caso de erro
+        """
         try:
             import requests
             url = f"https://brasilapi.com.br/api/cnpj/v1/{cnpj}"
-            print(f"[DEBUG] Consultando UF do CNPJ {cnpj} via API Brasil...")
+            print(f"[DEBUG] Consultando dados do CNPJ {cnpj} via API Brasil...")
             
             response = requests.get(url, timeout=5)
             if response.status_code == 200:
                 data = response.json()
                 uf = data.get('uf')
-                print(f"[DEBUG] UF encontrada: {uf}")
-                return uf
+                razao_social = data.get('razao_social')
+                print(f"[DEBUG] UF encontrada: {uf}, Razão Social: {razao_social}")
+                return (uf, razao_social)
             else:
                 print(f"[DEBUG] Erro ao consultar CNPJ: status {response.status_code}")
-                return None
+                return (None, None)
         except Exception as e:
             print(f"[DEBUG] Erro ao consultar API Brasil: {e}")
-            return None
+            return (None, None)
     
     def _extract_cert_info(self):
         """Extrai informações do certificado automaticamente."""
@@ -3544,9 +5117,16 @@ class AddCertificateDialog(QDialog):
                 self.informante_edit.setText(documento)
                 self.cnpj_edit.setText(documento)
                 
-                # Consulta UF automaticamente via API Brasil
+                # Consulta UF e Razão Social automaticamente via API Brasil
                 if len(documento) == 14:  # É CNPJ
-                    uf_encontrada = self._consultar_uf_cnpj(documento)
+                    uf_encontrada, razao_social = self._consultar_uf_cnpj(documento)
+                    
+                    # Preenche razão social
+                    if razao_social:
+                        self.razao_social_edit.setText(razao_social)
+                        print(f"[DEBUG] Razão Social preenchida: {razao_social}")
+                    
+                    # Preenche UF
                     if uf_encontrada:
                         # Mapeia UF para código
                         uf_to_codigo = {
@@ -3574,17 +5154,19 @@ class AddCertificateDialog(QDialog):
             self.validade_edit.setText(status_validade)
             
             uf_msg = ""
+            razao_msg = ""
             if len(documento or '') == 14:
-                uf_msg = f"\n\nUF foi preenchida automaticamente."
+                uf_msg = f"\nUF: Preenchida automaticamente"
+                if self.razao_social_edit.text():
+                    razao_msg = f"\nRazão Social: {self.razao_social_edit.text()}"
             
             QMessageBox.information(
                 self,
                 "Sucesso",
                 f"Informações extraídas com sucesso!\n\n"
                 f"Titular: {cn or 'N/D'}\n"
-                f"CNPJ/CPF: {documento or 'Não encontrado'}\n"
-                f"Validade: {status_validade}\n\n"
-                f"Não esqueça de preencher o campo 'UF Autor' antes de salvar!"
+                f"CNPJ/CPF: {documento or 'Não encontrado'}{razao_msg}\n"
+                f"Validade: {status_validade}{uf_msg}"
             )
             
         except Exception as e:
@@ -3603,6 +5185,8 @@ class AddCertificateDialog(QDialog):
         informante = self.informante_edit.text().strip()
         cnpj_cpf = self.cnpj_edit.text().strip()
         cuf = self.uf_edit.text().strip()
+        razao_social = self.razao_social_edit.text().strip()
+        nome_certificado = self.nome_cert_edit.text().strip()
         
         if not cert_path:
             QMessageBox.warning(self, "Atenção", "Selecione o arquivo do certificado!")
@@ -3626,7 +5210,9 @@ class AddCertificateDialog(QDialog):
             "caminho": cert_path,
             "senha": senha,
             "cUF_autor": cuf,
-            "ativo": 1
+            "ativo": 1,
+            "razao_social": razao_social if razao_social else None,
+            "nome_certificado": nome_certificado if nome_certificado else None
         }
 
 
@@ -3729,6 +5315,559 @@ class AutofillWorker(QThread):
                 self._emit(f"[Autofill] Erro: {e}")
             except Exception:
                 pass
+
+
+class StorageConfigDialog(QDialog):
+    """Diálogo para configurar como os arquivos XML e PDF são armazenados"""
+    
+    def __init__(self, db: UIDB, parent=None):
+        super().__init__(parent)
+        self.db = db
+        self.setWindowTitle("⚙️ Configurações de Armazenamento")
+        self.resize(700, 550)
+        
+        # Estilo moderno
+        self.setStyleSheet("""
+            QDialog {
+                background-color: #f8f9fa;
+            }
+            QGroupBox {
+                font-weight: bold;
+                border: 2px solid #ddd;
+                border-radius: 8px;
+                margin-top: 12px;
+                padding-top: 15px;
+                background-color: white;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 15px;
+                padding: 0 8px;
+                color: #2196F3;
+                font-size: 13px;
+            }
+            QLabel {
+                font-size: 11px;
+            }
+            QLineEdit, QComboBox {
+                padding: 8px;
+                border: 1px solid #ddd;
+                border-radius: 4px;
+                background-color: white;
+                font-size: 11px;
+            }
+            QLineEdit:focus, QComboBox:focus {
+                border: 2px solid #2196F3;
+            }
+            QRadioButton {
+                font-size: 11px;
+                spacing: 8px;
+            }
+            QPushButton {
+                padding: 10px 20px;
+                border-radius: 5px;
+                font-size: 11px;
+                font-weight: bold;
+            }
+        """)
+        
+        # Layout principal
+        layout = QVBoxLayout(self)
+        layout.setSpacing(15)
+        layout.setContentsMargins(20, 20, 20, 20)
+        
+        # Título
+        title = QLabel("📁 Configure como seus arquivos serão organizados")
+        title_font = title.font()
+        title_font.setPointSize(13)
+        title_font.setBold(True)
+        title.setFont(title_font)
+        title.setStyleSheet("color: #333; margin-bottom: 10px;")
+        layout.addWidget(title)
+        
+        # === GRUPO 1: Pasta Base ===
+        group_pasta = QGroupBox("📂 Pasta Base de Armazenamento")
+        pasta_layout = QVBoxLayout()
+        pasta_layout.setSpacing(10)
+        
+        pasta_label = QLabel("Caminho completo da pasta onde os arquivos serão salvos:")
+        pasta_label.setStyleSheet("font-weight: normal; color: #666;")
+        pasta_layout.addWidget(pasta_label)
+        
+        # Layout horizontal para campo + botão
+        pasta_h_layout = QHBoxLayout()
+        pasta_h_layout.setSpacing(8)
+        
+        self.pasta_edit = QLineEdit()
+        self.pasta_edit.setPlaceholderText("Ex: C:/Arquivo Walter - Empresas/Notas NFe")
+        pasta_h_layout.addWidget(self.pasta_edit, 1)
+        
+        btn_browse = QPushButton("📁 Procurar...")
+        btn_browse.setStyleSheet("""
+            QPushButton {
+                background-color: #2196F3;
+                color: white;
+                min-width: 120px;
+            }
+            QPushButton:hover {
+                background-color: #1976D2;
+            }
+        """)
+        btn_browse.clicked.connect(self._browse_folder)
+        pasta_h_layout.addWidget(btn_browse)
+        
+        pasta_layout.addLayout(pasta_h_layout)
+        
+        pasta_obs = QLabel("💡 Os arquivos serão salvos em: [PASTA_BASE]/[CNPJ]/[MÊS]/[TIPO]/")
+        pasta_obs.setStyleSheet("color: #888; font-size: 10px; font-style: italic;")
+        pasta_layout.addWidget(pasta_obs)
+        
+        group_pasta.setLayout(pasta_layout)
+        layout.addWidget(group_pasta)
+        
+        # === GRUPO 2: Formato do Mês ===
+        group_mes = QGroupBox("📅 Formato da Pasta de Mês")
+        mes_layout = QVBoxLayout()
+        mes_layout.setSpacing(10)
+        
+        mes_label = QLabel("Como deseja organizar as pastas por mês:")
+        mes_label.setStyleSheet("font-weight: normal; color: #666;")
+        mes_layout.addWidget(mes_label)
+        
+        self.formato_combo = QComboBox()
+        self.formato_combo.addItem("📅 AAAA-MM  (2025-01, 2025-02...)", "AAAA-MM")
+        self.formato_combo.addItem("📅 MM-AAAA  (01-2025, 02-2025...)", "MM-AAAA")
+        self.formato_combo.addItem("📅 AAAA/MM  (2025/01, 2025/02...)", "AAAA/MM")
+        self.formato_combo.addItem("📅 MM/AAAA  (01/2025, 02/2025...)", "MM/AAAA")
+        mes_layout.addWidget(self.formato_combo)
+        
+        mes_exemplo = QLabel("📁 Exemplo: xmls/33251845000109/2025-01/NFe/")
+        mes_exemplo.setStyleSheet("color: #888; font-size: 10px; font-style: italic; margin-top: 5px;")
+        mes_layout.addWidget(mes_exemplo)
+        
+        group_mes.setLayout(mes_layout)
+        layout.addWidget(group_mes)
+        
+        # === GRUPO 3: Organização XML/PDF ===
+        group_org = QGroupBox("🗂️ Organização de XML e PDF")
+        org_layout = QVBoxLayout()
+        org_layout.setSpacing(12)
+        
+        org_label = QLabel("Como deseja organizar XML e PDF:")
+        org_label.setStyleSheet("font-weight: normal; color: #666;")
+        org_layout.addWidget(org_label)
+        
+        self.radio_juntos = QRadioButton("📄 XMLs e PDFs na mesma pasta")
+        self.radio_juntos.setToolTip("Exemplo: xmls/33251845000109/2025-01/NFe/ (contém .xml e .pdf)")
+        org_layout.addWidget(self.radio_juntos)
+        
+        juntos_exemplo = QLabel("      └─ Exemplo: NFe/nota12345.xml + nota12345.pdf na mesma pasta")
+        juntos_exemplo.setStyleSheet("color: #888; font-size: 10px; margin-left: 30px;")
+        org_layout.addWidget(juntos_exemplo)
+        
+        self.radio_separados = QRadioButton("📁 XMLs e PDFs em pastas separadas")
+        self.radio_separados.setToolTip("Exemplo: xmls/ e pdfs/ em pastas diferentes")
+        self.radio_separados.setChecked(True)
+        org_layout.addWidget(self.radio_separados)
+        
+        sep_exemplo = QLabel("      └─ Exemplo: xmls/33251845000109/2025-01/NFe/ e pdfs/33251845000109/2025-01/NFe/")
+        sep_exemplo.setStyleSheet("color: #888; font-size: 10px; margin-left: 30px;")
+        org_layout.addWidget(sep_exemplo)
+        
+        group_org.setLayout(org_layout)
+        layout.addWidget(group_org)
+        
+        # === INFORMAÇÃO ADICIONAL ===
+        info_box = QLabel(
+            "ℹ️ <b>Estrutura de Pastas:</b><br>"
+            "   • <b>NFe</b>: Notas Fiscais Eletrônicas<br>"
+            "   • <b>CTe</b>: Conhecimentos de Transporte<br>"
+            "   • <b>NFe/Eventos</b>: Eventos de NF-e (cancelamento, carta de correção...)<br>"
+            "   • <b>CTe/Eventos</b>: Eventos de CT-e"
+        )
+        info_box.setStyleSheet("""
+            background-color: #e3f2fd;
+            border: 1px solid #90caf9;
+            border-radius: 6px;
+            padding: 12px;
+            color: #1565c0;
+            font-size: 10px;
+        """)
+        info_box.setWordWrap(True)
+        layout.addWidget(info_box)
+        
+        layout.addStretch()
+        
+        # === BOTÕES ===
+        button_layout = QHBoxLayout()
+        button_layout.addStretch()
+        
+        btn_save = QPushButton("💾 Salvar")
+        btn_save.setStyleSheet("""
+            QPushButton {
+                background-color: #4CAF50;
+                color: white;
+                min-width: 100px;
+            }
+            QPushButton:hover {
+                background-color: #45a049;
+            }
+        """)
+        btn_save.clicked.connect(self.save_config)
+        
+        btn_cancel = QPushButton("✖ Cancelar")
+        btn_cancel.setStyleSheet("""
+            QPushButton {
+                background-color: #f44336;
+                color: white;
+                min-width: 100px;
+            }
+            QPushButton:hover {
+                background-color: #da190b;
+            }
+        """)
+        btn_cancel.clicked.connect(self.reject)
+        
+        button_layout.addWidget(btn_save)
+        button_layout.addWidget(btn_cancel)
+        layout.addLayout(button_layout)
+        
+        # Carrega configurações atuais
+        self.load_current_config()
+        
+        # Conecta mudanças para atualizar exemplo
+        self.pasta_edit.textChanged.connect(self.update_example)
+        self.formato_combo.currentIndexChanged.connect(self.update_example)
+    
+    def _browse_folder(self):
+        """Abre diálogo para selecionar pasta"""
+        current_path = self.pasta_edit.text().strip()
+        
+        # Se já tem um caminho, usa como inicial
+        if current_path and os.path.exists(current_path):
+            initial_dir = current_path
+        else:
+            initial_dir = str(Path.home())
+        
+        folder = QFileDialog.getExistingDirectory(
+            self,
+            "Selecionar Pasta de Armazenamento",
+            initial_dir,
+            QFileDialog.ShowDirsOnly | QFileDialog.DontResolveSymlinks
+        )
+        
+        if folder:
+            self.pasta_edit.setText(folder)
+        
+    def load_current_config(self):
+        """Carrega as configurações atuais do banco"""
+        try:
+            # Pasta base - agora é caminho completo
+            pasta = self.db.get_config('storage_pasta_base', str(DATA_DIR / 'xmls'))
+            self.pasta_edit.setText(pasta)
+            
+            # Formato do mês
+            formato = self.db.get_config('storage_formato_mes', 'AAAA-MM')
+            for i in range(self.formato_combo.count()):
+                if self.formato_combo.itemData(i) == formato:
+                    self.formato_combo.setCurrentIndex(i)
+                    break
+            
+            # Organização XML/PDF
+            separado = self.db.get_config('storage_xml_pdf_separado', '1')
+            if separado == '1':
+                self.radio_separados.setChecked(True)
+            else:
+                self.radio_juntos.setChecked(True)
+        except Exception as e:
+            print(f"[ERRO] Ao carregar config de armazenamento: {e}")
+    
+    def update_example(self):
+        """Atualiza o exemplo de caminho conforme as configurações"""
+        try:
+            pasta = self.pasta_edit.text().strip()
+            if not pasta:
+                pasta = str(DATA_DIR / 'xmls')
+            
+            formato = self.formato_combo.currentData() or 'AAAA-MM'
+            
+            # Gera exemplo de mês
+            from datetime import datetime
+            now = datetime.now()
+            if formato == 'AAAA-MM':
+                mes_exemplo = f"{now.year}-{now.month:02d}"
+            elif formato == 'MM-AAAA':
+                mes_exemplo = f"{now.month:02d}-{now.year}"
+            elif formato == 'AAAA/MM':
+                mes_exemplo = f"{now.year}/{now.month:02d}"
+            else:  # MM/AAAA
+                mes_exemplo = f"{now.month:02d}/{now.year}"
+            
+            # Atualiza label de exemplo
+            exemplo = f"📁 Exemplo: {pasta}/33251845000109/{mes_exemplo}/NFe/"
+            
+            # Encontra o label de exemplo e atualiza
+            for widget in self.findChildren(QLabel):
+                if widget.text().startswith("📁 Exemplo:"):
+                    widget.setText(exemplo)
+                    break
+        except Exception:
+            pass
+    
+    def save_config(self):
+        """Salva as configurações no banco"""
+        try:
+            pasta = self.pasta_edit.text().strip()
+            
+            if not pasta:
+                QMessageBox.warning(self, "Atenção", "Por favor, informe o caminho da pasta base!")
+                return
+            
+            # Converte para Path para normalizar
+            try:
+                pasta_path = Path(pasta)
+                
+                # Cria a pasta se não existir
+                if not pasta_path.exists():
+                    reply = QMessageBox.question(
+                        self,
+                        "Pasta não existe",
+                        f"A pasta:\n{pasta}\n\nNão existe. Deseja criá-la?",
+                        QMessageBox.Yes | QMessageBox.No
+                    )
+                    
+                    if reply == QMessageBox.Yes:
+                        pasta_path.mkdir(parents=True, exist_ok=True)
+                    else:
+                        return
+                
+                # Verifica se é um diretório válido
+                if not pasta_path.is_dir():
+                    QMessageBox.warning(
+                        self,
+                        "Atenção",
+                        "O caminho informado não é um diretório válido!"
+                    )
+                    return
+                
+            except Exception as e:
+                QMessageBox.warning(
+                    self,
+                    "Erro",
+                    f"Caminho inválido:\n{e}"
+                )
+                return
+            
+            # Salva configurações (caminho normalizado)
+            self.db.set_config('storage_pasta_base', str(pasta_path))
+            self.db.set_config('storage_formato_mes', self.formato_combo.currentData())
+            self.db.set_config('storage_xml_pdf_separado', '1' if self.radio_separados.isChecked() else '0')
+            
+            # Pergunta se quer copiar os arquivos existentes
+            pasta_antiga = DATA_DIR / 'xmls'
+            if pasta_antiga.exists() and pasta_antiga != pasta_path:
+                reply = QMessageBox.question(
+                    self,
+                    "Copiar arquivos existentes?",
+                    f"Deseja copiar todos os XMLs e PDFs da pasta atual para a nova localização?\n\n"
+                    f"De: {pasta_antiga}\n"
+                    f"Para: {pasta_path}\n\n"
+                    f"Isso pode levar alguns minutos dependendo da quantidade de arquivos.",
+                    QMessageBox.Yes | QMessageBox.No
+                )
+                
+                if reply == QMessageBox.Yes:
+                    self._copiar_arquivos(pasta_antiga, pasta_path)
+            
+            QMessageBox.information(
+                self,
+                "✅ Sucesso",
+                f"Configurações de armazenamento salvas!\n\n"
+                f"Pasta base: {pasta_path}\n"
+                f"Formato mês: {self.formato_combo.currentData()}\n"
+                f"XML/PDF: {'Separados' if self.radio_separados.isChecked() else 'Juntos'}\n\n"
+                f"As novas configurações serão aplicadas aos próximos arquivos salvos."
+            )
+            
+            self.accept()
+        except Exception as e:
+            QMessageBox.critical(self, "Erro", f"Erro ao salvar configurações:\n{e}")
+    
+    def _copiar_arquivos(self, origem: Path, destino: Path):
+        """Copia os arquivos XML e PDF da pasta antiga para a nova"""
+        try:
+            import shutil
+            import re
+            
+            # Cria diálogo de progresso
+            progress = QProgressDialog("Preparando cópia de arquivos...", "Cancelar", 0, 100, self)
+            progress.setWindowTitle("Copiando Arquivos")
+            progress.setWindowModality(Qt.WindowModal)
+            progress.setMinimumDuration(0)
+            progress.setValue(0)
+            
+            # Pastas a ignorar
+            pastas_ignorar = ['Debug de notas', 'Resumos', 'debug', 'resumos']
+            
+            # Lista todos os arquivos XML e PDF recursivamente, exceto das pastas ignoradas
+            arquivos = []
+            for ext in ['*.xml', '*.pdf']:
+                for arquivo in origem.rglob(ext):
+                    # Verifica se o arquivo está em uma pasta que deve ser ignorada
+                    deve_ignorar = False
+                    for parte in arquivo.parts:
+                        if parte in pastas_ignorar:
+                            deve_ignorar = True
+                            break
+                    
+                    if not deve_ignorar:
+                        arquivos.append(arquivo)
+            
+            total = len(arquivos)
+            if total == 0:
+                QMessageBox.information(self, "Informação", "Nenhum arquivo encontrado para copiar.")
+                return
+            
+            progress.setMaximum(total)
+            progress.setLabelText(f"Copiando {total} arquivo(s)...")
+            
+            # Pega formato de mês configurado
+            formato_mes = self.formato_combo.currentData()
+            
+            # Carrega mapeamento de CNPJ -> Nome do Certificado
+            mapeamento_nomes = {}
+            try:
+                certs = self.db.load_certificates()
+                for cert in certs:
+                    informante = cert.get('informante', '')
+                    nome_cert = cert.get('nome_certificado', '')
+                    if informante and nome_cert:
+                        # Remove caracteres inválidos do nome
+                        nome_limpo = re.sub(r'[\\/*?:"<>|]', "_", nome_cert).strip()
+                        mapeamento_nomes[informante] = nome_limpo
+                        print(f"[DEBUG] Mapeamento: {informante} -> {nome_limpo}")
+            except Exception as e:
+                print(f"[ERRO] Ao carregar mapeamento de certificados: {e}")
+            
+            copiados = 0
+            erros = 0
+            ignorados = 0
+            
+            for idx, arquivo in enumerate(arquivos):
+                if progress.wasCanceled():
+                    QMessageBox.information(self, "Cancelado", f"Cópia cancelada. {copiados} arquivo(s) copiado(s).")
+                    return
+                
+                try:
+                    # Calcula o caminho relativo
+                    caminho_relativo = arquivo.relative_to(origem)
+                    partes = list(caminho_relativo.parts)
+                    
+                    # Verifica se há pelo menos 3 partes: CNPJ/MES/resto
+                    if len(partes) >= 3:
+                        cnpj_pasta = partes[0]
+                        mes_pasta = partes[1]
+                        resto = partes[2:]
+                        
+                        # NOVO: Busca nome do certificado para este CNPJ
+                        nome_pasta_cert = mapeamento_nomes.get(cnpj_pasta, cnpj_pasta)
+                        if nome_pasta_cert != cnpj_pasta:
+                            print(f"[DEBUG] Convertendo pasta de {cnpj_pasta} para {nome_pasta_cert}")
+                        
+                        # Tenta converter o formato do mês se necessário
+                        # Detecta formato AAAA-MM ou MM-AAAA
+                        match_aaaa_mm = re.match(r'^(\d{4})-(\d{2})$', mes_pasta)
+                        match_mm_aaaa = re.match(r'^(\d{2})-(\d{4})$', mes_pasta)
+                        match_aaaa_slash_mm = re.match(r'^(\d{4})/(\d{2})$', mes_pasta)
+                        match_mm_slash_aaaa = re.match(r'^(\d{2})/(\d{4})$', mes_pasta)
+                        
+                        nova_mes_pasta = mes_pasta  # Padrão: mantém original
+                        
+                        if match_aaaa_mm:
+                            ano, mes = match_aaaa_mm.groups()
+                            if formato_mes == 'AAAA-MM':
+                                nova_mes_pasta = f"{ano}-{mes}"
+                            elif formato_mes == 'MM-AAAA':
+                                nova_mes_pasta = f"{mes}-{ano}"
+                            elif formato_mes == 'AAAA/MM':
+                                nova_mes_pasta = f"{ano}/{mes}"
+                            elif formato_mes == 'MM/AAAA':
+                                nova_mes_pasta = f"{mes}/{ano}"
+                        
+                        elif match_mm_aaaa:
+                            mes, ano = match_mm_aaaa.groups()
+                            if formato_mes == 'AAAA-MM':
+                                nova_mes_pasta = f"{ano}-{mes}"
+                            elif formato_mes == 'MM-AAAA':
+                                nova_mes_pasta = f"{mes}-{ano}"
+                            elif formato_mes == 'AAAA/MM':
+                                nova_mes_pasta = f"{ano}/{mes}"
+                            elif formato_mes == 'MM/AAAA':
+                                nova_mes_pasta = f"{mes}/{ano}"
+                        
+                        elif match_aaaa_slash_mm:
+                            ano, mes = match_aaaa_slash_mm.groups()
+                            if formato_mes == 'AAAA-MM':
+                                nova_mes_pasta = f"{ano}-{mes}"
+                            elif formato_mes == 'MM-AAAA':
+                                nova_mes_pasta = f"{mes}-{ano}"
+                            elif formato_mes == 'AAAA/MM':
+                                nova_mes_pasta = f"{ano}/{mes}"
+                            elif formato_mes == 'MM/AAAA':
+                                nova_mes_pasta = f"{mes}/{ano}"
+                        
+                        elif match_mm_slash_aaaa:
+                            mes, ano = match_mm_slash_aaaa.groups()
+                            if formato_mes == 'AAAA-MM':
+                                nova_mes_pasta = f"{ano}-{mes}"
+                            elif formato_mes == 'MM-AAAA':
+                                nova_mes_pasta = f"{mes}-{ano}"
+                            elif formato_mes == 'AAAA/MM':
+                                nova_mes_pasta = f"{ano}/{mes}"
+                            elif formato_mes == 'MM/AAAA':
+                                nova_mes_pasta = f"{mes}/{ano}"
+                        
+                        # Reconstrói o caminho com nome do certificado (se disponível) e novo formato
+                        novo_caminho_relativo = Path(nome_pasta_cert) / nova_mes_pasta / Path(*resto)
+                        arquivo_destino = destino / novo_caminho_relativo
+                    else:
+                        # Se não tem estrutura esperada, mantém como está
+                        arquivo_destino = destino / caminho_relativo
+                    
+                    # Cria as pastas necessárias
+                    arquivo_destino.parent.mkdir(parents=True, exist_ok=True)
+                    
+                    # Copia o arquivo (não sobrescreve se já existir)
+                    if not arquivo_destino.exists():
+                        shutil.copy2(arquivo, arquivo_destino)
+                        copiados += 1
+                    else:
+                        ignorados += 1
+                    
+                    progress.setValue(idx + 1)
+                    progress.setLabelText(f"Copiando {idx + 1}/{total}: {arquivo.name}")
+                    QApplication.processEvents()
+                    
+                except Exception as e:
+                    print(f"[ERRO] Ao copiar {arquivo}: {e}")
+                    erros += 1
+            
+            progress.close()
+            
+            # Mensagem final
+            msg = f"✅ Cópia concluída!\n\n"
+            msg += f"Arquivos copiados: {copiados}\n"
+            if ignorados > 0:
+                msg += f"Arquivos já existentes (ignorados): {ignorados}\n"
+            if erros > 0:
+                msg += f"Erros: {erros}\n"
+            msg += f"\n📁 Pastas ignoradas: Debug de notas, Resumos"
+            msg += f"\n\nOs arquivos originais foram mantidos em:\n{origem}"
+            
+            QMessageBox.information(self, "Cópia Concluída", msg)
+            
+        except Exception as e:
+            QMessageBox.critical(self, "Erro", f"Erro ao copiar arquivos:\n{e}")
 
 
 def main():
