@@ -1,11 +1,11 @@
-; Script Inno Setup para BOT Busca NFE
+; Script Inno Setup para Busca XML
 ; Gera instalador profissional para Windows
 
-#define MyAppName "BOT Busca NFE"
+#define MyAppName "Busca XML"
 #define MyAppVersion "1.0.14"
 #define MyAppPublisher "DWM System Developer"
 #define MyAppURL "https://dwmsystems.up.railway.app/"
-#define MyAppExeName "BOT Busca NFE.exe"
+#define MyAppExeName "Busca XML.exe"
 
 [Setup]
 ; Informações do aplicativo
@@ -23,7 +23,7 @@ LicenseFile=
 InfoBeforeFile=
 InfoAfterFile=
 OutputDir=Output
-OutputBaseFilename=BOT_Busca_NFE_Setup
+OutputBaseFilename=Busca_XML_Setup
 Compression=lzma
 SolidCompression=yes
 WizardStyle=modern
@@ -47,9 +47,9 @@ Name: "quicklaunchicon"; Description: "Criar ícone na Barra de Tarefas"; GroupD
 [Files]
 ; Executável principal e toda a pasta dist (PyInstaller onedir mode)
 ; IMPORTANTE: Em onedir, o PyInstaller cria: BOT Busca NFE.exe + pasta _internal/ com tudo
-Source: "dist\BOT Busca NFE\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
-; NOTA: Arquivo_xsd, Icone e modules já estão dentro de dist\BOT Busca NFE\_internal\
-; Os arquivos .py para atualização também já estão em dist\BOT Busca NFE\ e dist\BOT Busca NFE\_internal\
+Source: "dist\Busca XML\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+; NOTA: Arquivo_xsd, Icone e modules já estão dentro de dist\Busca XML\_internal\
+; Os arquivos .py para atualização também já estão em dist\Busca XML\ e dist\Busca XML\_internal\
 
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"

@@ -6,7 +6,7 @@
     name="BOT.Busca.NFE"
     type="win32"
   />
-  <description>BOT Busca NFE - Sistema de Busca de Notas Fiscais</description>
+  <description>Busca XML - Sistema de Busca de Documentos Fiscais</description>
   
   <!-- Solicita elevação de privilégios (executar como administrador) -->
   <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">

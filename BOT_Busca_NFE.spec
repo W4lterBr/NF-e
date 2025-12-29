@@ -1,5 +1,5 @@
 # -*- mode: python ; coding: utf-8 -*-
-# BOT Busca NFE - PyInstaller Spec File
+# Busca XML - PyInstaller Spec File
 # Desenvolvido por: DWM System Developer
 # Site: https://dwmsystems.up.railway.app/
 

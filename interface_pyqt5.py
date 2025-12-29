@@ -309,8 +309,10 @@ class MainWindow(QMainWindow):
         self._update_window_title()
         self.resize(1200, 720)
         
-        # Define o ícone da janela principal
-        icon_path = BASE_DIR / 'Logo.png'
+        # Define o ícone da janela principal (tenta .ico primeiro, depois .png)
+        icon_path = BASE_DIR / 'Logo.ico'
+        if not icon_path.exists():
+            icon_path = BASE_DIR / 'Logo.png'
         if icon_path.exists():
             self.setWindowIcon(QIcon(str(icon_path)))
         
@@ -781,8 +783,10 @@ class MainWindow(QMainWindow):
             # Cria o ícone da bandeja
             self.tray_icon = QSystemTrayIcon(self)
             
-            # Tenta carregar ícone personalizado, senão usa ícone padrão
-            icon_path = BASE_DIR / 'Logo.png'
+            # Tenta carregar ícone personalizado (prioriza .ico)
+            icon_path = BASE_DIR / 'Logo.ico'
+            if not icon_path.exists():
+                icon_path = BASE_DIR / 'Logo.png'
             if icon_path.exists():
                 self.tray_icon.setIcon(QIcon(str(icon_path)))
             else:
@@ -824,7 +828,7 @@ class MainWindow(QMainWindow):
             self.tray_icon.show()
             
             # Tooltip
-            self.tray_icon.setToolTip("Busca de Notas Fiscais")
+            self.tray_icon.setToolTip("Busca XML")
             
         except Exception as e:
             print(f"[DEBUG] Erro ao configurar system tray: {e}")
@@ -848,7 +852,7 @@ class MainWindow(QMainWindow):
         reply = QMessageBox.question(
             self,
             "Confirmar saída",
-            "Deseja realmente encerrar o sistema?\n\nA busca automática de notas fiscais será interrompida.",
+            "Deseja realmente encerrar o Busca XML?\n\nA busca automática de documentos fiscais será interrompida.",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No
         )
@@ -1822,7 +1826,7 @@ class MainWindow(QMainWindow):
         except Exception:
             version = "1.0.0"
         
-        self.setWindowTitle(f"Busca de Notas Fiscais - v{version}")
+        self.setWindowTitle(f"Busca XML - v{version}")
     
     def _center_window(self):
         """Centraliza a janela na tela."""
@@ -6198,6 +6202,13 @@ def main():
     os.environ.setdefault("PYTHONIOENCODING", "utf-8")
     os.environ.setdefault("PYTHONUTF8", "1")
     app = QApplication(sys.argv)
+    
+    # Define o ícone do aplicativo (aparece na barra de tarefas do Windows)
+    icon_path = BASE_DIR / 'Logo.ico'
+    if not icon_path.exists():
+        icon_path = BASE_DIR / 'Logo.png'
+    if icon_path.exists():
+        app.setWindowIcon(QIcon(str(icon_path)))
     
     # Não encerra o app quando a janela é fechada (vai para bandeja)
     app.setQuitOnLastWindowClosed(False)

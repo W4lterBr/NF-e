@@ -1,6 +1,6 @@
 @echo off
 echo ============================================================
-echo  BOT Busca NFE - Compilador de Aplicativo
+echo  Busca XML - Compilador de Aplicativo
 echo  Desenvolvido por: DWM System Developer
 echo  Site: https://dwmsystems.up.railway.app/
 echo ============================================================
@@ -46,8 +46,8 @@ if exist Logo.png (
 REM Limpa builds anteriores
 echo [3/4] Limpando builds anteriores...
 if exist build rmdir /s /q build
-if exist "dist\BOT Busca NFE" rmdir /s /q "dist\BOT Busca NFE"
-if exist "dist\BOT Busca NFE.exe" del /q "dist\BOT Busca NFE.exe"
+if exist "dist\Busca XML" rmdir /s /q "dist\Busca XML"
+if exist "dist\Busca XML.exe" del /q "dist\Busca XML.exe"
 
 REM Compila o aplicativo
 echo [4/4] Compilando aplicativo...
@@ -76,8 +76,8 @@ REM ===================================================================
 REM Copiar recursos necessários (Icone e Arquivo_xsd)
 echo.
 echo [RECURSOS] Copiando icones e schemas XSD...
-xcopy /E /I /Y "Icone" "dist\BOT Busca NFE\Icone" >nul 2>&1
-xcopy /E /I /Y "Arquivo_xsd" "dist\BOT Busca NFE\Arquivo_xsd" >nul 2>&1
+xcopy /E /I /Y "Icone" "dist\Busca XML\Icone" >nul 2>&1
+xcopy /E /I /Y "Arquivo_xsd" "dist\Busca XML\Arquivo_xsd" >nul 2>&1
 echo   Recursos copiados com sucesso!
 
 echo.
@@ -86,7 +86,7 @@ echo   Apenas executavel compilado sera distribuido
 
 echo.
 echo ============================================================
-echo SUCESSO! Aplicativo compilado em: dist\BOT Busca NFE\
+echo SUCESSO! Aplicativo compilado em: dist\Busca XML\
 echo ============================================================
 echo.
 echo Deseja criar o instalador agora? (S/N)
@@ -102,7 +102,7 @@ if /i "%CREATE_INSTALLER%"=="S" (
     ) else (
         echo.
         echo ============================================================
-        echo Instalador criado em: Output\BOT_Busca_NFE_Setup.exe
+        echo Instalador criado em: Output\Busca_XML_Setup.exe
         echo ============================================================
     )
 )
