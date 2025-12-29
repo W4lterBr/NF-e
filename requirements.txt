@@ -1,0 +1,43 @@
+# ====================================
+# BOT - Busca NFE - Requirements
+# Sistema de Busca e Gerenciamento de NF-e, CT-e e NFS-e
+# Versão: 2.0
+# Data: 2025-12-18
+# ====================================
+
+# Interface Gráfica
+PyQt5>=5.15.9
+PyQt5-Qt5>=5.15.2
+PyQt5-sip>=12.12.1
+
+# Processamento XML
+lxml>=4.9.3
+
+# Requisições HTTP e SOAP
+requests>=2.31.0
+requests-pkcs12>=1.20
+urllib3>=2.0.7
+zeep>=4.2.1
+
+# Criptografia e Certificados Digitais
+cryptography>=41.0.7
+pyOpenSSL>=23.3.0
+
+# PDF Generation
+reportlab>=4.0.7
+borb>=2.1.18
+PyPDF2>=3.0.1
+
+# Data e Tempo
+python-dateutil>=2.8.2
+
+# Utilitários
+python-dotenv>=1.0.0
+pathlib>=1.0.1
+
+# ====================================
+# OPCIONAL - Para desenvolvimento
+# ====================================
+# PyInstaller>=6.3.0  # Para compilar executável
+# autopep8>=2.0.4  # Para formatação
+# pylint>=3.0.3  # Para análise de código

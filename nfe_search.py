@@ -1406,9 +1406,11 @@ class XMLProcessor:
                 else:
                     tipo_doc = "documento"
                 
-                save_debug_soap(self.informante, f"xml_extraido_{tipo_doc}_NSU{nsu}", xml, prefixo="nfe_dist")
+                # XMLProcessor não tem informante, usa genérico
+                informante = getattr(self, 'informante', 'DESCONHECIDO')
+                save_debug_soap(informante, f"xml_extraido_{tipo_doc}_NSU{nsu}", xml, prefixo="nfe_dist")
             except Exception as e:
-                logger.error(f"Erro ao salvar XML extraído em debug: {e}")
+                logger.debug(f"Debug save XML pulado: {e}")
         
         logger.debug(f"{len(docs)} documentos extraídos")
         return docs

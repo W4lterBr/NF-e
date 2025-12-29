@@ -1,8 +1,13 @@
-# Build artifacts - IMPORTANTE: Não versionar executáveis
+# ====================================
+# BOT - Busca NFE - .gitignore
+# ====================================
+
+# Build artifacts - Não versionar executáveis
 dist/
 build/
 Output/
 *.spec.backup
+installer/
 
 # Python bytecode
 __pycache__/
@@ -14,24 +19,37 @@ __pycache__/
 *.pyd
 *.egg-info/
 .pytest_cache/
+.mypy_cache/
+.tox/
 
 # Virtual environments
 venv/
 .venv/
 env/
 ENV/
+env.bak/
+venv.bak/
 
 # Database files (dados locais do usuário)
 *.db
 *.db-journal
 *.sqlite
 *.sqlite3
+notas.db
+configuracoes.db
+nfe_config.db
+nfe_data.db
+test.db
+test_no_downgrade.db
+fluxo_caixa.db
 
 # Log files
 logs/
 *.log
+primeira_busca.log
+nfse_test.log
 
-# XML data directories (contêm dados sensíveis dos usuários)
+# XML data directories (contêm dados sensíveis)
 xmls/
 xmls_chave/
 xmls_nfce/
@@ -43,11 +61,67 @@ consChNFe.xml
 consNSU.xml
 distNSU.xml
 
-# Certificates (dados sensíveis - NÃO versionar)
+# Certificates (CRÍTICO - dados sensíveis)
 *.pfx
 *.p12
+*.pem
+*.key
+*.crt
 
-# IDE
+# Credentials (NÃO versionar)
+api_credentials.csv
+.env
+secrets.json
+
+# Chaves de criptografia (CRÍTICO - NUNCA versionar!)
+.bot_nfe/
+key.bin
+
+# IDE and Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# OS files
+Thumbs.db
+desktop.ini
+*.lnk
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+test_input.txt
+
+# Jupyter notebooks output
+.ipynb_checkpoints/
+*.ipynb
+
+# Coverage reports
+htmlcov/
+.coverage
+.coverage.*
+coverage.xml
+
+# Documentation builds
+docs/_build/
+
+# ====================================
+# ARQUIVOS QUE DEVEM SER VERSIONADOS:
+# ====================================
+# ✅ *.py (scripts Python)
+# ✅ modules/*.py
+# ✅ Arquivo_xsd/*.xsd (schemas)
+# ✅ Icone/*.png
+# ✅ requirements.txt
+# ✅ README.md
+# ✅ INSTALACAO.md
+# ✅ *.bat, *.sh (instaladores)
+# ✅ .gitignore
+
 .vscode/
 .idea/
 *.swp

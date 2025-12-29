@@ -11,6 +11,9 @@ from lxml import etree
 from zeep import Client
 from zeep.transports import Transport
 from zeep.exceptions import Fault
+import base64
+import gzip
+from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
@@ -21,6 +24,43 @@ URL_CTE_DISTRIBUICAO_HOM = "https://hom.cte.fazenda.gov.br/CTeDistribuicaoDFe/CT
 
 # Namespace CTe
 NS_CTE = "http://www.portalfiscal.inf.br/cte"
+
+
+def get_data_dir():
+    """Retorna o diretório de dados do aplicativo."""
+    import sys
+    import os
+    
+    if getattr(sys, 'frozen', False):
+        app_data = Path(os.environ.get('APPDATA', Path.home()))
+        data_dir = app_data / "BOT Busca NFE"
+    else:
+        data_dir = Path(__file__).parent.parent
+    
+    data_dir.mkdir(parents=True, exist_ok=True)
+    return data_dir
+
+
+def save_debug_soap_cte(informante: str, tipo: str, conteudo: str, prefixo: str = ""):
+    """Salva arquivos SOAP CT-e para debug."""
+    try:
+        debug_dir = get_data_dir() / "xmls" / "Debug de notas"
+        debug_dir.mkdir(parents=True, exist_ok=True)
+        
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:19]
+        nome_base = f"{timestamp}_{informante}"
+        if prefixo:
+            nome_base = f"{nome_base}_{prefixo}"
+        nome_arquivo = f"{nome_base}_{tipo}.xml"
+        
+        arquivo_path = debug_dir / nome_arquivo
+        arquivo_path.write_text(conteudo, encoding='utf-8')
+        
+        logger.debug(f"📝 Debug CTe salvo: {nome_arquivo}")
+        return str(arquivo_path)
+    except Exception as e:
+        logger.error(f"Erro ao salvar debug SOAP CTe: {e}")
+        return None
 
 
 class CTeService:
@@ -94,11 +134,16 @@ class CTeService:
         xml_envio = etree.tostring(distInt, encoding='utf-8').decode()
         logger.debug(f"XML de consulta CTe:\n{xml_envio}")
         
+        # 🔍 DEBUG: Salva XML enviado
+        save_debug_soap_cte(self.informante, "request", xml_envio, prefixo="cte_dist")
+        
         # Envia requisição SOAP
         try:
             resp = self.dist_client.service.cteDistDFeInteresse(cteDadosMsg=distInt)
         except Fault as fault:
             logger.error(f"SOAP Fault CTe Distribuição: {fault}")
+            # 🔍 DEBUG: Salva erro SOAP
+            save_debug_soap_cte(self.informante, "fault", str(fault), prefixo="cte_dist")
             return None
         except Exception as e:
             logger.error(f"Erro ao consultar CTe: {e}")
@@ -107,6 +152,9 @@ class CTeService:
         # Converte resposta para XML
         xml_str = etree.tostring(resp, encoding='utf-8').decode()
         logger.debug(f"Resposta CTe Distribuição (primeiros 500 chars):\n{xml_str[:500]}")
+        
+        # 🔍 DEBUG: Salva XML recebido
+        save_debug_soap_cte(self.informante, "response", xml_str, prefixo="cte_dist")
         
         return xml_str
     
@@ -140,6 +188,23 @@ class CTeService:
                 conteudo_xml = gzip.decompress(conteudo_compactado).decode('utf-8')
                 
                 logger.debug(f"Documento CTe extraído: NSU={nsu}, schema={schema}")
+                
+                # 🔍 DEBUG: Salva cada XML extraído
+                try:
+                    # Identifica tipo do documento
+                    if '<resCTe' in conteudo_xml or '<resEvento' in conteudo_xml:
+                        tipo_doc = "resumo"
+                    elif '<procCTe' in conteudo_xml or '<cteProc' in conteudo_xml:
+                        tipo_doc = "cte_completo"
+                    elif '<procEventoCTe' in conteudo_xml:
+                        tipo_doc = "evento"
+                    else:
+                        tipo_doc = "documento"
+                    
+                    save_debug_soap_cte(self.informante, f"xml_extraido_{tipo_doc}_NSU{nsu}", conteudo_xml, prefixo="cte_dist")
+                except Exception as e:
+                    logger.error(f"Erro ao salvar XML CTe extraído em debug: {e}")
+                
                 yield (nsu, conteudo_xml, schema)
                 
         except Exception as e:

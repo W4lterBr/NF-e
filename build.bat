@@ -62,22 +62,27 @@ if errorlevel 1 (
     exit /b 1
 )
 
-REM Copia arquivos .py para a pasta dist (necessário para atualizações remotas)
+REM ===================================================================
+REM ARQUIVOS .PY REMOVIDOS DA DISTRIBUIÇÃO (Segurança)
+REM ===================================================================
+REM O executável já contém todo o código compilado.
+REM Apenas dados do usuário (xmls/, notas.db) devem permanecer após desinstalação.
+REM
+REM Se precisar de atualizações remotas no futuro, implemente via:
+REM - Novo instalador/executável
+REM - Sistema de atualização automática que baixa novo .exe
+REM ===================================================================
+
+REM Copiar recursos necessários (Icone e Arquivo_xsd)
 echo.
-echo [ATUALIZACAO] Copiando arquivos Python para atualizacoes...
-echo   - nfe_search.py
-copy /Y nfe_search.py "dist\BOT Busca NFE\" >nul
-echo   - version.txt
-copy /Y version.txt "dist\BOT Busca NFE\" >nul
-echo   - CHANGELOG.md
-copy /Y CHANGELOG.md "dist\BOT Busca NFE\" >nul
+echo [RECURSOS] Copiando icones e schemas XSD...
+xcopy /E /I /Y "Icone" "dist\BOT Busca NFE\Icone" >nul 2>&1
+xcopy /E /I /Y "Arquivo_xsd" "dist\BOT Busca NFE\Arquivo_xsd" >nul 2>&1
+echo   Recursos copiados com sucesso!
 
-REM Copia pasta modules completa
-echo   - modules\*.py
-if not exist "dist\BOT Busca NFE\modules" mkdir "dist\BOT Busca NFE\modules"
-xcopy /Y /S /I modules\*.py "dist\BOT Busca NFE\modules\" >nul
-
-echo   Arquivos de atualizacao copiados!
+echo.
+echo [SEGURANCA] Codigo-fonte NAO incluido na distribuicao
+echo   Apenas executavel compilado sera distribuido
 
 echo.
 echo ============================================================

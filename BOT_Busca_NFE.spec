@@ -3,16 +3,16 @@
 # Desenvolvido por: DWM System Developer
 # Site: https://dwmsystems.up.railway.app/
 
+import os
+
 block_cipher = None
 
-# Dados adicionais a incluir
+# Dados adicionais a incluir (APENAS recursos, NÃO código-fonte)
 added_files = [
-    ('Icone', 'Icone'),
-    ('Arquivo_xsd', 'Arquivo_xsd'),
-    # IMPORTANTE: Não incluir .py como datas aqui
-    # Os .py serão copiados pelo build.bat para permitir atualizações
-    # ('nfe_search.py', '.'),  # REMOVIDO - será copiado pelo build.bat
-    # ('modules', 'modules'),  # REMOVIDO - será copiado pelo build.bat
+    ('Icone', 'Icone'),           # Ícones da interface
+    ('Arquivo_xsd', 'Arquivo_xsd'), # Schemas XML para validação
+    # CÓDIGO-FONTE (.py) NÃO É INCLUÍDO - apenas executável compilado
+    # Dados do usuário (xmls/, notas.db) são criados em runtime no AppData
 ]
 
 # Imports ocultos necessários
@@ -85,7 +85,8 @@ exe = EXE(
     uac_uiaccess=False,
 )
 
-# Modo ONEDIR: mantém .py externos para facilitar atualizações
+# Modo ONEDIR: Executável + dependências (SEM código-fonte .py)
+# Apenas dados do usuário (xmls/, notas.db) permanecem após desinstalação
 
 coll = COLLECT(
     exe,

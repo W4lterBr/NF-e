@@ -16,7 +16,7 @@ from PyQt5.QtWidgets import (
     QDialog, QMessageBox, QFileDialog, QInputDialog, QStatusBar,
     QTreeWidget, QTreeWidgetItem, QSplitter, QAction, QMenu, QSystemTrayIcon,
     QProgressDialog, QStyledItemDelegate, QStyleOptionViewItem, QScrollArea, QFrame,
-    QGroupBox, QRadioButton
+    QGroupBox, QRadioButton, QDateEdit
 )
 from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal, QSettings, QSize
 from PyQt5.QtGui import QIcon, QColor, QBrush, QFont, QCloseEvent
@@ -364,6 +364,31 @@ class MainWindow(QMainWindow):
         self.search_edit = QLineEdit()
         self.search_edit.setPlaceholderText("Buscar por emitente, número ou CNPJ…")
         self.search_edit.textChanged.connect(self.refresh_table)
+        
+        # Filtros de data
+        from PyQt5.QtCore import QDate
+        date_label = QLabel("Data:")
+        self.date_inicio = QDateEdit()
+        self.date_inicio.setCalendarPopup(True)
+        self.date_inicio.setDisplayFormat("dd/MM/yyyy")
+        self.date_inicio.setDate(QDate.currentDate().addMonths(-3))  # Padrão: 3 meses atrás
+        self.date_inicio.dateChanged.connect(self.refresh_table)
+        self.date_inicio.setToolTip("Data inicial do filtro")
+        
+        date_ate_label = QLabel("até:")
+        self.date_fim = QDateEdit()
+        self.date_fim.setCalendarPopup(True)
+        self.date_fim.setDisplayFormat("dd/MM/yyyy")
+        self.date_fim.setDate(QDate.currentDate())  # Padrão: hoje
+        self.date_fim.dateChanged.connect(self.refresh_table)
+        self.date_fim.setToolTip("Data final do filtro")
+        
+        # Botão para limpar filtro de data
+        btn_clear_dates = QPushButton("✖")
+        btn_clear_dates.setMaximumWidth(30)
+        btn_clear_dates.setToolTip("Limpar filtro de data")
+        btn_clear_dates.clicked.connect(self._clear_date_filters)
+        
         self.status_dd = QComboBox(); self.status_dd.addItems(["Todos","Autorizado","Cancelado","Denegado"])
         self.status_dd.currentTextChanged.connect(self.refresh_table)
         self.tipo_dd = QComboBox(); self.tipo_dd.addItems(["Todos","NFe","CTe","NFS-e"])
@@ -421,6 +446,11 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
         t.addWidget(self.search_edit)
+        t.addWidget(date_label)
+        t.addWidget(self.date_inicio)
+        t.addWidget(date_ate_label)
+        t.addWidget(self.date_fim)
+        t.addWidget(btn_clear_dates)
         t.addWidget(self.status_dd)
         t.addWidget(self.tipo_dd)
         t.addWidget(limit_label)
@@ -811,6 +841,7 @@ class MainWindow(QMainWindow):
         self.show()
         self.setWindowState(self.windowState() & ~Qt.WindowMinimized | Qt.WindowActive)
         self.activateWindow()
+        self._center_window()
     
     def _quit_application(self):
         """Encerra a aplicação completamente."""
@@ -838,6 +869,18 @@ class MainWindow(QMainWindow):
                 if self._load_worker.isRunning():
                     self._load_worker.terminate()
             
+            # Finaliza threads de geração de PDF
+            if hasattr(self, '_pdf_workers'):
+                for worker in self._pdf_workers[:]:  # Cópia da lista
+                    if worker and worker.isRunning():
+                        print(f"[DEBUG] Aguardando finalização de thread PDF...")
+                        worker.wait(2000)  # Aguarda até 2 segundos
+                        if worker.isRunning():
+                            print(f"[DEBUG] Forçando término de thread PDF...")
+                            worker.terminate()
+                            worker.wait(500)
+                self._pdf_workers.clear()
+            
             if hasattr(self, 'tray_icon'):
                 self.tray_icon.hide()
             QApplication.quit()
@@ -854,6 +897,18 @@ class MainWindow(QMainWindow):
             self._load_worker.wait(1000)
             if self._load_worker.isRunning():
                 self._load_worker.terminate()
+        
+        # Finaliza threads de geração de PDF
+        if hasattr(self, '_pdf_workers'):
+            for worker in self._pdf_workers[:]:  # Cópia da lista
+                if worker and worker.isRunning():
+                    print(f"[DEBUG] Aguardando finalização de thread PDF...")
+                    worker.wait(2000)  # Aguarda até 2 segundos
+                    if worker.isRunning():
+                        print(f"[DEBUG] Forçando término de thread PDF...")
+                        worker.terminate()
+                        worker.wait(500)
+            self._pdf_workers.clear()
         
         # Ao invés de fechar, minimiza para bandeja
         event.ignore()
@@ -996,6 +1051,9 @@ class MainWindow(QMainWindow):
                 # Constrói cache de PDFs em background (não bloqueia UI)
                 if self.notes and not self._cache_building:
                     self._build_pdf_cache_async()
+                
+                # Gera PDFs faltantes em segundo plano
+                QTimer.singleShot(1000, self._gerar_pdfs_faltantes)
                     
             except Exception as e:
                 QMessageBox.critical(self, "Erro", f"Falha ao carregar dados: {e}")
@@ -1011,12 +1069,40 @@ class MainWindow(QMainWindow):
         self._load_worker = LoadNotesWorker(self.db, limit=1000)
         self._load_worker.finished_notes.connect(on_loaded)
         self._load_worker.start()
+    
+    def _clear_date_filters(self):
+        """Limpa os filtros de data (volta ao padrão)"""
+        try:
+            from PyQt5.QtCore import QDate
+            # Remove valores dos campos de data (desabilita filtro)
+            self.date_inicio.setDate(QDate.currentDate().addMonths(-3))
+            self.date_fim.setDate(QDate.currentDate())
+            self.set_status("Filtro de data limpo", 1500)
+        except Exception as e:
+            print(f"[DEBUG] Erro ao limpar filtros de data: {e}")
 
     def filtered(self) -> List[Dict[str, Any]]:
         q = (self.search_edit.text() or "").lower().strip()
         selected_cert = getattr(self, '_selected_cert_cnpj', None)
         st = (self.status_dd.currentText() or "Todos").lower()
         tp = (self.tipo_dd.currentText() or "Todos").lower().replace('-', '')
+        
+        # Filtro de data
+        date_inicio_filter = None
+        date_fim_filter = None
+        if hasattr(self, 'date_inicio') and hasattr(self, 'date_fim'):
+            try:
+                from PyQt5.QtCore import QDate
+                # Verifica se não é a data padrão (não aplicar filtro se usuário não alterou)
+                date_inicio_qdate = self.date_inicio.date()
+                date_fim_qdate = self.date_fim.date()
+                
+                # Só aplica filtro se as datas forem válidas
+                if date_inicio_qdate.isValid() and date_fim_qdate.isValid():
+                    date_inicio_filter = date_inicio_qdate.toString("yyyy-MM-dd")
+                    date_fim_filter = date_fim_qdate.toString("yyyy-MM-dd")
+            except Exception as e:
+                print(f"[DEBUG] Erro ao processar filtro de data: {e}")
         
         # Limite de linhas
         limit_text = self.limit_dd.currentText()
@@ -1047,6 +1133,14 @@ class MainWindow(QMainWindow):
                     continue
                 if tp == "nfse" and raw not in ("NFSE", "NFS-E"):
                     continue
+            
+            # Filtro de data
+            if date_inicio_filter and date_fim_filter:
+                data_emissao = (it.get("data_emissao") or "")[:10]  # YYYY-MM-DD
+                if data_emissao:
+                    if not (date_inicio_filter <= data_emissao <= date_fim_filter):
+                        continue
+            
             out.append(it)
             
             # Aplica limite se definido
@@ -1061,6 +1155,21 @@ class MainWindow(QMainWindow):
         selected_cert = getattr(self, '_selected_cert_cnpj', None)
         st = (self.status_dd.currentText() or "Todos").lower()
         tp = (self.tipo_dd.currentText() or "Todos").lower().replace('-', '')
+        
+        # Filtro de data
+        date_inicio_filter = None
+        date_fim_filter = None
+        if hasattr(self, 'date_inicio') and hasattr(self, 'date_fim'):
+            try:
+                from PyQt5.QtCore import QDate
+                date_inicio_qdate = self.date_inicio.date()
+                date_fim_qdate = self.date_fim.date()
+                
+                if date_inicio_qdate.isValid() and date_fim_qdate.isValid():
+                    date_inicio_filter = date_inicio_qdate.toString("yyyy-MM-dd")
+                    date_fim_filter = date_fim_qdate.toString("yyyy-MM-dd")
+            except Exception as e:
+                print(f"[DEBUG] Erro ao processar filtro de data: {e}")
         
         # Limite de linhas
         limit_text = self.limit_dd.currentText()
@@ -1159,6 +1268,13 @@ class MainWindow(QMainWindow):
                     continue
                 if tp == "nfse" and raw not in ("NFSE", "NFS-E"):
                     continue
+            
+            # Filtro de data
+            if date_inicio_filter and date_fim_filter:
+                data_emissao = (it.get("data_emissao") or "")[:10]  # YYYY-MM-DD
+                if data_emissao:
+                    if not (date_inicio_filter <= data_emissao <= date_fim_filter):
+                        continue
             
             out.append(it)
             
@@ -1707,6 +1823,17 @@ class MainWindow(QMainWindow):
             version = "1.0.0"
         
         self.setWindowTitle(f"Busca de Notas Fiscais - v{version}")
+    
+    def _center_window(self):
+        """Centraliza a janela na tela."""
+        from PyQt5.QtWidgets import QApplication
+        from PyQt5.QtCore import QRect
+        screen = QApplication.desktop().screenGeometry()
+        size = self.geometry()
+        self.move(
+            (screen.width() - size.width()) // 2,
+            (screen.height() - size.height()) // 2
+        )
     
     def _update_search_summary(self):
         """Atualiza resumo de busca em tempo real."""
@@ -2377,36 +2504,66 @@ class MainWindow(QMainWindow):
 
     def _on_table_double_clicked(self, row: int, col: int):
         """Abre PDF (verifica existência primeiro, só gera se necessário) - OTIMIZADO"""
+        import time
+        start_time = time.time()
+        print(f"\n[DEBUG PDF] ========== DUPLO CLIQUE ===========")
+        print(f"[DEBUG PDF] Linha: {row}, Coluna: {col}")
+        
         # Obtém o item pela linha clicada da lista filtrada
         flt = self.filtered()
         item = flt[row] if 0 <= row < len(flt) else None
         if not item:
+            print(f"[DEBUG PDF] ❌ Item não encontrado")
             return
         
         chave = item.get('chave', '')
         if not chave:
+            print(f"[DEBUG PDF] ❌ Chave vazia")
             return
         
+        print(f"[DEBUG PDF] Chave: {chave}")
+        print(f"[DEBUG PDF] Informante: {item.get('informante', 'N/A')}")
+        print(f"[DEBUG PDF] Tipo: {item.get('tipo', 'N/A')}")
+        
         # OTIMIZAÇÃO 1: Verifica cache primeiro (INSTANTÂNEO)
+        print(f"[DEBUG PDF] Etapa 1: Verificando cache...")
+        cache_start = time.time()
         if chave in self._pdf_cache:
+            print(f"[DEBUG PDF] ✅ Encontrado no cache: {self._pdf_cache[chave]}")
             cached_pdf = Path(self._pdf_cache[chave])
             if cached_pdf.exists():
                 try:
+                    print(f"[DEBUG PDF] ⚡ Cache hit! Tempo: {time.time() - cache_start:.3f}s")
                     pdf_str = str(cached_pdf.absolute())
                     if sys.platform == "win32":
                         os.startfile(pdf_str)  # type: ignore[attr-defined]
                     else:
                         subprocess.Popen(["xdg-open", pdf_str])
+                    total_time = time.time() - start_time
+                    print(f"[DEBUG PDF] ✅ PDF aberto (cache) - Tempo total: {total_time:.3f}s")
                     self.set_status("✅ PDF aberto (cache)", 1000)
                     return
                 except Exception as e:
+                    print(f"[DEBUG PDF] ❌ Erro ao abrir PDF do cache: {e}")
                     QMessageBox.warning(self, "Erro ao abrir PDF", f"Erro: {e}")
                     return
+            else:
+                print(f"[DEBUG PDF] ⚠️ PDF no cache não existe mais no disco")
+        else:
+            print(f"[DEBUG PDF] Cache miss (tamanho do cache: {len(self._pdf_cache)})")
+        
+        print(f"[DEBUG PDF] Etapa 1 concluída em {time.time() - cache_start:.3f}s")
         
         # OTIMIZAÇÃO 2: Busca direta baseada na data de emissão (MUITO MAIS RÁPIDO)
+        print(f"[DEBUG PDF] Etapa 2: Busca direta na pasta...")
+        direct_start = time.time()
         informante = item.get('informante', '')
         tipo = (item.get('tipo') or 'NFe').strip().upper().replace('-', '')
         data_emissao = (item.get('data_emissao') or '')[:10]
+        
+        print(f"[DEBUG PDF] Informante: {informante}")
+        print(f"[DEBUG PDF] Tipo: {tipo}")
+        print(f"[DEBUG PDF] Data emissão: {data_emissao}")
         
         pdf_path = None
         
@@ -2414,92 +2571,186 @@ class MainWindow(QMainWindow):
             # Extrai ano-mês da data de emissão
             try:
                 year_month = data_emissao[:7] if len(data_emissao) >= 7 else None
+                print(f"[DEBUG PDF] Ano-mês extraído: {year_month}")
                 if year_month:
                     # Busca direta na pasta específica do mês (SEM recursão)
                     specific_path = BASE_DIR / "xmls" / informante / tipo / year_month / f"{chave}.pdf"
+                    print(f"[DEBUG PDF] Buscando em: {specific_path}")
                     if specific_path.exists():
+                        print(f"[DEBUG PDF] ✅ Encontrado na busca direta!")
                         pdf_path = specific_path
                     else:
                         # Tenta sem o tipo (estrutura antiga)
                         old_path = BASE_DIR / "xmls" / informante / year_month / f"{chave}.pdf"
+                        print(f"[DEBUG PDF] Tentando estrutura antiga: {old_path}")
                         if old_path.exists():
+                            print(f"[DEBUG PDF] ✅ Encontrado na estrutura antiga!")
                             pdf_path = old_path
-            except Exception:
+                        else:
+                            print(f"[DEBUG PDF] ❌ Não encontrado na busca direta")
+            except Exception as e:
+                print(f"[DEBUG PDF] ❌ Erro na busca direta: {e}")
                 pass
         
+        print(f"[DEBUG PDF] Etapa 2 concluída em {time.time() - direct_start:.3f}s")
+        
         # OTIMIZAÇÃO 3: Apenas se não encontrou acima, busca em toda estrutura (LENTO - último recurso)
+        print(f"[DEBUG PDF] Etapa 3: Busca recursiva (se necessário)...")
+        recursive_start = time.time()
         if not pdf_path and chave and informante:
+            print(f"[DEBUG PDF] PDF não encontrado na busca direta, iniciando busca recursiva...")
             xmls_root = BASE_DIR / "xmls" / informante
+            print(f"[DEBUG PDF] Pasta raiz: {xmls_root}")
             if xmls_root.exists():
-                # Lista todas as pastas de ano-mês
-                for year_month_folder in sorted(xmls_root.glob("*/20*"), reverse=True):
+                # Lista todas as pastas de ano-mês (diretamente na raiz E em subpastas de tipo)
+                folders = list(sorted(xmls_root.glob("20*"), reverse=True))  # Busca direta: 2025-05/, 2025-06/
+                folders.extend(sorted(xmls_root.glob("*/20*"), reverse=True))  # Busca com tipo: NFE/2025-05/, CTe/2025-06/
+                print(f"[DEBUG PDF] Encontradas {len(folders)} pastas para varrer")
+                if folders:
+                    print(f"[DEBUG PDF] Pastas encontradas: {[f.name for f in folders[:10]]}")
+                for idx, year_month_folder in enumerate(folders):
                     potential_pdf = year_month_folder / f"{chave}.pdf"
+                    print(f"[DEBUG PDF] Verificando [{idx+1}/{len(folders)}]: {year_month_folder}")
                     if potential_pdf.exists():
+                        print(f"[DEBUG PDF] ✅ Encontrado na pasta {idx+1}/{len(folders)}: {year_month_folder}")
                         pdf_path = potential_pdf
                         break
-                # Se ainda não encontrou, busca com tipo
-                if not pdf_path:
-                    tipo_folder = xmls_root / tipo
-                    if tipo_folder.exists():
-                        for year_month_folder in sorted(tipo_folder.glob("20*"), reverse=True):
-                            potential_pdf = year_month_folder / f"{chave}.pdf"
-                            if potential_pdf.exists():
-                                pdf_path = potential_pdf
+                    else:
+                        print(f"[DEBUG PDF] ❌ Não encontrado em: {potential_pdf}")
+            else:
+                print(f"[DEBUG PDF] Pasta raiz não existe: {xmls_root}")
+        else:
+            if pdf_path:
+                print(f"[DEBUG PDF] PDF já encontrado, pulando busca recursiva")
+            else:
+                print(f"[DEBUG PDF] Dados insuficientes para busca recursiva (chave ou informante faltando)")
+        
+        print(f"[DEBUG PDF] Etapa 3 concluída em {time.time() - recursive_start:.3f}s")
+        
+        # Etapa 3.5: Se ainda não encontrou, busca pelo XML e depois o PDF (estrutura número-nome)
+        if not pdf_path and chave and informante:
+            print(f"[DEBUG PDF] Etapa 3.5: Busca por XML contendo a chave...")
+            xml_search_start = time.time()
+            try:
+                xmls_root = BASE_DIR / "xmls" / informante
+                if xmls_root.exists():
+                    # Busca recursiva por XML que contenha a chave
+                    xml_found = None
+                    for xml_file in xmls_root.rglob("*.xml"):
+                        try:
+                            xml_content = xml_file.read_text(encoding='utf-8', errors='ignore')
+                            if chave in xml_content:
+                                xml_found = xml_file
+                                print(f"[DEBUG PDF] ✅ XML encontrado: {xml_file}")
                                 break
+                        except:
+                            continue
+                    
+                    if xml_found:
+                        # Verifica se existe PDF com mesmo nome
+                        pdf_candidate = xml_found.with_suffix('.pdf')
+                        if pdf_candidate.exists():
+                            print(f"[DEBUG PDF] ✅ PDF encontrado via XML: {pdf_candidate}")
+                            pdf_path = pdf_candidate
+                        else:
+                            print(f"[DEBUG PDF] ❌ PDF não encontrado no mesmo local do XML")
+            except Exception as e:
+                print(f"[DEBUG PDF] Erro na busca por XML: {e}")
+            print(f"[DEBUG PDF] Etapa 3.5 concluída em {time.time() - xml_search_start:.3f}s")
         
         # Se PDF existe, abre imediatamente e adiciona ao cache
+        print(f"[DEBUG PDF] Etapa 4: Abertura do PDF...")
+        open_start = time.time()
         if pdf_path and pdf_path.exists():
+            print(f"[DEBUG PDF] Abrindo PDF: {pdf_path}")
             try:
                 # Adiciona ao cache para próximas aberturas
                 self._pdf_cache[chave] = str(pdf_path)
+                print(f"[DEBUG PDF] PDF adicionado ao cache (tamanho: {len(self._pdf_cache)})")
                 
                 pdf_str = str(pdf_path.absolute())
                 if sys.platform == "win32":
                     os.startfile(pdf_str)  # type: ignore[attr-defined]
                 else:
                     subprocess.Popen(["xdg-open", pdf_str])
+                print(f"[DEBUG PDF] Etapa 4 concluída em {time.time() - open_start:.3f}s")
+                total_time = time.time() - start_time
+                print(f"[DEBUG PDF] ✅ PDF aberto com sucesso - Tempo total: {total_time:.3f}s\n")
                 self.set_status("✅ PDF aberto", 1000)
                 return
             except Exception as e:
+                print(f"[DEBUG PDF] ❌ Erro ao abrir PDF: {e}")
                 QMessageBox.warning(self, "Erro ao abrir PDF", f"Erro: {e}")
                 return
         
         # Se não tem PDF, precisa gerar (LENTO) - executa em thread separada
+        print(f"[DEBUG PDF] Etapa 5: Geração de PDF necessária...")
+        generation_start = time.time()
+        print(f"[DEBUG PDF] PDF não encontrado em disco, iniciando geração...")
         self.set_status("⏳ PDF não encontrado. Gerando... Por favor aguarde...")
         QApplication.processEvents()
         
         # Cria worker thread para não travar a interface
+        print(f"[DEBUG PDF] Criando worker thread para geração assíncrona...")
         self._process_pdf_async(item)
+        print(f"[DEBUG PDF] Worker criado - aguardando conclusão em background")
+        print(f"[DEBUG PDF] ========================================\n")
     
     def _on_table_emitidos_double_clicked(self, row: int, col: int):
         """Abre PDF da tabela de notas emitidas (mesma lógica que _on_table_double_clicked)"""
+        import time
+        start_time = time.time()
+        
+        print(f"\n[DEBUG PDF EMITIDOS] ========== DUPLO CLIQUE ===========")
+        
         # Obtém o item pela linha clicada da lista filtrada de emitidos
         flt = self.filtered_emitidos()
         item = flt[row] if 0 <= row < len(flt) else None
         if not item:
+            print(f"[DEBUG PDF EMITIDOS] ❌ Item não encontrado na linha {row}")
             return
         
         chave = item.get('chave', '')
         if not chave:
+            print(f"[DEBUG PDF EMITIDOS] ❌ Chave não encontrada no item")
             return
         
+        print(f"[DEBUG PDF EMITIDOS] Chave: {chave}")
+        print(f"[DEBUG PDF EMITIDOS] Informante: {item.get('informante', 'N/A')}")
+        print(f"[DEBUG PDF EMITIDOS] Tipo: {item.get('tipo', 'N/A')}")
+        
         # OTIMIZAÇÃO 1: Verifica cache primeiro (INSTANTÂNEO)
+        print(f"[DEBUG PDF EMITIDOS] Etapa 1: Verificando cache...")
+        cache_start = time.time()
         if chave in self._pdf_cache:
+            print(f"[DEBUG PDF EMITIDOS] ✅ Encontrado no cache: {self._pdf_cache[chave]}")
             cached_pdf = Path(self._pdf_cache[chave])
             if cached_pdf.exists():
                 try:
+                    print(f"[DEBUG PDF EMITIDOS] ⚡ Cache hit! Tempo: {time.time() - cache_start:.3f}s")
                     pdf_str = str(cached_pdf.absolute())
                     if sys.platform == "win32":
                         os.startfile(pdf_str)  # type: ignore[attr-defined]
                     else:
                         subprocess.Popen(["xdg-open", pdf_str])
+                    total_time = time.time() - start_time
+                    print(f"[DEBUG PDF EMITIDOS] ✅ PDF aberto (cache) - Tempo total: {total_time:.3f}s")
                     self.set_status("✅ PDF aberto (cache)", 1000)
                     return
                 except Exception as e:
+                    print(f"[DEBUG PDF EMITIDOS] ❌ Erro ao abrir PDF do cache: {e}")
                     QMessageBox.warning(self, "Erro ao abrir PDF", f"Erro: {e}")
                     return
+            else:
+                print(f"[DEBUG PDF EMITIDOS] ⚠️ PDF no cache não existe mais no disco")
+        else:
+            print(f"[DEBUG PDF EMITIDOS] Cache miss (tamanho do cache: {len(self._pdf_cache)})")
+        
+        print(f"[DEBUG PDF EMITIDOS] Etapa 1 concluída em {time.time() - cache_start:.3f}s")
         
         # OTIMIZAÇÃO 2: Busca direta baseada na data de emissão (MUITO MAIS RÁPIDO)
+        print(f"[DEBUG PDF EMITIDOS] Etapa 2: Busca direta na pasta...")
+        direct_start = time.time()
         # Para notas emitidas, o cnpj_emitente é da empresa (quem emitiu)
         # e o informante é quem recebeu (destinatário)
         # O XML está salvo pelo informante (quem baixou)
@@ -2507,68 +2758,140 @@ class MainWindow(QMainWindow):
         tipo = (item.get('tipo') or 'NFe').strip().upper().replace('-', '')
         data_emissao = (item.get('data_emissao') or '')[:10]
         
+        print(f"[DEBUG PDF EMITIDOS] Informante: {informante}")
+        print(f"[DEBUG PDF EMITIDOS] Tipo: {tipo}")
+        print(f"[DEBUG PDF EMITIDOS] Data emissão: {data_emissao}")
+        
         pdf_path = None
         
         if chave and informante and data_emissao:
             # Extrai ano-mês da data de emissão
             try:
                 year_month = data_emissao[:7] if len(data_emissao) >= 7 else None
+                print(f"[DEBUG PDF EMITIDOS] Ano-mês extraído: {year_month}")
                 if year_month:
                     # Busca direta na pasta específica do mês (SEM recursão)
                     specific_path = BASE_DIR / "xmls" / informante / tipo / year_month / f"{chave}.pdf"
+                    print(f"[DEBUG PDF EMITIDOS] Buscando em: {specific_path}")
                     if specific_path.exists():
+                        print(f"[DEBUG PDF EMITIDOS] ✅ Encontrado na busca direta!")
                         pdf_path = specific_path
                     else:
                         # Tenta sem o tipo (estrutura antiga)
                         old_path = BASE_DIR / "xmls" / informante / year_month / f"{chave}.pdf"
+                        print(f"[DEBUG PDF EMITIDOS] Tentando estrutura antiga: {old_path}")
                         if old_path.exists():
+                            print(f"[DEBUG PDF EMITIDOS] ✅ Encontrado na estrutura antiga!")
                             pdf_path = old_path
-            except Exception:
+                        else:
+                            print(f"[DEBUG PDF EMITIDOS] ❌ Não encontrado na busca direta")
+            except Exception as e:
+                print(f"[DEBUG PDF EMITIDOS] ❌ Erro na busca direta: {e}")
                 pass
         
+        print(f"[DEBUG PDF EMITIDOS] Etapa 2 concluída em {time.time() - direct_start:.3f}s")
+        
         # OTIMIZAÇÃO 3: Apenas se não encontrou acima, busca em toda estrutura (LENTO - último recurso)
+        print(f"[DEBUG PDF EMITIDOS] Etapa 3: Busca recursiva (se necessário)...")
+        recursive_start = time.time()
         if not pdf_path and chave and informante:
+            print(f"[DEBUG PDF EMITIDOS] PDF não encontrado na busca direta, iniciando busca recursiva...")
             xmls_root = BASE_DIR / "xmls" / informante
+            print(f"[DEBUG PDF EMITIDOS] Pasta raiz: {xmls_root}")
             if xmls_root.exists():
-                # Lista todas as pastas de ano-mês
-                for year_month_folder in sorted(xmls_root.glob("*/20*"), reverse=True):
+                # Lista todas as pastas de ano-mês (diretamente na raiz E em subpastas de tipo)
+                folders = list(sorted(xmls_root.glob("20*"), reverse=True))  # Busca direta: 2025-05/, 2025-06/
+                folders.extend(sorted(xmls_root.glob("*/20*"), reverse=True))  # Busca com tipo: NFE/2025-05/, CTe/2025-06/
+                print(f"[DEBUG PDF EMITIDOS] Encontradas {len(folders)} pastas para varrer")
+                if folders:
+                    print(f"[DEBUG PDF EMITIDOS] Pastas encontradas: {[f.name for f in folders[:10]]}")
+                for idx, year_month_folder in enumerate(folders):
                     potential_pdf = year_month_folder / f"{chave}.pdf"
+                    print(f"[DEBUG PDF EMITIDOS] Verificando [{idx+1}/{len(folders)}]: {year_month_folder}")
                     if potential_pdf.exists():
+                        print(f"[DEBUG PDF EMITIDOS] ✅ Encontrado na pasta {idx+1}/{len(folders)}: {year_month_folder}")
                         pdf_path = potential_pdf
                         break
-                # Se ainda não encontrou, busca com tipo
-                if not pdf_path:
-                    tipo_folder = xmls_root / tipo
-                    if tipo_folder.exists():
-                        for year_month_folder in sorted(tipo_folder.glob("20*"), reverse=True):
-                            potential_pdf = year_month_folder / f"{chave}.pdf"
-                            if potential_pdf.exists():
-                                pdf_path = potential_pdf
+                    else:
+                        print(f"[DEBUG PDF EMITIDOS] ❌ Não encontrado em: {potential_pdf}")
+            else:
+                print(f"[DEBUG PDF EMITIDOS] Pasta raiz não existe: {xmls_root}")
+        else:
+            if pdf_path:
+                print(f"[DEBUG PDF EMITIDOS] PDF já encontrado, pulando busca recursiva")
+            else:
+                print(f"[DEBUG PDF EMITIDOS] Dados insuficientes para busca recursiva (chave ou informante faltando)")
+        
+        print(f"[DEBUG PDF EMITIDOS] Etapa 3 concluída em {time.time() - recursive_start:.3f}s")
+        
+        # Etapa 3.5: Se ainda não encontrou, busca pelo XML e depois o PDF (estrutura número-nome)
+        if not pdf_path and chave and informante:
+            print(f"[DEBUG PDF EMITIDOS] Etapa 3.5: Busca por XML contendo a chave...")
+            xml_search_start = time.time()
+            try:
+                xmls_root = BASE_DIR / "xmls" / informante
+                if xmls_root.exists():
+                    # Busca recursiva por XML que contenha a chave
+                    xml_found = None
+                    for xml_file in xmls_root.rglob("*.xml"):
+                        try:
+                            xml_content = xml_file.read_text(encoding='utf-8', errors='ignore')
+                            if chave in xml_content:
+                                xml_found = xml_file
+                                print(f"[DEBUG PDF EMITIDOS] ✅ XML encontrado: {xml_file}")
                                 break
+                        except:
+                            continue
+                    
+                    if xml_found:
+                        # Verifica se existe PDF com mesmo nome
+                        pdf_candidate = xml_found.with_suffix('.pdf')
+                        if pdf_candidate.exists():
+                            print(f"[DEBUG PDF EMITIDOS] ✅ PDF encontrado via XML: {pdf_candidate}")
+                            pdf_path = pdf_candidate
+                        else:
+                            print(f"[DEBUG PDF EMITIDOS] ❌ PDF não encontrado no mesmo local do XML")
+            except Exception as e:
+                print(f"[DEBUG PDF EMITIDOS] Erro na busca por XML: {e}")
+            print(f"[DEBUG PDF EMITIDOS] Etapa 3.5 concluída em {time.time() - xml_search_start:.3f}s")
         
         # Se PDF existe, abre imediatamente e adiciona ao cache
+        print(f"[DEBUG PDF EMITIDOS] Etapa 4: Abertura do PDF...")
+        open_start = time.time()
         if pdf_path and pdf_path.exists():
+            print(f"[DEBUG PDF EMITIDOS] Abrindo PDF: {pdf_path}")
             try:
                 # Adiciona ao cache para próximas aberturas
                 self._pdf_cache[chave] = str(pdf_path)
+                print(f"[DEBUG PDF EMITIDOS] PDF adicionado ao cache (tamanho: {len(self._pdf_cache)})")
                 
                 pdf_str = str(pdf_path.absolute())
                 if sys.platform == "win32":
                     os.startfile(pdf_str)  # type: ignore[attr-defined]
                 else:
                     subprocess.Popen(["xdg-open", pdf_str])
+                print(f"[DEBUG PDF EMITIDOS] Etapa 4 concluída em {time.time() - open_start:.3f}s")
+                total_time = time.time() - start_time
+                print(f"[DEBUG PDF EMITIDOS] ✅ PDF aberto com sucesso - Tempo total: {total_time:.3f}s\n")
                 self.set_status("✅ PDF aberto", 1000)
                 return
             except Exception as e:
+                print(f"[DEBUG PDF EMITIDOS] ❌ Erro ao abrir PDF: {e}")
                 QMessageBox.warning(self, "Erro ao abrir PDF", f"Erro: {e}")
                 return
         
         # Se não tem PDF, precisa gerar (LENTO) - executa em thread separada
+        print(f"[DEBUG PDF EMITIDOS] Etapa 5: Geração de PDF necessária...")
+        generation_start = time.time()
+        print(f"[DEBUG PDF EMITIDOS] PDF não encontrado em disco, iniciando geração...")
         self.set_status("⏳ PDF não encontrado. Gerando... Por favor aguarde...")
         QApplication.processEvents()
         
         # Cria worker thread para não travar a interface
+        print(f"[DEBUG PDF EMITIDOS] Criando worker thread para geração assíncrona...")
         self._process_pdf_async(item)
+        print(f"[DEBUG PDF EMITIDOS] Worker criado - aguardando conclusão em background")
+        print(f"[DEBUG PDF EMITIDOS] ========================================\n")
     
     def _process_pdf_async(self, item: Dict[str, Any]):
         """Processa PDF em thread separada para não travar a UI"""
@@ -5881,6 +6204,7 @@ def main():
     
     w = MainWindow()
     w.show()
+    w._center_window()  # Centraliza depois de mostrar
     sys.exit(app.exec_())
 
 
