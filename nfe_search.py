@@ -43,7 +43,7 @@ def get_data_dir():
     if getattr(sys, 'frozen', False):
         # Usa AppData do usuário
         app_data = Path(os.environ.get('APPDATA', Path.home()))
-        data_dir = app_data / "Busca XML"
+        data_dir = app_data / "BOT Busca NFE"
     else:
         # Desenvolvimento: usa pasta local
         data_dir = Path(__file__).parent
