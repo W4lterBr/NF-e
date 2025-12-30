@@ -121,7 +121,7 @@ class GitHubUpdater:
             file_size = installer_asset.get('size', 0)
             file_name = installer_asset.get('name', 'installer.exe')
             
-            log_progress(f"📥 Baixando {file_name}...")
+            log_progress(f"📥 Baixando instalador...")
             
             # Baixa instalador
             response = requests.get(download_url, stream=True, timeout=60)
@@ -132,6 +132,7 @@ class GitHubUpdater:
             installer_path = temp_dir / file_name
             
             downloaded = 0
+            last_percent = -1
             with open(installer_path, 'wb') as f:
                 for chunk in response.iter_content(chunk_size=8192):
                     if chunk:
@@ -139,9 +140,12 @@ class GitHubUpdater:
                         downloaded += len(chunk)
                         if file_size > 0:
                             percent = int((downloaded / file_size) * 100)
-                            log_progress(f"📥 Baixando: {percent}%")
+                            # Atualiza apenas quando a porcentagem muda
+                            if percent != last_percent:
+                                log_progress(f"📥 Baixando: {percent}%")
+                                last_percent = percent
             
-            log_progress(f"✅ Download concluído: {installer_path}")
+            log_progress(f"✅ Download concluído!")
             return installer_path
             
         except Exception as e:
@@ -287,13 +291,14 @@ class GitHubUpdater:
                             log_progress(f"⚠️ Execute manualmente: {installer_path}")
             
             # MÉTODO 2: Atualiza arquivos individuais (fallback ou modo desenvolvimento)
-            log_progress("📥 Baixando arquivos de atualização...")
+            log_progress("📥 Preparando atualização...")
             
             files = self.get_file_list()
             total = len(files)
             
             for idx, file_path in enumerate(files, 1):
-                log_progress(f"[{idx}/{total}] Baixando {file_path}...")
+                percent = int((idx / total) * 100)
+                log_progress(f"📥 Atualizando: {percent}%")
                 
                 # Baixa arquivo
                 content = self.download_file(file_path)
