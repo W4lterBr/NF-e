@@ -78,8 +78,14 @@ class DatabaseManager:
                 chave TEXT PRIMARY KEY,
                 cnpj_cpf TEXT,
                 caminho_arquivo TEXT,
+                xml_completo TEXT,
                 baixado_em TEXT
             )''')
+            # Migração: adicionar coluna xml_completo se não existir
+            try:
+                conn.execute("ALTER TABLE xmls_baixados ADD COLUMN xml_completo TEXT")
+            except:
+                pass  # Coluna já existe
             conn.execute('''CREATE TABLE IF NOT EXISTS nf_status (
                 chNFe TEXT PRIMARY KEY,
                 cStat TEXT,

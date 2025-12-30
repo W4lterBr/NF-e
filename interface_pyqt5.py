@@ -343,6 +343,7 @@ class MainWindow(QMainWindow):
         self._pdf_cache = {}
         self._cache_building = False
         self._cache_worker = None  # Referência para a thread do cache
+        self._refreshing_emitidos = False  # Flag para evitar múltiplos refreshes simultâneos
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -419,8 +420,14 @@ class MainWindow(QMainWindow):
         limit_label = QLabel("Exibir:")
         self.limit_dd = QComboBox()
         self.limit_dd.addItems(["50", "100", "500", "1000", "Todos"])
-        self.limit_dd.setCurrentText("100")  # Padrão: 100 linhas
+        
+        # Restaura a seleção salva do usuário
+        settings = QSettings('NFE_System', 'BOT_NFE')
+        saved_limit = settings.value('display/limit', '100')  # Padrão: 100 linhas
+        self.limit_dd.setCurrentText(str(saved_limit))
+        
         self.limit_dd.currentTextChanged.connect(self.refresh_table)
+        self.limit_dd.currentTextChanged.connect(self._save_limit_preference)
         self.limit_dd.setToolTip("Quantidade de documentos a exibir na tabela")
         
         self.btn_refresh = QPushButton("Atualizar"); self.btn_refresh.clicked.connect(self.refresh_all)
@@ -1082,7 +1089,37 @@ class MainWindow(QMainWindow):
                 rows = conn.execute("SELECT chave FROM xmls_baixados").fetchall()
                 total_registros = len(rows)
                 
-                for (chave,) in rows:
+                # Cria diálogo de progresso
+                from PyQt5.QtWidgets import QProgressDialog
+                progress = QProgressDialog(
+                    "Sincronizando XMLs...",
+                    "Cancelar",
+                    0,
+                    total_registros,
+                    self
+                )
+                progress.setWindowTitle("Sincronização")
+                progress.setWindowModality(Qt.WindowModal)
+                progress.setMinimumDuration(0)
+                progress.setValue(0)
+                
+                cancelado = False
+                
+                for idx, (chave,) in enumerate(rows):
+                    if progress.wasCanceled():
+                        cancelado = True
+                        break
+                    
+                    # Atualiza progresso
+                    progress.setLabelText(
+                        f"Verificando registro {idx + 1}/{total_registros}\n"
+                        f"Chave: ...{chave[-12:]}\n\n"
+                        f"✅ Encontrados: {registros_ok}\n"
+                        f"❌ Removidos: {registros_removidos}"
+                    )
+                    progress.setValue(idx)
+                    QApplication.processEvents()
+                    
                     xml_existe = False
                     
                     # Busca em pastas locais
@@ -1115,11 +1152,21 @@ class MainWindow(QMainWindow):
                         registros_removidos += 1
                         chaves_removidas.append(chave)
                 
-                conn.commit()
+                progress.setValue(total_registros)
+                progress.close()
+                
+                if not cancelado:
+                    conn.commit()
+                else:
+                    conn.rollback()
             
             # Mostra resumo
-            mensagem = f"✅ Sincronização concluída!\n\n"
-            mensagem += f"Total de registros: {total_registros}\n"
+            if cancelado:
+                mensagem = f"⏸️ Sincronização cancelada!\n\n"
+            else:
+                mensagem = f"✅ Sincronização concluída!\n\n"
+            
+            mensagem += f"Total de registros verificados: {idx + 1}/{total_registros}\n"
             mensagem += f"✅ XMLs encontrados: {registros_ok}\n"
             mensagem += f"❌ Registros removidos: {registros_removidos}\n"
             
@@ -1149,10 +1196,12 @@ class MainWindow(QMainWindow):
             with sqlite3.connect(str(DB_PATH)) as conn:
                 # Busca chaves que não tem caminho_arquivo
                 rows = conn.execute("""
-                    SELECT x.chave, x.cnpj_cpf, c.cnpj_cpf, c.caminho, c.senha, c.cUF_autor
-                    FROM xmls_baixados AS x
-                    JOIN certificados AS c ON x.cnpj_cpf = c.informante
-                    WHERE (x.caminho_arquivo IS NULL OR x.caminho_arquivo = '')
+                    SELECT xmls_baixados.chave, xmls_baixados.cnpj_cpf, 
+                           certificados.cnpj_cpf, certificados.caminho, 
+                           certificados.senha, certificados.cUF_autor
+                    FROM xmls_baixados
+                    JOIN certificados ON xmls_baixados.cnpj_cpf = certificados.informante
+                    WHERE (xmls_baixados.caminho_arquivo IS NULL OR xmls_baixados.caminho_arquivo = '')
                     LIMIT 100
                 """).fetchall()
                 
@@ -1190,6 +1239,18 @@ class MainWindow(QMainWindow):
             sys.path.insert(0, str(BASE_DIR))
             from nfe_search import consultar_nfe_por_chave
             
+            # Importa sistema de descriptografia
+            try:
+                from modules.crypto_portable import get_portable_crypto as get_crypto
+                crypto = get_crypto()
+                CRYPTO_AVAILABLE = True
+            except ImportError:
+                CRYPTO_AVAILABLE = False
+                print("⚠️ Sistema de criptografia não disponível")
+            
+            # Dicionário para rastrear certificados com problemas
+            certificados_com_erro = {}
+            
             # Progresso
             from PyQt5.QtWidgets import QProgressDialog
             progress = QProgressDialog(
@@ -1210,12 +1271,22 @@ class MainWindow(QMainWindow):
             
             import time
             
-            for idx, (chave, cnpj_cpf, cnpj_cert, cert_path, senha, cuf) in enumerate(rows):
+            for idx, (chave, cnpj_cpf, cnpj_cert, cert_path, senha_encriptada, cuf) in enumerate(rows):
                 if progress.wasCanceled():
                     cancelado = True
                     break
                 
                 try:
+                    # Descriptografa a senha se necessário
+                    senha = senha_encriptada
+                    if CRYPTO_AVAILABLE and senha_encriptada:
+                        try:
+                            senha = crypto.decrypt(senha_encriptada)
+                        except Exception as e:
+                            # Se falhar ao descriptografar, assume que é texto plano
+                            print(f"⚠️ Usando senha em texto plano (não descriptografada): {e}")
+                            senha = senha_encriptada
+                    
                     progress.setLabelText(
                         f"Baixando XML {idx + 1}/{total_faltantes}\n"
                         f"Chave: ...{chave[-12:]}\n"
@@ -1268,7 +1339,21 @@ class MainWindow(QMainWindow):
                         time.sleep(1.2)
                     
                 except Exception as e:
-                    print(f"Erro ao consultar chave {chave}: {e}")
+                    erro_msg = str(e)
+                    print(f"Erro ao consultar chave {chave}: {erro_msg}")
+                    
+                    # Rastreia certificados com problema
+                    cert_info = f"{cert_cnpj} (UF {cuf}) - {cert_path}"
+                    if cert_info not in certificados_com_erro:
+                        certificados_com_erro[cert_info] = {
+                            'count': 0,
+                            'erro': erro_msg,
+                            'chaves': []
+                        }
+                    certificados_com_erro[cert_info]['count'] += 1
+                    if len(certificados_com_erro[cert_info]['chaves']) < 3:
+                        certificados_com_erro[cert_info]['chaves'].append(chave[:20] + '...')
+                    
                     falhas += 1
             
             progress.setValue(total_faltantes)
@@ -1286,6 +1371,17 @@ class MainWindow(QMainWindow):
             
             if sucessos > 0:
                 mensagem += f"\n💾 {sucessos} XMLs salvos no banco de dados!"
+            
+            # Adiciona relatório de certificados com problema
+            if certificados_com_erro:
+                mensagem += "\n\n⚠️ CERTIFICADOS COM PROBLEMAS:\n"
+                mensagem += "=" * 50 + "\n"
+                for cert_info, dados in certificados_com_erro.items():
+                    mensagem += f"\n📜 {cert_info}\n"
+                    mensagem += f"   Erro: {dados['erro']}\n"
+                    mensagem += f"   Falhas: {dados['count']}\n"
+                    if dados['chaves']:
+                        mensagem += f"   Exemplos: {', '.join(dados['chaves'])}\n"
             
             QMessageBox.information(self, "Download Concluído", mensagem)
             
@@ -1364,6 +1460,15 @@ class MainWindow(QMainWindow):
             self.set_status("Filtro de data limpo", 1500)
         except Exception as e:
             print(f"[DEBUG] Erro ao limpar filtros de data: {e}")
+    
+    def _save_limit_preference(self, limit_text: str):
+        """Salva a preferência de limite de exibição do usuário"""
+        try:
+            settings = QSettings('NFE_System', 'BOT_NFE')
+            settings.setValue('display/limit', limit_text)
+            settings.sync()
+        except Exception as e:
+            print(f"[DEBUG] Erro ao salvar preferência de limite: {e}")
 
     def filtered(self) -> List[Dict[str, Any]]:
         q = (self.search_edit.text() or "").lower().strip()
@@ -1470,103 +1575,121 @@ class MainWindow(QMainWindow):
             company_cnpjs.discard('')  # Remove string vazia se houver
             print(f"[DEBUG] Certificados encontrados: {len(certs)}")
             print(f"[DEBUG] CNPJs da empresa (normalizados): {company_cnpjs}")
-            
-            # Verifica total no banco (sem limite)
-            try:
-                with self.db._connect() as conn:
-                    total_db = conn.execute("SELECT COUNT(*) FROM notas_detalhadas WHERE xml_status != 'EVENTO'").fetchone()[0]
-                    print(f"[DEBUG] Total de notas no banco (sem limite): {total_db}")
-            except Exception as e2:
-                print(f"[DEBUG] Erro ao contar notas no banco: {e2}")
         except Exception as e:
             print(f"[DEBUG] Erro ao carregar certificados: {e}")
             company_cnpjs = set()
         
+        if not company_cnpjs:
+            print(f"[DEBUG] Nenhum certificado encontrado, retornando lista vazia")
+            return []
+        
+        # ALTERAÇÃO: Carrega DIRETAMENTE do banco com filtros SQL em vez de usar self.notes
+        # Isso garante que todas as notas emitidas sejam encontradas, não apenas as primeiras 1000
         out: List[Dict[str, Any]] = []
-        total_notes = len(self.notes or [])
-        print(f"[DEBUG] Total de notas carregadas: {total_notes}")
         
-        # DEBUG: Mostra exemplos de CNPJs emitentes no banco
-        sample_cnpjs = set()
-        for i, note in enumerate(self.notes or []):
-            if i < 10:  # Primeiras 10 notas
-                cnpj_raw = note.get('cnpj_emitente') or ''
-                cnpj_norm = normalizar_cnpj(cnpj_raw)
-                if cnpj_norm:
-                    sample_cnpjs.add(f"{cnpj_norm} (original: {cnpj_raw})")
-        if sample_cnpjs:
-            print(f"[DEBUG] Exemplos de CNPJ emitente nas primeiras 10 notas:")
-            for cnpj in list(sample_cnpjs)[:5]:
-                print(f"[DEBUG]   - {cnpj}")
-        
-        # Verifica se há ALGUMA nota emitida no banco (direto no SQL)
         try:
-            cnpjs_str = "','".join(company_cnpjs)
-            query = f"SELECT COUNT(*) FROM notas_detalhadas WHERE cnpj_emitente IN ('{cnpjs_str}') AND xml_status != 'EVENTO'"
             with self.db._connect() as conn:
-                count_emitidas_db = conn.execute(query).fetchone()[0]
-                print(f"[DEBUG] Notas emitidas pela empresa no banco (direto SQL): {count_emitidas_db}")
-        except Exception as e3:
-            print(f"[DEBUG] Erro ao verificar notas emitidas no banco: {e3}")
+                # DIAGNÓSTICO: Verifica o que existe no banco
+                try:
+                    total_notas = conn.execute("SELECT COUNT(*) FROM notas_detalhadas").fetchone()[0]
+                    total_nao_eventos = conn.execute("SELECT COUNT(*) FROM notas_detalhadas WHERE xml_status != 'EVENTO'").fetchone()[0]
+                    print(f"[DEBUG] Total de notas no banco: {total_notas}")
+                    print(f"[DEBUG] Total de notas não-eventos: {total_nao_eventos}")
+                    
+                    # Verifica se cnpj_emitente tem valores
+                    sample_cnpjs = conn.execute("""
+                        SELECT DISTINCT cnpj_emitente 
+                        FROM notas_detalhadas 
+                        WHERE cnpj_emitente IS NOT NULL AND cnpj_emitente != '' 
+                        LIMIT 10
+                    """).fetchall()
+                    print(f"[DEBUG] Exemplos de cnpj_emitente no banco:")
+                    for (cnpj,) in sample_cnpjs[:5]:
+                        normalized = ''.join(c for c in str(cnpj or '') if c.isdigit())
+                        print(f"[DEBUG]   - {cnpj} (normalizado: {normalized})")
+                    
+                    # Testa a query de normalização diretamente
+                    for test_cnpj in list(company_cnpjs)[:2]:
+                        test_result = conn.execute(f"""
+                            SELECT COUNT(*) 
+                            FROM notas_detalhadas 
+                            WHERE REPLACE(REPLACE(REPLACE(cnpj_emitente, '.', ''), '/', ''), '-', '') = ?
+                            AND xml_status != 'EVENTO'
+                        """, (test_cnpj,)).fetchone()[0]
+                        print(f"[DEBUG] Teste CNPJ {test_cnpj}: {test_result} notas encontradas")
+                except Exception as e:
+                    print(f"[DEBUG] Erro no diagnóstico: {e}")
+                
+                # Constrói query SQL com filtros
+                where_clauses = ["xml_status != 'EVENTO'"]
+                params = []
+                
+                # Filtro PRINCIPAL: cnpj_emitente nos certificados da empresa
+                # Normaliza CNPJ removendo pontuação (apenas dígitos) para comparação
+                cnpjs_placeholders = ','.join(['?' for _ in company_cnpjs])
+                where_clauses.append(f"REPLACE(REPLACE(REPLACE(cnpj_emitente, '.', ''), '/', ''), '-', '') IN ({cnpjs_placeholders})")
+                params.extend(list(company_cnpjs))
+                
+                # Filtro por certificado selecionado
+                if selected_cert:
+                    where_clauses.append("REPLACE(REPLACE(REPLACE(cnpj_emitente, '.', ''), '/', ''), '-', '') = ?")
+                    params.append(normalizar_cnpj(str(selected_cert)))
+                
+                # Filtro por status
+                if st != "todos":
+                    where_clauses.append("LOWER(status) LIKE ?")
+                    params.append(f"%{st}%")
+                
+                # Filtro por tipo
+                if tp != "todos":
+                    tipo_patterns = []
+                    if tp == "nfe":
+                        tipo_patterns = ["NFE", "NF-E"]
+                    elif tp == "cte":
+                        tipo_patterns = ["CTE", "CT-E"]
+                    elif tp == "nfse":
+                        tipo_patterns = ["NFSE", "NFS-E"]
+                    
+                    if tipo_patterns:
+                        tipo_clauses = " OR ".join(["UPPER(REPLACE(REPLACE(tipo, '_', ''), ' ', '')) = ?" for _ in tipo_patterns])
+                        where_clauses.append(f"({tipo_clauses})")
+                        params.extend(tipo_patterns)
+                
+                # Filtro por data
+                if date_inicio_filter and date_fim_filter:
+                    where_clauses.append("SUBSTR(data_emissao, 1, 10) BETWEEN ? AND ?")
+                    params.extend([date_inicio_filter, date_fim_filter])
+                
+                # Busca por texto (nome, número, CNPJ)
+                if q:
+                    where_clauses.append("(LOWER(nome_emitente) LIKE ? OR CAST(numero AS TEXT) LIKE ? OR cnpj_emitente LIKE ?)")
+                    params.extend([f"%{q}%", f"%{q}%", f"%{q}%"])
+                
+                # Monta query completa
+                where_sql = " AND ".join(where_clauses)
+                query = f"SELECT * FROM notas_detalhadas WHERE {where_sql} ORDER BY data_emissao DESC"
+                
+                # Aplica limite se definido
+                if limit:
+                    query += f" LIMIT {limit}"
+                
+                print(f"[DEBUG] Query SQL para notas emitidas: {query[:200]}...")
+                print(f"[DEBUG] Parâmetros: {params[:10]}...")
+                
+                cursor = conn.execute(query, params)
+                rows = cursor.fetchall()
+                columns = [desc[0] for desc in cursor.description]
+                
+                for row in rows:
+                    out.append(dict(zip(columns, row)))
+                
+                print(f"[DEBUG] Total de notas emitidas carregadas do banco: {len(out)}")
+                
+        except Exception as e:
+            print(f"[DEBUG] Erro ao carregar notas emitidas do banco: {e}")
+            import traceback
+            traceback.print_exc()
         
-        emitidas_count = 0
-        for it in (self.notes or []):
-            # NÃO MOSTRAR eventos na interface
-            xml_status = (it.get('xml_status') or '').upper()
-            if xml_status == 'EVENTO':
-                continue
-            
-            # FILTRO PRINCIPAL: Nota emitida pela empresa (cnpj_emitente é um dos certificados)
-            cnpj_emit_raw = it.get('cnpj_emitente') or ''
-            cnpj_emit = normalizar_cnpj(cnpj_emit_raw)
-            
-            if cnpj_emit in company_cnpjs:
-                emitidas_count += 1
-                if emitidas_count <= 3:  # Log das primeiras 3
-                    print(f"[DEBUG] Nota emitida encontrada: {cnpj_emit} - Num: {it.get('numero')}")
-            
-            if cnpj_emit not in company_cnpjs:
-                continue
-            
-            if selected_cert:
-                # Para emitidos, filtra por cnpj_emitente (não informante)
-                if cnpj_emit != str(selected_cert).strip():
-                    continue
-            
-            if q:
-                # Busca por nome do destinatário ou número ou CNPJ destinatário
-                # Note: para notas emitidas, precisamos buscar dados do destinatário
-                # Como não temos campo específico, busca em nome_emitente e cnpj_emitente
-                # (que neste contexto seria informação do destinatário se fosse estruturado)
-                if q not in (it.get("nome_emitente", "").lower()) and q not in (str(it.get("numero", "")).lower()) and q not in (it.get("cnpj_emitente", "").lower()):
-                    continue
-            
-            if st != "todos" and st not in (it.get("status", "").lower()):
-                continue
-            
-            if tp != "todos":
-                raw = (it.get("tipo", "") or "").strip().upper().replace('_','').replace(' ','')
-                if tp == "nfe" and raw not in ("NFE", "NF-E"):
-                    continue
-                if tp == "cte" and raw not in ("CTE", "CT-E"):
-                    continue
-                if tp == "nfse" and raw not in ("NFSE", "NFS-E"):
-                    continue
-            
-            # Filtro de data
-            if date_inicio_filter and date_fim_filter:
-                data_emissao = (it.get("data_emissao") or "")[:10]  # YYYY-MM-DD
-                if data_emissao:
-                    if not (date_inicio_filter <= data_emissao <= date_fim_filter):
-                        continue
-            
-            out.append(it)
-            
-            # Aplica limite se definido
-            if limit and len(out) >= limit:
-                break
-        
-        print(f"[DEBUG] Total de notas emitidas FILTRADAS: {len(out)} (de {emitidas_count} encontradas)")
         return out
 
     def _populate_certs_tree(self):
@@ -1714,30 +1837,39 @@ class MainWindow(QMainWindow):
     
     def refresh_emitidos_table(self):
         """Popula a tabela de notas emitidas pela empresa (usa mesma lógica de _populate_row)"""
-        print("[DEBUG] ========== REFRESH_EMITIDOS_TABLE CHAMADO ==========")
-        items = self.filtered_emitidos()
-        print(f"[DEBUG] Populando tabela_emitidos com {len(items)} itens")
+        # Evitar múltiplas execuções simultâneas
+        if self._refreshing_emitidos:
+            print("[DEBUG] ⏭️ refresh_emitidos_table já está executando, pulando chamada duplicada")
+            return
         
+        self._refreshing_emitidos = True
         try:
-            sorting_enabled = self.table_emitidos.isSortingEnabled()
-            self.table_emitidos.setSortingEnabled(False)
-        except Exception:
-            sorting_enabled = False
-        
-        try:
-            self.table_emitidos.clearContents()
-            self.table_emitidos.setRowCount(len(items))
-        except Exception:
-            pass
-        
-        # Popula diretamente (sem timer, pois geralmente há menos itens)
-        for r, it in enumerate(items):
-            self._populate_emitidos_row(r, it)
-        
-        try:
-            self.table_emitidos.setSortingEnabled(sorting_enabled)
-        except Exception:
-            pass
+            print("[DEBUG] ========== REFRESH_EMITIDOS_TABLE CHAMADO ==========")
+            items = self.filtered_emitidos()
+            print(f"[DEBUG] Populando tabela_emitidos com {len(items)} itens")
+            
+            try:
+                sorting_enabled = self.table_emitidos.isSortingEnabled()
+                self.table_emitidos.setSortingEnabled(False)
+            except Exception:
+                sorting_enabled = False
+            
+            try:
+                self.table_emitidos.clearContents()
+                self.table_emitidos.setRowCount(len(items))
+            except Exception:
+                pass
+            
+            # Popula diretamente (sem timer, pois geralmente há menos itens)
+            for r, it in enumerate(items):
+                self._populate_emitidos_row(r, it)
+            
+            try:
+                self.table_emitidos.setSortingEnabled(sorting_enabled)
+            except Exception:
+                pass
+        finally:
+            self._refreshing_emitidos = False
 
     def _populate_row(self, r: int, it: Dict[str, Any]):
         def cell(c: Any) -> QTableWidgetItem:
@@ -2821,7 +2953,6 @@ class MainWindow(QMainWindow):
                     pdf_str = str(cached_pdf.absolute())
                     if sys.platform == "win32":
                         # Abre PDF com visualizador padrão do Windows (evita abrir interface se PDF estiver associado incorretamente)
-                        import subprocess
                         subprocess.Popen(["cmd", "/c", "start", "", pdf_str], shell=False, creationflags=subprocess.CREATE_NO_WINDOW)  # type: ignore[attr-defined]
                     else:
                         subprocess.Popen(["xdg-open", pdf_str])

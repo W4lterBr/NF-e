@@ -1041,8 +1041,16 @@ class DatabaseManager:
             )''')
             cur.execute('''CREATE TABLE IF NOT EXISTS xmls_baixados (
                 chave TEXT PRIMARY KEY,
-                cnpj_cpf TEXT
+                cnpj_cpf TEXT,
+                caminho_arquivo TEXT,
+                xml_completo TEXT,
+                baixado_em TEXT
             )''')
+            # Migração: adicionar coluna xml_completo se não existir
+            try:
+                cur.execute("ALTER TABLE xmls_baixados ADD COLUMN xml_completo TEXT")
+            except:
+                pass  # Coluna já existe
             cur.execute('''CREATE TABLE IF NOT EXISTS nf_status (
                 chNFe TEXT PRIMARY KEY,
                 cStat TEXT,
@@ -1325,11 +1333,10 @@ class DatabaseManager:
     def get_chaves_missing_status(self):
         with self._connect() as conn:
             rows = conn.execute('''
-                SELECT x.chave, x.cnpj_cpf
-                FROM xmls_baixados x
-                LEFT JOIN nf_status n
-                ON x.chave = n.chNFe
-                WHERE n.chNFe IS NULL
+                SELECT xmls_baixados.chave, xmls_baixados.cnpj_cpf
+                FROM xmls_baixados
+                LEFT JOIN nf_status ON xmls_baixados.chave = nf_status.chNFe
+                WHERE nf_status.chNFe IS NULL
             ''').fetchall()
             logger.debug(f"Chaves sem status: {rows}")
             return rows
@@ -1907,6 +1914,16 @@ def consultar_nfe_por_chave(chave: str, certificado_path: str, senha: str, cnpj:
     """
     try:
         logger.info(f"Consultando NFe por chave: {chave}")
+        logger.info(f"  📜 Certificado: {certificado_path}")
+        logger.info(f"  🏢 CNPJ: {cnpj}, UF: {cuf}")
+        
+        # Verifica se o certificado existe
+        from pathlib import Path
+        cert_file = Path(certificado_path)
+        if not cert_file.exists():
+            logger.error(f"  ❌ Certificado não encontrado: {certificado_path}")
+            return None
+        
         svc = NFeService(certificado_path, senha, cnpj, cuf)
         prot_xml = svc.fetch_prot_nfe(chave)
         
