@@ -2013,8 +2013,20 @@ def run_single_cycle():
                             if infnfe is None:
                                 logger.warning(f"⚠️ [{cnpj}] NF-e: infNFe não encontrado no XML (NSU={nsu}), pulando")
                                 continue
+                            
+                            # Verifica modelo do documento (55 = NF-e, 65 = NFC-e)
+                            ide = infnfe.find('{http://www.portalfiscal.inf.br/nfe}ide')
+                            if ide is not None:
+                                modelo = ide.findtext('{http://www.portalfiscal.inf.br/nfe}mod', '')
+                                if modelo == '65':
+                                    logger.info(f"🛒 [{cnpj}] NFC-e (modelo 65) detectada no NSU={nsu}, pulando (sistema busca apenas NF-e modelo 55)")
+                                    continue
+                                elif modelo and modelo != '55':
+                                    logger.warning(f"⚠️ [{cnpj}] Modelo desconhecido '{modelo}' no NSU={nsu}, pulando")
+                                    continue
+                            
                             chave  = infnfe.attrib.get('Id','')[-44:]
-                            logger.info(f"🔑 [{cnpj}] NF-e: Chave extraída = {chave}")
+                            logger.info(f"🔑 [{cnpj}] NF-e (modelo 55): Chave extraída = {chave}")
                             
                             db.registrar_xml(chave, cnpj)
                             
