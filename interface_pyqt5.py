@@ -2548,7 +2548,9 @@ class MainWindow(QMainWindow):
                     print(f"[DEBUG PDF] ⚡ Cache hit! Tempo: {time.time() - cache_start:.3f}s")
                     pdf_str = str(cached_pdf.absolute())
                     if sys.platform == "win32":
-                        os.startfile(pdf_str)  # type: ignore[attr-defined]
+                        # Abre PDF com visualizador padrão do Windows (evita abrir interface se PDF estiver associado incorretamente)
+                        import subprocess
+                        subprocess.Popen(["cmd", "/c", "start", "", pdf_str], shell=False, creationflags=subprocess.CREATE_NO_WINDOW)  # type: ignore[attr-defined]
                     else:
                         subprocess.Popen(["xdg-open", pdf_str])
                     total_time = time.time() - start_time
@@ -2682,7 +2684,8 @@ class MainWindow(QMainWindow):
                 
                 pdf_str = str(pdf_path.absolute())
                 if sys.platform == "win32":
-                    os.startfile(pdf_str)  # type: ignore[attr-defined]
+                    # Abre PDF com visualizador padrão do Windows (evita abrir interface se PDF estiver associado incorretamente)
+                    subprocess.Popen(["cmd", "/c", "start", "", pdf_str], shell=False, creationflags=subprocess.CREATE_NO_WINDOW)  # type: ignore[attr-defined]
                 else:
                     subprocess.Popen(["xdg-open", pdf_str])
                 print(f"[DEBUG PDF] Etapa 4 concluída em {time.time() - open_start:.3f}s")
@@ -2742,7 +2745,8 @@ class MainWindow(QMainWindow):
                     print(f"[DEBUG PDF EMITIDOS] ⚡ Cache hit! Tempo: {time.time() - cache_start:.3f}s")
                     pdf_str = str(cached_pdf.absolute())
                     if sys.platform == "win32":
-                        os.startfile(pdf_str)  # type: ignore[attr-defined]
+                        # Abre PDF com visualizador padrão do Windows (evita abrir interface se PDF estiver associado incorretamente)
+                        subprocess.Popen(["cmd", "/c", "start", "", pdf_str], shell=False, creationflags=subprocess.CREATE_NO_WINDOW)  # type: ignore[attr-defined]
                     else:
                         subprocess.Popen(["xdg-open", pdf_str])
                     total_time = time.time() - start_time
@@ -2879,7 +2883,8 @@ class MainWindow(QMainWindow):
                 
                 pdf_str = str(pdf_path.absolute())
                 if sys.platform == "win32":
-                    os.startfile(pdf_str)  # type: ignore[attr-defined]
+                    # Abre PDF com visualizador padrão do Windows (evita abrir interface se PDF estiver associado incorretamente)
+                    subprocess.Popen(["cmd", "/c", "start", "", pdf_str], shell=False, creationflags=subprocess.CREATE_NO_WINDOW)  # type: ignore[attr-defined]
                 else:
                     subprocess.Popen(["xdg-open", pdf_str])
                 print(f"[DEBUG PDF EMITIDOS] Etapa 4 concluída em {time.time() - open_start:.3f}s")
@@ -3072,7 +3077,8 @@ class MainWindow(QMainWindow):
                 pdf_path = result.get("pdf_path")
                 try:
                     if sys.platform == "win32":
-                        os.startfile(pdf_path)  # type: ignore[attr-defined]
+                        # Abre PDF com visualizador padrão do Windows (evita abrir interface se PDF estiver associado incorretamente)
+                        subprocess.Popen(["cmd", "/c", "start", "", pdf_path], shell=False, creationflags=subprocess.CREATE_NO_WINDOW)  # type: ignore[attr-defined]
                     else:
                         subprocess.Popen(["xdg-open", pdf_path])
                     self.set_status("✅ PDF gerado e aberto com sucesso!", 2000)
