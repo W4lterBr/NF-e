@@ -190,14 +190,39 @@ class DatabaseManager:
             
             return certificates
     
-    def save_certificate(self, data: Dict[str, Any]) -> bool:
-        """Save certificate to database. Returns True if successful."""
+    def save_certificate(self, data: Dict[str, Any]) -> tuple[bool, Optional[str]]:
+        """Save certificate to database. 
+        
+        Returns:
+            tuple: (success: bool, error_message: Optional[str])
+        """
         try:
+            # Validações básicas
+            if not data.get('informante'):
+                return False, "Campo 'Informante' está vazio"
+            
+            if not data.get('cnpj_cpf'):
+                return False, "Campo 'CNPJ/CPF' está vazio"
+            
+            if not data.get('caminho'):
+                return False, "Caminho do certificado não foi especificado"
+            
+            import os
+            if not os.path.exists(data.get('caminho', '')):
+                return False, f"Arquivo do certificado não encontrado:\n{data.get('caminho')}"
+            
+            if not data.get('cUF_autor'):
+                return False, "Campo 'UF Autor' está vazio"
+            
             # Criptografa senha antes de salvar
             senha_to_save = data.get('senha', '')
             if senha_to_save and CRYPTO_AVAILABLE:
-                crypto = get_crypto()
-                senha_to_save = crypto.encrypt(senha_to_save)
+                try:
+                    crypto = get_crypto()
+                    senha_to_save = crypto.encrypt(senha_to_save)
+                except Exception as e:
+                    print(f"[DEBUG] Erro ao criptografar senha: {e}")
+                    return False, f"Erro ao criptografar senha: {e}"
             
             with self._connect() as conn:
                 # Check for duplicates by informante
@@ -236,12 +261,26 @@ class DatabaseManager:
                          data.get('nome_certificado'))
                     )
                 conn.commit()
-                return True
+                print(f"[DEBUG] Certificado salvo com sucesso: {data.get('informante')}")
+                return True, None
+        except sqlite3.IntegrityError as e:
+            error_msg = f"Erro de integridade do banco de dados: {e}"
+            print(f"[DEBUG] {error_msg}")
+            import traceback
+            traceback.print_exc()
+            return False, error_msg
+        except sqlite3.OperationalError as e:
+            error_msg = f"Erro operacional do banco: {e}"
+            print(f"[DEBUG] {error_msg}")
+            import traceback
+            traceback.print_exc()
+            return False, error_msg
         except Exception as e:
+            error_msg = f"Erro inesperado: {type(e).__name__}: {e}"
             print(f"[DEBUG] Erro ao salvar certificado: {e}")
             import traceback
             traceback.print_exc()
-            return False
+            return False, error_msg
     
     def save_note(self, data: Dict[str, Any]) -> bool:
         """Save note to database with anti-downgrade logic."""

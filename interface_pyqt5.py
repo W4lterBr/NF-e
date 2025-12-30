@@ -4425,8 +4425,10 @@ class CertificateDialog(QDialog):
             data = dlg.get_data()
             if not data:
                 return
-            ok = self.db.save_certificate(data)
-            if ok:
+            
+            success, error_msg = self.db.save_certificate(data)
+            
+            if success:
                 QMessageBox.information(
                     self,
                     "✅ Sucesso",
@@ -4436,11 +4438,13 @@ class CertificateDialog(QDialog):
                     f"ele foi substituído automaticamente."
                 )
             else:
+                error_details = error_msg or "Erro desconhecido"
                 QMessageBox.critical(
                     self, 
-                    "❌ Erro", 
+                    "❌ Erro ao Salvar Certificado", 
                     f"Não foi possível salvar o certificado.\n\n"
-                    f"Verifique os logs no terminal para mais detalhes."
+                    f"Detalhes do erro:\n{error_details}\n\n"
+                    f"Verifique também os logs no terminal para mais informações."
                 )
             self.reload()
 
@@ -5616,6 +5620,17 @@ class AddCertificateDialog(QDialog):
             QMessageBox.warning(self, "Atenção", "Selecione o arquivo do certificado!")
             return None
         
+        # Verifica se o arquivo existe
+        import os
+        if not os.path.exists(cert_path):
+            QMessageBox.critical(
+                self, 
+                "Erro",
+                f"Arquivo do certificado não encontrado:\n\n{cert_path}\n\n"
+                "Verifique se o arquivo ainda existe no local especificado."
+            )
+            return None
+        
         if not informante:
             QMessageBox.warning(self, "Atenção", "Informante não foi preenchido!\n\nClique em 'Extrair Informações' primeiro.")
             return None
@@ -5627,6 +5642,36 @@ class AddCertificateDialog(QDialog):
         if not cuf:
             QMessageBox.warning(self, "Atenção", "Preencha o campo 'UF Autor' (código da UF, ex: 33 para RJ)")
             return None
+        
+        # Validação do código UF (deve ser numérico entre 11 e 53)
+        try:
+            cuf_int = int(cuf)
+            if cuf_int < 11 or cuf_int > 53:
+                QMessageBox.warning(
+                    self, 
+                    "Atenção",
+                    f"Código UF inválido: {cuf}\n\n"
+                    "Use um código entre 11 e 53.\n"
+                    "Ex: 33 (Rio de Janeiro), 35 (São Paulo)"
+                )
+                return None
+        except ValueError:
+            QMessageBox.warning(
+                self,
+                "Atenção", 
+                f"Código UF deve ser numérico!\n\n"
+                f"Valor informado: '{cuf}'\n\n"
+                "Ex: 33 (Rio de Janeiro), 35 (São Paulo)"
+            )
+            return None
+        
+        print(f"[DEBUG] Dados do certificado validados:")
+        print(f"  - Informante: {informante}")
+        print(f"  - CNPJ/CPF: {cnpj_cpf}")
+        print(f"  - Caminho: {cert_path}")
+        print(f"  - UF Autor: {cuf}")
+        print(f"  - Razão Social: {razao_social or '(não preenchido)'}")
+        print(f"  - Nome Certificado: {nome_certificado or '(não preenchido)'}")
         
         return {
             "informante": informante,
