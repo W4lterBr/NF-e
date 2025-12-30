@@ -231,12 +231,22 @@ def resolve_xml_text(item: Dict[str, Any]) -> Optional[str]:
             return None
         import sqlite3
         with sqlite3.connect(str(DB_PATH)) as conn:
-            row = conn.execute("SELECT caminho_arquivo FROM xmls_baixados WHERE chave = ?", (chave,)).fetchone()
-            if row and row[0] and os.path.exists(row[0]):
-                try:
-                    return Path(row[0]).read_text(encoding="utf-8", errors="ignore")
-                except Exception:
-                    pass
+            # Tenta pegar xml_completo primeiro (mais rápido)
+            row = conn.execute("SELECT xml_completo, caminho_arquivo FROM xmls_baixados WHERE chave = ?", (chave,)).fetchone()
+            if row:
+                # Se tem xml_completo no banco, usa ele
+                if row[0]:
+                    print(f"[DEBUG XML] ✅ XML encontrado no banco (xml_completo)")
+                    return row[0]
+                # Se não, tenta ler do arquivo
+                if row[1] and os.path.exists(row[1]):
+                    try:
+                        print(f"[DEBUG XML] ✅ XML encontrado no arquivo: {row[1]}")
+                        return Path(row[1]).read_text(encoding="utf-8", errors="ignore")
+                    except Exception as e:
+                        print(f"[DEBUG XML] ⚠️ Erro ao ler arquivo: {e}")
+        
+        print(f"[DEBUG XML] Buscando XML nas pastas locais para chave: {chave}")
         roots = [
             DATA_DIR / "xmls",
             DATA_DIR / "xmls_chave",
@@ -265,9 +275,13 @@ def resolve_xml_text(item: Dict[str, Any]) -> Optional[str]:
                 continue
             for f in r.rglob(f"*{chave}*.xml"):
                 try:
+                    print(f"[DEBUG XML] ✅ XML encontrado em: {f}")
                     return f.read_text(encoding="utf-8", errors="ignore")
                 except Exception:
                     continue
+        
+        # Segunda tentativa: busca pelo conteúdo
+        print(f"[DEBUG XML] Segunda tentativa: buscando pelo conteúdo da chave")
         for r in roots:
             if not r.exists():
                 continue
@@ -275,11 +289,14 @@ def resolve_xml_text(item: Dict[str, Any]) -> Optional[str]:
                 try:
                     head = f.read_text(encoding="utf-8", errors="ignore")
                     if chave in head:
+                        print(f"[DEBUG XML] ✅ XML encontrado por conteúdo em: {f}")
                         return head
                 except Exception:
                     continue
-    except Exception:
-        pass
+        
+        print(f"[DEBUG XML] ❌ XML não encontrado em nenhuma pasta")
+    except Exception as e:
+        print(f"[DEBUG XML] ❌ Erro ao buscar XML: {e}")
     return None
 
 
