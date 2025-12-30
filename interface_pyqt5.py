@@ -8,6 +8,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Callable
 from datetime import datetime
 import sqlite3
+import ctypes
+from ctypes import wintypes
 
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -6349,6 +6351,41 @@ def main():
     # Keep console open when run under VS Code for visibility
     os.environ.setdefault("PYTHONIOENCODING", "utf-8")
     os.environ.setdefault("PYTHONUTF8", "1")
+    
+    # ===== PROTEÇÃO CONTRA MÚLTIPLAS INSTÂNCIAS =====
+    # Cria um mutex único para o sistema "Busca XML"
+    # Se já existir, significa que outra instância está rodando
+    if sys.platform == "win32":
+        kernel32 = ctypes.windll.kernel32
+        ERROR_ALREADY_EXISTS = 183
+        
+        # Nome único do mutex (pode ser qualquer string única)
+        mutex_name = "Global\\BuscaXML_SingleInstance_Mutex_9A8B7C6D"
+        
+        # Tenta criar o mutex
+        mutex = kernel32.CreateMutexW(None, False, mutex_name)
+        last_error = kernel32.GetLastError()
+        
+        # Se o mutex já existe, outra instância está rodando
+        if last_error == ERROR_ALREADY_EXISTS:
+            # Mostra mensagem de erro usando MessageBox do Windows (mais confiável que QMessageBox antes do QApplication)
+            user32 = ctypes.windll.user32
+            MB_OK = 0x00000000
+            MB_ICONWARNING = 0x00000030
+            MB_TOPMOST = 0x00040000
+            
+            mensagem = (
+                "O sistema 'Busca XML' já está em execução!\n\n"
+                "Não é permitido abrir múltiplas instâncias do programa.\n\n"
+                "Por favor, use a instância que já está aberta."
+            )
+            user32.MessageBoxW(None, mensagem, "Busca XML - Já em Execução", MB_OK | MB_ICONWARNING | MB_TOPMOST)
+            sys.exit(1)
+        
+        # Mantém o mutex aberto durante toda a execução do programa
+        # Ele será automaticamente liberado quando o processo terminar
+    # ===== FIM DA PROTEÇÃO =====
+    
     app = QApplication(sys.argv)
     
     # Define o ícone do aplicativo (aparece na barra de tarefas do Windows)
