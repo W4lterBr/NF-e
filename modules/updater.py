@@ -9,6 +9,9 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 import shutil
 import logging
+import sys
+import subprocess
+import tempfile
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +30,7 @@ class GitHubUpdater:
         self.backup_dir = Path(backup_dir) if backup_dir else self.base_dir / "backups"
         self.api_url = f"https://api.github.com/repos/{repo}"
         self.raw_url = f"https://raw.githubusercontent.com/{repo}/main"
+        self.releases_url = f"{self.api_url}/releases/latest"
         self.version_file = self.base_dir / "version.txt"
         
     def get_current_version(self) -> str:
@@ -49,6 +53,17 @@ class GitHubUpdater:
             logger.error(f"Erro ao buscar versão remota: {e}")
             return None
     
+    def get_latest_release(self) -> Optional[Dict]:
+        """Busca informações da última release do GitHub."""
+        try:
+            response = requests.get(self.releases_url, timeout=10)
+            if response.status_code == 200:
+                return response.json()
+            return None
+        except Exception as e:
+            logger.error(f"Erro ao buscar release: {e}")
+            return None
+    
     def check_for_updates(self) -> Tuple[bool, str, str]:
         """
         Verifica se há atualizações disponíveis.
@@ -64,6 +79,75 @@ class GitHubUpdater:
         
         has_update = remote != current
         return has_update, current, remote
+    
+    def download_installer_from_release(self, progress_callback=None) -> Optional[Path]:
+        """
+        Baixa o instalador (.exe) da última release do GitHub.
+        
+        Args:
+            progress_callback: Função callback(message: str) para reportar progresso
+            
+        Returns:
+            Path do instalador baixado ou None se falhar
+        """
+        def log_progress(msg):
+            if progress_callback:
+                progress_callback(msg)
+            logger.info(msg)
+        
+        try:
+            log_progress("🔍 Buscando última release...")
+            release = self.get_latest_release()
+            
+            if not release:
+                log_progress("❌ Não foi possível buscar informações da release")
+                return None
+            
+            # Procura asset do instalador
+            assets = release.get('assets', [])
+            installer_asset = None
+            
+            for asset in assets:
+                name = asset.get('name', '').lower()
+                if name.endswith('.exe') and ('setup' in name or 'installer' in name or 'busca_xml' in name):
+                    installer_asset = asset
+                    break
+            
+            if not installer_asset:
+                log_progress("❌ Instalador não encontrado na release")
+                return None
+            
+            download_url = installer_asset.get('browser_download_url')
+            file_size = installer_asset.get('size', 0)
+            file_name = installer_asset.get('name', 'installer.exe')
+            
+            log_progress(f"📥 Baixando {file_name}...")
+            
+            # Baixa instalador
+            response = requests.get(download_url, stream=True, timeout=60)
+            response.raise_for_status()
+            
+            # Salva em diretório temporário
+            temp_dir = Path(tempfile.gettempdir())
+            installer_path = temp_dir / file_name
+            
+            downloaded = 0
+            with open(installer_path, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    if chunk:
+                        f.write(chunk)
+                        downloaded += len(chunk)
+                        if file_size > 0:
+                            percent = int((downloaded / file_size) * 100)
+                            log_progress(f"📥 Baixando: {percent}%")
+            
+            log_progress(f"✅ Download concluído: {installer_path}")
+            return installer_path
+            
+        except Exception as e:
+            logger.error(f"Erro ao baixar instalador: {e}")
+            log_progress(f"❌ Erro: {str(e)}")
+            return None
     
     def get_file_list(self) -> List[str]:
         """
@@ -140,6 +224,7 @@ class GitHubUpdater:
     def apply_update(self, progress_callback=None) -> Dict[str, any]:
         """
         Aplica atualização baixando e substituindo arquivos.
+        Prioriza instalador do GitHub Releases, depois atualiza arquivos individuais.
         
         Args:
             progress_callback: Função callback(message: str) para reportar progresso
@@ -168,7 +253,42 @@ class GitHubUpdater:
             
             log_progress(f"📥 Atualizando de {current} para {remote}...")
             
-            # Baixa lista de arquivos
+            # MÉTODO 1: Tenta baixar e executar instalador (melhor opção)
+            if getattr(sys, 'frozen', False):
+                # Aplicativo compilado - pode usar instalador
+                log_progress("📦 Tentando baixar instalador...")
+                installer_path = self.download_installer_from_release(progress_callback)
+                
+                if installer_path and installer_path.exists():
+                    log_progress("🚀 Executando instalador...")
+                    
+                    try:
+                        # Tenta instalação silenciosa
+                        subprocess.Popen([str(installer_path), '/VERYSILENT', '/NORESTART'])
+                        
+                        return {
+                            'success': True,
+                            'message': '✅ Instalador executado com sucesso!\n\nO aplicativo será atualizado automaticamente.\nAguarde alguns segundos e reinicie.',
+                            'updated_files': ['Instalador automático executado']
+                        }
+                        
+                    except Exception as e:
+                        logger.warning(f"Falha instalação silenciosa: {e}")
+                        
+                        # Tenta execução normal
+                        try:
+                            subprocess.Popen([str(installer_path)])
+                            return {
+                                'success': True,
+                                'message': '✅ Instalador iniciado!\n\nSiga as instruções na tela para atualizar.',
+                                'updated_files': ['Instalador manual iniciado']
+                            }
+                        except:
+                            log_progress(f"⚠️ Execute manualmente: {installer_path}")
+            
+            # MÉTODO 2: Atualiza arquivos individuais (fallback ou modo desenvolvimento)
+            log_progress("📥 Baixando arquivos de atualização...")
+            
             files = self.get_file_list()
             total = len(files)
             
@@ -204,11 +324,14 @@ class GitHubUpdater:
             version_content = self.download_file("version.txt")
             if version_content:
                 self.version_file.write_bytes(version_content)
+                updated_files.append("version.txt")
                 log_progress(f"✅ Versão atualizada para {remote}")
             
             # Resultado final
             if errors:
-                error_msg = "\n".join(errors)
+                error_msg = "\n".join(errors[:5])  # Limita a 5 erros
+                if len(errors) > 5:
+                    error_msg += f"\n... e mais {len(errors)-5} erros"
                 return {
                     'success': False,
                     'message': f'Atualização parcial. Erros:\n{error_msg}',
@@ -217,7 +340,7 @@ class GitHubUpdater:
             else:
                 return {
                     'success': True,
-                    'message': f'✅ Atualização concluída!\n{len(updated_files)} arquivos atualizados para versão {remote}',
+                    'message': f'✅ Atualização concluída!\n\n{len(updated_files)} arquivos atualizados para versão {remote}\n\nReinicie o aplicativo para aplicar as mudanças.',
                     'updated_files': updated_files
                 }
                 
