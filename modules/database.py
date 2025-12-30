@@ -42,6 +42,14 @@ class DatabaseManager:
                 ativo INTEGER DEFAULT 1
             )''')
             
+            # Adiciona coluna ativo se não existir (migração)
+            try:
+                conn.execute("ALTER TABLE certificados ADD COLUMN ativo INTEGER DEFAULT 1")
+                conn.commit()
+            except Exception:
+                # Coluna já existe, ignora
+                pass
+            
             # Adiciona coluna criado_em se não existir (migração)
             try:
                 conn.execute("ALTER TABLE certificados ADD COLUMN criado_em TEXT")
