@@ -1795,6 +1795,13 @@ def processar_cte(db, cert_data):
             iteration_count += 1
             logger.info(f"🔄 [{inf}] CT-e iteração {iteration_count}/{max_iterations}, NSU atual: {ult_nsu_cte}")
             
+            # 🌐 DEBUG HTTP: Informações da requisição CT-e
+            logger.info(f"🌐 [{inf}] Preparando requisição HTTP CT-e:")
+            logger.info(f"   📍 Endpoint: CTeDistribuicaoDFe (Receita Federal)")
+            logger.info(f"   📋 Tipo: {'CNPJ' if len(cnpj)==14 else 'CPF'}")
+            logger.info(f"   📊 NSU solicitado: {ult_nsu_cte}")
+            logger.info(f"   🔐 Certificado: {path}")
+            
             resp_cte = cte_svc.fetch_by_cnpj("CNPJ" if len(cnpj)==14 else "CPF", ult_nsu_cte)
             
             if not resp_cte:

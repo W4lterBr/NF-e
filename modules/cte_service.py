@@ -15,7 +15,8 @@ import base64
 import gzip
 from datetime import datetime
 
-logger = logging.getLogger(__name__)
+# Usa o logger raiz para herdar configurações do módulo principal
+logger = logging.getLogger('nfe_search')  # Mesmo logger do nfe_search.py
 
 # Endpoints oficiais CT-e (Ambiente Nacional - Receita Federal)
 # Fonte: https://www.cte.fazenda.gov.br/portal/webServices.aspx
