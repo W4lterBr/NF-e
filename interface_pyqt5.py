@@ -1079,49 +1079,33 @@ class MainWindow(QMainWindow):
             
             # Carrega todos os registros do banco
             with sqlite3.connect(str(DB_PATH)) as conn:
-                rows = conn.execute("SELECT chave, caminho_arquivo FROM xmls_baixados").fetchall()
+                rows = conn.execute("SELECT chave FROM xmls_baixados").fetchall()
                 total_registros = len(rows)
                 
-                for chave, caminho_arquivo in rows:
+                for (chave,) in rows:
                     xml_existe = False
                     
-                    # Verifica se tem xml_completo no banco
-                    xml_completo = conn.execute(
-                        "SELECT xml_completo FROM xmls_baixados WHERE chave = ?",
-                        (chave,)
-                    ).fetchone()
+                    # Busca em pastas locais
+                    pastas = [
+                        DATA_DIR / "xmls",
+                        DATA_DIR / "xmls_chave",
+                        DATA_DIR / "xml_NFs",
+                        DATA_DIR / "xml_envio",
+                        DATA_DIR / "xml_extraidos",
+                        DATA_DIR / "xml_resposta_sefaz"
+                    ]
                     
-                    if xml_completo and xml_completo[0]:
-                        # XML armazenado no banco
-                        xml_existe = True
-                    elif caminho_arquivo:
-                        # Verifica se arquivo físico existe
-                        if os.path.exists(caminho_arquivo):
-                            xml_existe = True
-                    
-                    # Se não tem xml_completo nem arquivo, busca em pastas
-                    if not xml_existe:
-                        # Busca em pastas locais
-                        pastas = [
-                            DATA_DIR / "xmls",
-                            DATA_DIR / "xmls_chave",
-                            DATA_DIR / "xml_NFs",
-                            DATA_DIR / "xml_envio",
-                            DATA_DIR / "xml_extraidos",
-                            DATA_DIR / "xml_resposta_sefaz"
-                        ]
+                    for pasta in pastas:
+                        if not pasta.exists():
+                            continue
                         
-                        for pasta in pastas:
-                            if not pasta.exists():
-                                continue
-                            
-                            # Busca por nome de arquivo contendo a chave
-                            for xml_file in pasta.rglob(f"*{chave}*.xml"):
-                                xml_existe = True
-                                break
-                            
-                            if xml_existe:
-                                break
+                        # Busca por nome de arquivo contendo a chave
+                        for xml_file in pasta.rglob(f"*{chave}*.xml"):
+                            xml_existe = True
+                            break
+                        
+                        if xml_existe:
+                            break
                     
                     if xml_existe:
                         registros_ok += 1
@@ -1161,15 +1145,14 @@ class MainWindow(QMainWindow):
         """Baixa XMLs completos usando consulta por chave (sem erro 656).
         Ideal para buscar XMLs que faltam quando tem bloqueio no NSU."""
         try:
-            # Busca chaves sem XML completo
+            # Busca chaves sem arquivo XML
             with sqlite3.connect(str(DB_PATH)) as conn:
-                # Busca chaves que não tem xml_completo e não tem arquivo
+                # Busca chaves que não tem caminho_arquivo
                 rows = conn.execute("""
-                    SELECT x.chave, c.cnpj, c.caminho_certificado, c.senha, c.cuf
-                    FROM xmls_baixados x
-                    JOIN certificados c ON x.informante = c.informante
-                    WHERE (x.xml_completo IS NULL OR x.xml_completo = '')
-                      AND (x.caminho_arquivo IS NULL OR x.caminho_arquivo = '')
+                    SELECT x.chave, x.cnpj_cpf, c.cnpj_cpf, c.caminho, c.senha, c.cUF_autor
+                    FROM xmls_baixados AS x
+                    JOIN certificados AS c ON x.cnpj_cpf = c.informante
+                    WHERE (x.caminho_arquivo IS NULL OR x.caminho_arquivo = '')
                     LIMIT 100
                 """).fetchall()
                 
@@ -1227,7 +1210,7 @@ class MainWindow(QMainWindow):
             
             import time
             
-            for idx, (chave, cnpj, cert_path, senha, cuf) in enumerate(rows):
+            for idx, (chave, cnpj_cpf, cnpj_cert, cert_path, senha, cuf) in enumerate(rows):
                 if progress.wasCanceled():
                     cancelado = True
                     break
@@ -1242,14 +1225,21 @@ class MainWindow(QMainWindow):
                     QApplication.processEvents()
                     
                     # Consulta por chave (sem erro 656!)
-                    xml = consultar_nfe_por_chave(chave, cert_path, senha, cnpj, cuf)
+                    xml = consultar_nfe_por_chave(chave, cert_path, senha, cnpj_cert, cuf)
                     
                     if xml:
-                        # Salva XML no banco
+                        # Salva XML em arquivo na pasta xmls_chave/cnpj/
+                        pasta_cnpj = DATA_DIR / "xmls_chave" / cnpj_cpf
+                        pasta_cnpj.mkdir(parents=True, exist_ok=True)
+                        
+                        caminho_xml = pasta_cnpj / f"{chave}.xml"
+                        caminho_xml.write_text(xml, encoding='utf-8')
+                        
+                        # Atualiza caminho no banco
                         with sqlite3.connect(str(DB_PATH)) as conn:
                             conn.execute(
-                                "UPDATE xmls_baixados SET xml_completo = ? WHERE chave = ?",
-                                (xml, chave)
+                                "UPDATE xmls_baixados SET caminho_arquivo = ? WHERE chave = ?",
+                                (str(caminho_xml), chave)
                             )
                             conn.commit()
                         sucessos += 1
