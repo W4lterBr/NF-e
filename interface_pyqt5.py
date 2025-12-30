@@ -16,7 +16,7 @@ from PyQt5.QtWidgets import (
     QDialog, QMessageBox, QFileDialog, QInputDialog, QStatusBar,
     QTreeWidget, QTreeWidgetItem, QSplitter, QAction, QMenu, QSystemTrayIcon,
     QProgressDialog, QStyledItemDelegate, QStyleOptionViewItem, QScrollArea, QFrame,
-    QGroupBox, QRadioButton, QDateEdit
+    QGroupBox, QRadioButton, QDateEdit, QStyle
 )
 from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal, QSettings, QSize
 from PyQt5.QtGui import QIcon, QColor, QBrush, QFont, QCloseEvent
@@ -659,7 +659,7 @@ class MainWindow(QMainWindow):
         
         def _worker():
             try:
-                xmls_dir = BASE_DIR / "xmls"
+                xmls_dir = DATA_DIR / "xmls"
                 if not xmls_dir.exists():
                     return
                 
@@ -961,17 +961,25 @@ class MainWindow(QMainWindow):
         menubar = self.menuBar()
         tarefas = menubar.addMenu("Configurações")
 
-        # Helper para criar ações com ícone opcional
-        def add_action(menu: QMenu, text: str, slot, shortcut: Optional[str] = None, icon_name: Optional[str] = None):
+        # Helper para criar ações com ícone opcional (QStyle ou arquivo)
+        def add_action(menu: QMenu, text: str, slot, shortcut: Optional[str] = None, icon_name: Optional[str] = None, qstyle_icon=None):
             act = QAction(text, self)
             if shortcut:
                 try:
                     act.setShortcut(shortcut)
                 except Exception:
                     pass
-            if icon_name:
+            # Tenta QStyle icon primeiro, depois arquivo
+            if qstyle_icon:
                 try:
-                    act.setIcon(QIcon(str((BASE_DIR / 'Icone' / icon_name))))
+                    act.setIcon(self.style().standardIcon(qstyle_icon))
+                except Exception:
+                    pass
+            elif icon_name:
+                try:
+                    icon_path = BASE_DIR / 'Icone' / icon_name
+                    if icon_path.exists():
+                        act.setIcon(QIcon(str(icon_path)))
                 except Exception:
                     pass
             act.triggered.connect(slot)
@@ -979,23 +987,23 @@ class MainWindow(QMainWindow):
             return act
 
         # Ações principais já presentes na toolbar
-        add_action(tarefas, "Atualizar", self.refresh_all, "F5", "refresh.png")
+        add_action(tarefas, "Atualizar", self.refresh_all, "F5", qstyle_icon=QStyle.SP_BrowserReload)
         tarefas.addSeparator()
-        add_action(tarefas, "Buscar na SEFAZ", self.do_search, "Ctrl+B", "search.png")
-        add_action(tarefas, "Busca Completa", self.do_busca_completa, "Ctrl+Shift+B", "search.png")
-        add_action(tarefas, "PDFs em lote…", self.do_batch_pdf, "Ctrl+P", "pdf.png")
+        add_action(tarefas, "Buscar na SEFAZ", self.do_search, "Ctrl+B", qstyle_icon=QStyle.SP_FileDialogContentsView)
+        add_action(tarefas, "Busca Completa", self.do_busca_completa, "Ctrl+Shift+B", qstyle_icon=QStyle.SP_FileDialogDetailedView)
+        add_action(tarefas, "PDFs em lote…", self.do_batch_pdf, "Ctrl+P", qstyle_icon=QStyle.SP_FileIcon)
         tarefas.addSeparator()
-        add_action(tarefas, "Busca por chave", self.buscar_por_chave, "Ctrl+K", "search.png")
-        add_action(tarefas, "Certificados…", self.open_certificates, "Ctrl+Shift+C", "certificate.png")
+        add_action(tarefas, "Busca por chave", self.buscar_por_chave, "Ctrl+K", qstyle_icon=QStyle.SP_FileDialogListView)
+        add_action(tarefas, "Certificados…", self.open_certificates, "Ctrl+Shift+C", qstyle_icon=QStyle.SP_DialogApplyButton)
         tarefas.addSeparator()
-        add_action(tarefas, "� Armazenamento…", self.open_storage_config, "Ctrl+Shift+A", "xml.png")
+        add_action(tarefas, "💾 Armazenamento…", self.open_storage_config, "Ctrl+Shift+A", qstyle_icon=QStyle.SP_DriveFDIcon)
         tarefas.addSeparator()
-        add_action(tarefas, "�🔄 Atualizações", self.check_updates, "Ctrl+U", "update.png")
+        add_action(tarefas, "🔄 Atualizações", self.check_updates, "Ctrl+U", qstyle_icon=QStyle.SP_BrowserReload)
         tarefas.addSeparator()
-        add_action(tarefas, "Limpar", self.limpar_dados, "Ctrl+Shift+L", "xml.png")
+        add_action(tarefas, "Limpar", self.limpar_dados, "Ctrl+Shift+L", qstyle_icon=QStyle.SP_TrashIcon)
         tarefas.addSeparator()
-        add_action(tarefas, "Abrir XMLs", self.open_xmls_folder, "Ctrl+Shift+X", "xml.png")
-        add_action(tarefas, "Abrir logs", self.open_logs_folder, "Ctrl+L", "log.png")
+        add_action(tarefas, "Abrir XMLs", self.open_xmls_folder, "Ctrl+Shift+X", qstyle_icon=QStyle.SP_DirIcon)
+        add_action(tarefas, "Abrir logs", self.open_logs_folder, "Ctrl+L", qstyle_icon=QStyle.SP_FileDialogInfoView)
 
         # Alternativa: alternar 'PDF simples' (guarda em QSettings). Útil para modo seguro.
         try:
@@ -2328,7 +2336,7 @@ class MainWindow(QMainWindow):
         try:
             # Procura em TODAS as pastas de eventos (não só do informante)
             # porque eventos podem estar na pasta do destinatário
-            xmls_root = BASE_DIR / "xmls"
+            xmls_root = DATA_DIR / "xmls"
             if xmls_root.exists():
                 # Busca em todas as pastas de eventos de todos os CNPJs
                 for eventos_folder in xmls_root.rglob("Eventos"):
@@ -2438,7 +2446,7 @@ class MainWindow(QMainWindow):
     def _abrir_pasta_eventos(self, informante: str):
         """Abre a pasta de eventos do informante no Windows Explorer"""
         try:
-            eventos_path = BASE_DIR / "xmls" / informante
+            eventos_path = DATA_DIR / "xmls" / informante
             if eventos_path.exists():
                 if sys.platform == "win32":
                     os.startfile(str(eventos_path))  # type: ignore[attr-defined]
@@ -2479,13 +2487,13 @@ class MainWindow(QMainWindow):
                             year_month = data_emissao[:7] if len(data_emissao) >= 7 else None
                             if year_month:
                                 # Verifica caminho direto (com tipo)
-                                pdf_path = self.base_dir / "xmls" / informante / tipo / year_month / f"{chave}.pdf"
+                                pdf_path = DATA_DIR / "xmls" / informante / tipo / year_month / f"{chave}.pdf"
                                 if pdf_path.exists():
                                     cache[chave] = str(pdf_path)
                                     continue
                                 
                                 # Verifica caminho antigo (sem tipo)
-                                pdf_path = self.base_dir / "xmls" / informante / year_month / f"{chave}.pdf"
+                                pdf_path = DATA_DIR / "xmls" / informante / year_month / f"{chave}.pdf"
                                 if pdf_path.exists():
                                     cache[chave] = str(pdf_path)
                                     continue
@@ -2578,14 +2586,14 @@ class MainWindow(QMainWindow):
                 print(f"[DEBUG PDF] Ano-mês extraído: {year_month}")
                 if year_month:
                     # Busca direta na pasta específica do mês (SEM recursão)
-                    specific_path = BASE_DIR / "xmls" / informante / tipo / year_month / f"{chave}.pdf"
+                    specific_path = DATA_DIR / "xmls" / informante / tipo / year_month / f"{chave}.pdf"
                     print(f"[DEBUG PDF] Buscando em: {specific_path}")
                     if specific_path.exists():
                         print(f"[DEBUG PDF] ✅ Encontrado na busca direta!")
                         pdf_path = specific_path
                     else:
                         # Tenta sem o tipo (estrutura antiga)
-                        old_path = BASE_DIR / "xmls" / informante / year_month / f"{chave}.pdf"
+                        old_path = DATA_DIR / "xmls" / informante / year_month / f"{chave}.pdf"
                         print(f"[DEBUG PDF] Tentando estrutura antiga: {old_path}")
                         if old_path.exists():
                             print(f"[DEBUG PDF] ✅ Encontrado na estrutura antiga!")
@@ -2603,7 +2611,7 @@ class MainWindow(QMainWindow):
         recursive_start = time.time()
         if not pdf_path and chave and informante:
             print(f"[DEBUG PDF] PDF não encontrado na busca direta, iniciando busca recursiva...")
-            xmls_root = BASE_DIR / "xmls" / informante
+            xmls_root = DATA_DIR / "xmls" / informante
             print(f"[DEBUG PDF] Pasta raiz: {xmls_root}")
             if xmls_root.exists():
                 # Lista todas as pastas de ano-mês (diretamente na raiz E em subpastas de tipo)
@@ -2636,7 +2644,7 @@ class MainWindow(QMainWindow):
             print(f"[DEBUG PDF] Etapa 3.5: Busca por XML contendo a chave...")
             xml_search_start = time.time()
             try:
-                xmls_root = BASE_DIR / "xmls" / informante
+                xmls_root = DATA_DIR / "xmls" / informante
                 if xmls_root.exists():
                     # Busca recursiva por XML que contenha a chave
                     xml_found = None
@@ -2775,14 +2783,14 @@ class MainWindow(QMainWindow):
                 print(f"[DEBUG PDF EMITIDOS] Ano-mês extraído: {year_month}")
                 if year_month:
                     # Busca direta na pasta específica do mês (SEM recursão)
-                    specific_path = BASE_DIR / "xmls" / informante / tipo / year_month / f"{chave}.pdf"
+                    specific_path = DATA_DIR / "xmls" / informante / tipo / year_month / f"{chave}.pdf"
                     print(f"[DEBUG PDF EMITIDOS] Buscando em: {specific_path}")
                     if specific_path.exists():
                         print(f"[DEBUG PDF EMITIDOS] ✅ Encontrado na busca direta!")
                         pdf_path = specific_path
                     else:
                         # Tenta sem o tipo (estrutura antiga)
-                        old_path = BASE_DIR / "xmls" / informante / year_month / f"{chave}.pdf"
+                        old_path = DATA_DIR / "xmls" / informante / year_month / f"{chave}.pdf"
                         print(f"[DEBUG PDF EMITIDOS] Tentando estrutura antiga: {old_path}")
                         if old_path.exists():
                             print(f"[DEBUG PDF EMITIDOS] ✅ Encontrado na estrutura antiga!")
@@ -2800,7 +2808,7 @@ class MainWindow(QMainWindow):
         recursive_start = time.time()
         if not pdf_path and chave and informante:
             print(f"[DEBUG PDF EMITIDOS] PDF não encontrado na busca direta, iniciando busca recursiva...")
-            xmls_root = BASE_DIR / "xmls" / informante
+            xmls_root = DATA_DIR / "xmls" / informante
             print(f"[DEBUG PDF EMITIDOS] Pasta raiz: {xmls_root}")
             if xmls_root.exists():
                 # Lista todas as pastas de ano-mês (diretamente na raiz E em subpastas de tipo)
@@ -2833,7 +2841,7 @@ class MainWindow(QMainWindow):
             print(f"[DEBUG PDF EMITIDOS] Etapa 3.5: Busca por XML contendo a chave...")
             xml_search_start = time.time()
             try:
-                xmls_root = BASE_DIR / "xmls" / informante
+                xmls_root = DATA_DIR / "xmls" / informante
                 if xmls_root.exists():
                     # Busca recursiva por XML que contenha a chave
                     xml_found = None
@@ -2980,7 +2988,7 @@ class MainWindow(QMainWindow):
                             data_emissao = (self.item.get('data_emissao') or '')[:10]
                             if chave and informante:
                                 year_month = data_emissao[:7] if len(data_emissao) >= 7 else datetime.now().strftime("%Y-%m")
-                                xmls_root = BASE_DIR / "xmls" / informante / tipo / year_month
+                                xmls_root = DATA_DIR / "xmls" / informante / tipo / year_month
                                 xmls_root.mkdir(parents=True, exist_ok=True)
                                 xml_file = xmls_root / f"{chave}.xml"
                                 xml_file.write_text(xml_text, encoding='utf-8')
@@ -3001,7 +3009,7 @@ class MainWindow(QMainWindow):
                         pdf_path = Path(saved_xml_path).with_suffix('.pdf')
                     else:
                         if chave and informante:
-                            xmls_root = BASE_DIR / "xmls" / informante
+                            xmls_root = DATA_DIR / "xmls" / informante
                             found_xml = None
                             if xmls_root.exists():
                                 tipo_folder = xmls_root / tipo

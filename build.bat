@@ -73,11 +73,13 @@ REM - Novo instalador/executável
 REM - Sistema de atualização automática que baixa novo .exe
 REM ===================================================================
 
-REM Copiar recursos necessários (Icone e Arquivo_xsd)
+REM Copiar recursos necessários (Icone, Logo.ico e Arquivo_xsd)
 echo.
 echo [RECURSOS] Copiando icones e schemas XSD...
 xcopy /E /I /Y "Icone" "dist\Busca XML\Icone" >nul 2>&1
 xcopy /E /I /Y "Arquivo_xsd" "dist\Busca XML\Arquivo_xsd" >nul 2>&1
+copy /Y "Logo.ico" "dist\Busca XML\Logo.ico" >nul 2>&1
+copy /Y "Logo.png" "dist\Busca XML\Logo.png" >nul 2>&1
 echo   Recursos copiados com sucesso!
 
 echo.
