@@ -97,45 +97,57 @@ def setup_logger():
     LOGS_DIR = BASE / "logs"
     
     # Cria pasta de logs se não existir
-    LOGS_DIR.mkdir(exist_ok=True)
+    LOGS_DIR.mkdir(parents=True, exist_ok=True)
     
     # Nome do arquivo de log com data
     log_filename = LOGS_DIR / f"busca_nfe_{datetime.now().strftime('%Y-%m-%d')}.log"
     
-    # Remove log anterior se existir
-    if log_filename.exists():
-        try:
-            log_filename.unlink()
-        except Exception:
-            pass  # Se não conseguir deletar, continua
+    # Força criação do arquivo se não existir
+    try:
+        log_filename.touch(exist_ok=True)
+    except Exception as e:
+        print(f"⚠️ Erro ao criar arquivo de log: {e}")
+        print(f"   Caminho tentado: {log_filename}")
     
     logger = logging.getLogger(__name__)
     
-    # Sempre garantir que há handlers
-    has_file_handler = any(isinstance(h, logging.FileHandler) for h in logger.handlers)
-    has_console_handler = any(isinstance(h, logging.StreamHandler) and not isinstance(h, logging.FileHandler) for h in logger.handlers)
+    # Remove handlers antigos para evitar duplicação
+    logger.handlers.clear()
     
-    if not has_file_handler:
-        # Handler para arquivo
-        file_handler = logging.FileHandler(log_filename, encoding='utf-8')
+    try:
+        # Handler para arquivo (sempre cria novo)
+        file_handler = logging.FileHandler(log_filename, encoding='utf-8', mode='a')
         file_handler.setLevel(logging.DEBUG)
         file_formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
         file_handler.setFormatter(file_formatter)
         logger.addHandler(file_handler)
-    
-    if not has_console_handler:
+        
         # Handler para console
         console_handler = logging.StreamHandler()
         console_handler.setLevel(logging.INFO)
         console_formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
         console_handler.setFormatter(console_formatter)
         logger.addHandler(console_handler)
+        
+        logger.setLevel(logging.DEBUG)
+        
+        # Log de confirmação
+        print(f"✅ Logger configurado: {log_filename}")
+        
+    except Exception as e:
+        print(f"❌ ERRO ao configurar logger: {e}")
+        print(f"   LOGS_DIR: {LOGS_DIR}")
+        print(f"   log_filename: {log_filename}")
+        # Logger básico apenas no console se falhar
+        console_handler = logging.StreamHandler()
+        console_handler.setLevel(logging.INFO)
+        logger.addHandler(console_handler)
+        logger.setLevel(logging.INFO)
     
-    logger.setLevel(logging.DEBUG)
     return logger
 
 logger = setup_logger()
-logger.debug("Iniciando nfe_search.py")
+logger.info(f"✅ nfe_search.py iniciado - Logs em: {BASE / 'logs'}")
 # -------------------------------------------------------------------
 # Fluxo NSU
 # -------------------------------------------------------------------
