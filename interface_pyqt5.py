@@ -3610,6 +3610,7 @@ class MainWindow(QMainWindow):
                 with sqlite3.connect(str(DB_PATH)) as conn:
                     # Busca todos os certificados (informantes)
                     informantes = conn.execute("SELECT DISTINCT informante FROM certificados").fetchall()
+                    total_informantes = len(informantes)
                     
                     # Reseta NSU individualmente para cada certificado (NFe E CTe)
                     for (informante,) in informantes:
@@ -3630,39 +3631,122 @@ class MainWindow(QMainWindow):
                 # Atualiza timestamp da última busca
                 self.db.set_last_search_time(datetime.now().isoformat())
                 
-                self.set_status(f"NSU resetado para {len(informantes)} certificado(s) e bloqueios limpos", 2000)
+                self.set_status(f"NSU resetado para {total_informantes} certificado(s) e bloqueios limpos", 2000)
             except Exception as e:
                 QMessageBox.critical(self, "Busca Completa", f"Erro ao resetar NSU: {e}")
                 self._search_in_progress = False
                 return
             
-            # Inicia busca na SEFAZ (mesma lógica do do_search)
-            # Sem SearchDialog - usando apenas barra de status
-            self.set_status("🔄 Busca Completa: resetando NSU e buscando todos XMLs...", 0)
+            # Reseta estatísticas para busca completa
+            self._search_stats = {
+                'nfes_found': 0,
+                'ctes_found': 0,
+                'start_time': datetime.now(),
+                'last_cert': '',
+                'total_docs': 0,
+                'current_cert': 0,
+                'total_certs': total_informantes
+            }
+            
+            # Mostra progress bar com range determinado
+            self.search_progress.setVisible(True)
+            self.search_progress.setRange(0, total_informantes)
+            self.search_progress.setValue(0)
+            self.search_summary_label.setText(f"🔄 Busca Completa: 0/{total_informantes} certificados | NFes: 0 | CTes: 0")
+            
+            # Inicia busca na SEFAZ
+            self.set_status("🔄 Busca Completa iniciada - aguarde...", 0)
 
             def on_progress(line: str):
                 if not line:
                     return
                 
-                # Detecta se a busca foi finalizada e vai dormir
-                if "Busca de NSU finalizada" in line or "Dormindo por" in line:
+                # Atualiza progresso baseado nos logs
+                try:
+                    import re
+                    
+                    # Detecta processamento de certificado
+                    if "Processando certificado" in line:
+                        match = re.search(r'CNPJ[=:]?\s*(\d+)', line, re.IGNORECASE)
+                        if match:
+                            cnpj = match.group(1)
+                            self._search_stats['current_cert'] += 1
+                            self._search_stats['last_cert'] = cnpj[-4:]
+                            
+                            # Atualiza progress bar
+                            self.search_progress.setValue(self._search_stats['current_cert'])
+                            
+                            # Atualiza resumo
+                            elapsed = (datetime.now() - self._search_stats['start_time']).total_seconds()
+                            self.search_summary_label.setText(
+                                f"🔄 Busca Completa: {self._search_stats['current_cert']}/{total_informantes} certificados | "
+                                f"NFes: {self._search_stats['nfes_found']} | "
+                                f"CTes: {self._search_stats['ctes_found']} | "
+                                f"Cert: ...{self._search_stats['last_cert']} | "
+                                f"{elapsed:.0f}s"
+                            )
+                    
+                    # Detecta NFe encontrada
+                    if "registrar_xml" in line.lower() or "infnfe" in line.lower():
+                        self._search_stats['nfes_found'] += 1
+                        elapsed = (datetime.now() - self._search_stats['start_time']).total_seconds()
+                        self.search_summary_label.setText(
+                            f"🔄 Busca Completa: {self._search_stats['current_cert']}/{total_informantes} certificados | "
+                            f"NFes: {self._search_stats['nfes_found']} | "
+                            f"CTes: {self._search_stats['ctes_found']} | "
+                            f"Cert: ...{self._search_stats['last_cert']} | "
+                            f"{elapsed:.0f}s"
+                        )
+                    
+                    # Detecta CTe encontrado
+                    if "processar_cte" in line.lower() or "🚛" in line:
+                        self._search_stats['ctes_found'] += 1
+                        elapsed = (datetime.now() - self._search_stats['start_time']).total_seconds()
+                        self.search_summary_label.setText(
+                            f"🔄 Busca Completa: {self._search_stats['current_cert']}/{total_informantes} certificados | "
+                            f"NFes: {self._search_stats['nfes_found']} | "
+                            f"CTes: {self._search_stats['ctes_found']} | "
+                            f"Cert: ...{self._search_stats['last_cert']} | "
+                            f"{elapsed:.0f}s"
+                        )
+                        
+                except Exception:
+                    pass  # Silencioso para evitar recursão
+                
+                # Detecta se a busca foi finalizada
+                if "Busca de NSU finalizada" in line or "Dormindo por" in line or "Busca concluída" in line:
                     # Marca que a busca finalizou
                     self._search_in_progress = False
+                    
+                    # Oculta progress bar
+                    self.search_progress.setVisible(False)
+                    
+                    # Mostra resumo final
+                    elapsed = (datetime.now() - self._search_stats['start_time']).total_seconds()
+                    minutos = int(elapsed / 60)
+                    segundos = int(elapsed % 60)
+                    
+                    tempo_str = f"{minutos}min {segundos}s" if minutos > 0 else f"{segundos}s"
+                    
+                    self.search_summary_label.setText(
+                        f"✅ Busca Completa finalizada! NFes: {self._search_stats['nfes_found']} | "
+                        f"CTes: {self._search_stats['ctes_found']} | "
+                        f"Tempo: {tempo_str}"
+                    )
                     
                     # Extrai tempo de espera (em minutos)
                     import re
                     match = re.search(r'(\d+)\s*minutos', line)
                     if match:
-                        minutos = int(match.group(1))
-                        # Calcula próxima busca
-                        self._next_search_time = datetime.now() + timedelta(minutes=minutos)
-                        self.set_status(f"✅ Busca completa finalizada. Próxima em {minutos} minutos", 3000)
+                        minutos_espera = int(match.group(1))
+                        self._next_search_time = datetime.now() + timedelta(minutes=minutos_espera)
+                        self.set_status(f"✅ Busca completa finalizada. Próxima em {minutos_espera} minutos", 3000)
                     else:
                         self.set_status("✅ Busca completa finalizada", 3000)
                     return
                 
-                # Atualiza status com a linha de progresso
-                print(line)  # Logs no console
+                # Logs no console
+                print(line)
 
             # Worker thread para não travar a interface
             class SearchWorker(QThread):
@@ -3678,8 +3762,13 @@ class MainWindow(QMainWindow):
                     error = res.get('error') or res.get('message')
                     print(f"Erro na busca completa: {error}")
                     self.set_status(f"❌ Erro: {error[:50]}...", 5000)
-                    self._search_in_progress = False  # Libera para nova busca
-                # Diálogo será fechado automaticamente por on_progress
+                    self._search_in_progress = False
+                    
+                    # Oculta progress bar em caso de erro
+                    self.search_progress.setVisible(False)
+                    self.search_summary_label.setText(f"❌ Erro na busca completa")
+                    
+                # Atualiza interface
                 self.refresh_all()
                 self._search_worker = None
             
