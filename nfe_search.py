@@ -1258,12 +1258,8 @@ class DatabaseManager:
             
             ultimo_erro_str, nsu_bloqueado = row
             
-            # Se o NSU mudou, pode consultar (tem documentos novos)
-            if nsu_bloqueado != nsu_atual:
-                logger.debug(f"{informante}: NSU mudou de {nsu_bloqueado} para {nsu_atual}, pode consultar")
-                return True
-            
-            # Verifica se já passou 65 minutos desde o último erro
+            # CORREÇÃO: Verifica PRIMEIRO o tempo decorrido, DEPOIS o NSU
+            # Mudança de NSU não libera consulta antes de 65 minutos!
             from datetime import datetime, timedelta
             ultimo_erro = datetime.fromisoformat(ultimo_erro_str)
             agora = datetime.now()
@@ -1273,7 +1269,10 @@ class DatabaseManager:
                 logger.debug(f"{informante}: Passou {diferenca:.1f} minutos desde erro 656, pode consultar")
                 return True
             else:
-                logger.info(f"{informante}: Ainda em bloqueio erro 656 (faltam {65 - diferenca:.1f} minutos)")
+                # Ainda em período de bloqueio, NÃO consulta mesmo que NSU tenha mudado
+                tempo_restante = 65 - diferenca
+                logger.info(f"🔒 [{informante}] Bloqueado por erro 656 - aguarde {tempo_restante:.1f} minutos")
+                logger.debug(f"   NSU bloqueado: {nsu_bloqueado}, NSU atual: {nsu_atual}")
                 return False
 
     def get_cert_nome_by_informante(self, informante: str):
