@@ -1007,6 +1007,8 @@ class MainWindow(QMainWindow):
 
         # Ações principais já presentes na toolbar
         add_action(tarefas, "Atualizar", self.refresh_all, "F5", qstyle_icon=QStyle.SP_BrowserReload)
+        add_action(tarefas, "🔄 Sincronizar XMLs", self.sincronizar_xmls_interface, "Ctrl+Shift+S", qstyle_icon=QStyle.SP_FileDialogDetailedView)
+        add_action(tarefas, "📥 Baixar XMLs Faltantes", self.baixar_xmls_faltantes_por_chave, "Ctrl+Shift+D", qstyle_icon=QStyle.SP_ArrowDown)
         tarefas.addSeparator()
         add_action(tarefas, "Buscar na SEFAZ", self.do_search, "Ctrl+B", qstyle_icon=QStyle.SP_FileDialogContentsView)
         add_action(tarefas, "Busca Completa", self.do_busca_completa, "Ctrl+Shift+B", qstyle_icon=QStyle.SP_FileDialogDetailedView)
@@ -1042,6 +1044,267 @@ class MainWindow(QMainWindow):
             tarefas.addAction(self._act_pdf_simples)
         except Exception:
             pass
+
+    def sincronizar_xmls_interface(self):
+        """Sincroniza dados da interface com XMLs físicos.
+        Remove registros órfãos (sem XML correspondente)."""
+        try:
+            from pathlib import Path
+            import os
+            
+            # Confirma operação
+            reply = QMessageBox.question(
+                self,
+                "Sincronizar XMLs",
+                "Esta operação irá:\n\n"
+                "• Verificar todos os registros na interface\n"
+                "• Remover registros sem XML físico correspondente\n"
+                "• Verificar XMLs em pastas locais e banco de dados\n\n"
+                "Deseja continuar?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No
+            )
+            
+            if reply != QMessageBox.Yes:
+                return
+            
+            self.set_status("Sincronizando XMLs com interface...", 0)
+            QApplication.processEvents()
+            
+            # Estatísticas
+            total_registros = 0
+            registros_ok = 0
+            registros_removidos = 0
+            chaves_removidas = []
+            
+            # Carrega todos os registros do banco
+            with sqlite3.connect(str(DB_PATH)) as conn:
+                rows = conn.execute("SELECT chave, caminho_arquivo FROM xmls_baixados").fetchall()
+                total_registros = len(rows)
+                
+                for chave, caminho_arquivo in rows:
+                    xml_existe = False
+                    
+                    # Verifica se tem xml_completo no banco
+                    xml_completo = conn.execute(
+                        "SELECT xml_completo FROM xmls_baixados WHERE chave = ?",
+                        (chave,)
+                    ).fetchone()
+                    
+                    if xml_completo and xml_completo[0]:
+                        # XML armazenado no banco
+                        xml_existe = True
+                    elif caminho_arquivo:
+                        # Verifica se arquivo físico existe
+                        if os.path.exists(caminho_arquivo):
+                            xml_existe = True
+                    
+                    # Se não tem xml_completo nem arquivo, busca em pastas
+                    if not xml_existe:
+                        # Busca em pastas locais
+                        pastas = [
+                            DATA_DIR / "xmls",
+                            DATA_DIR / "xmls_chave",
+                            DATA_DIR / "xml_NFs",
+                            DATA_DIR / "xml_envio",
+                            DATA_DIR / "xml_extraidos",
+                            DATA_DIR / "xml_resposta_sefaz"
+                        ]
+                        
+                        for pasta in pastas:
+                            if not pasta.exists():
+                                continue
+                            
+                            # Busca por nome de arquivo contendo a chave
+                            for xml_file in pasta.rglob(f"*{chave}*.xml"):
+                                xml_existe = True
+                                break
+                            
+                            if xml_existe:
+                                break
+                    
+                    if xml_existe:
+                        registros_ok += 1
+                    else:
+                        # Remove registro órfão
+                        conn.execute("DELETE FROM xmls_baixados WHERE chave = ?", (chave,))
+                        registros_removidos += 1
+                        chaves_removidas.append(chave)
+                
+                conn.commit()
+            
+            # Mostra resumo
+            mensagem = f"✅ Sincronização concluída!\n\n"
+            mensagem += f"Total de registros: {total_registros}\n"
+            mensagem += f"✅ XMLs encontrados: {registros_ok}\n"
+            mensagem += f"❌ Registros removidos: {registros_removidos}\n"
+            
+            if chaves_removidas:
+                mensagem += f"\n📋 Chaves removidas (primeiras 10):\n"
+                for chave in chaves_removidas[:10]:
+                    mensagem += f"  • {chave[:8]}...{chave[-8:]}\n"
+                
+                if len(chaves_removidas) > 10:
+                    mensagem += f"  ... e mais {len(chaves_removidas) - 10} chaves\n"
+            
+            QMessageBox.information(self, "Sincronização Concluída", mensagem)
+            
+            # Atualiza interface
+            self.refresh_all()
+            
+        except Exception as e:
+            QMessageBox.critical(self, "Erro na Sincronização", f"Erro ao sincronizar XMLs: {e}")
+        finally:
+            self.set_status("Sincronização concluída", 3000)
+
+    def baixar_xmls_faltantes_por_chave(self):
+        """Baixa XMLs completos usando consulta por chave (sem erro 656).
+        Ideal para buscar XMLs que faltam quando tem bloqueio no NSU."""
+        try:
+            # Busca chaves sem XML completo
+            with sqlite3.connect(str(DB_PATH)) as conn:
+                # Busca chaves que não tem xml_completo e não tem arquivo
+                rows = conn.execute("""
+                    SELECT x.chave, c.cnpj, c.caminho_certificado, c.senha, c.cuf
+                    FROM xmls_baixados x
+                    JOIN certificados c ON x.informante = c.informante
+                    WHERE (x.xml_completo IS NULL OR x.xml_completo = '')
+                      AND (x.caminho_arquivo IS NULL OR x.caminho_arquivo = '')
+                    LIMIT 100
+                """).fetchall()
+                
+                total_faltantes = len(rows)
+            
+            if total_faltantes == 0:
+                QMessageBox.information(
+                    self,
+                    "XMLs Completos",
+                    "✅ Todos os registros já possuem XML completo!"
+                )
+                return
+            
+            # Confirma operação
+            reply = QMessageBox.question(
+                self,
+                "Baixar XMLs Faltantes",
+                f"Encontradas {total_faltantes} chaves sem XML completo.\n\n"
+                f"Esta operação irá:\n"
+                f"• Consultar cada chave individualmente na SEFAZ\n"
+                f"• Baixar XML completo usando consulta por chave\n"
+                f"• NÃO gera erro 656 (pode usar a qualquer momento)\n"
+                f"• Respeita limite de ~50 consultas/minuto\n\n"
+                f"⏱️ Tempo estimado: ~{(total_faltantes / 50):.0f}-{(total_faltantes / 40):.0f} minutos\n\n"
+                f"Deseja continuar?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No
+            )
+            
+            if reply != QMessageBox.Yes:
+                return
+            
+            # Importa função de consulta
+            import sys
+            sys.path.insert(0, str(BASE_DIR))
+            from nfe_search import consultar_nfe_por_chave
+            
+            # Progresso
+            from PyQt5.QtWidgets import QProgressDialog
+            progress = QProgressDialog(
+                "Baixando XMLs por chave...",
+                "Cancelar",
+                0,
+                total_faltantes,
+                self
+            )
+            progress.setWindowTitle("Baixando XMLs")
+            progress.setWindowModality(Qt.WindowModal)
+            progress.setMinimumDuration(0)
+            progress.setValue(0)
+            
+            sucessos = 0
+            falhas = 0
+            cancelado = False
+            
+            import time
+            
+            for idx, (chave, cnpj, cert_path, senha, cuf) in enumerate(rows):
+                if progress.wasCanceled():
+                    cancelado = True
+                    break
+                
+                try:
+                    progress.setLabelText(
+                        f"Baixando XML {idx + 1}/{total_faltantes}\n"
+                        f"Chave: ...{chave[-12:]}\n"
+                        f"✅ Sucessos: {sucessos} | ❌ Falhas: {falhas}"
+                    )
+                    progress.setValue(idx)
+                    QApplication.processEvents()
+                    
+                    # Consulta por chave (sem erro 656!)
+                    xml = consultar_nfe_por_chave(chave, cert_path, senha, cnpj, cuf)
+                    
+                    if xml:
+                        # Salva XML no banco
+                        with sqlite3.connect(str(DB_PATH)) as conn:
+                            conn.execute(
+                                "UPDATE xmls_baixados SET xml_completo = ? WHERE chave = ?",
+                                (xml, chave)
+                            )
+                            conn.commit()
+                        sucessos += 1
+                    else:
+                        falhas += 1
+                    
+                    # Rate limit: ~50 por minuto = 1.2 segundos entre requisições
+                    if (idx + 1) % 50 == 0:
+                        # A cada 50 requisições, aguarda 1 minuto
+                        for segundo in range(60, 0, -1):
+                            if progress.wasCanceled():
+                                cancelado = True
+                                break
+                            progress.setLabelText(
+                                f"⏸️ Rate limit: aguardando {segundo}s...\n"
+                                f"Processados: {idx + 1}/{total_faltantes}\n"
+                                f"✅ Sucessos: {sucessos} | ❌ Falhas: {falhas}"
+                            )
+                            QApplication.processEvents()
+                            time.sleep(1)
+                        
+                        if cancelado:
+                            break
+                    else:
+                        # Pequeno delay entre requisições
+                        time.sleep(1.2)
+                    
+                except Exception as e:
+                    print(f"Erro ao consultar chave {chave}: {e}")
+                    falhas += 1
+            
+            progress.setValue(total_faltantes)
+            progress.close()
+            
+            # Mostra resumo
+            if cancelado:
+                mensagem = f"⏸️ Operação cancelada!\n\n"
+            else:
+                mensagem = f"✅ Download concluído!\n\n"
+            
+            mensagem += f"Total processado: {idx + 1}/{total_faltantes}\n"
+            mensagem += f"✅ Sucessos: {sucessos}\n"
+            mensagem += f"❌ Falhas: {falhas}\n"
+            
+            if sucessos > 0:
+                mensagem += f"\n💾 {sucessos} XMLs salvos no banco de dados!"
+            
+            QMessageBox.information(self, "Download Concluído", mensagem)
+            
+            # Atualiza interface
+            if sucessos > 0:
+                self.refresh_all()
+            
+        except Exception as e:
+            QMessageBox.critical(self, "Erro", f"Erro ao baixar XMLs: {e}")
 
     def refresh_all(self):
         # Evita reentrância e trava de UI: carrega notas em thread
