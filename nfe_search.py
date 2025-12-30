@@ -1597,15 +1597,36 @@ class NFeService:
             logger.error("XML de distribuição não passou na validação XSD. Corrija antes de enviar.")
             return None
 
+        # 🌐 DEBUG HTTP: Informações da requisição SOAP
+        logger.info(f"🌐 [{self.informante}] HTTP REQUEST Distribuição:")
+        logger.info(f"   📍 URL: {URL_DISTRIBUICAO}")
+        logger.info(f"   🔐 Certificado: Configurado com PKCS12")
+        logger.info(f"   📦 Método: POST (SOAP)")
+        logger.info(f"   📋 Payload: distDFeInt (ultNSU={ult_nsu}, cUF={self.cuf})")
+        logger.info(f"   📏 Tamanho XML: {len(xml_envio)} bytes")
+
         try:
             resp = self.dist_client.service.nfeDistDFeInteresse(nfeDadosMsg=distInt)
+            
+            # 🌐 DEBUG HTTP: Informações da resposta
+            logger.info(f"✅ [{self.informante}] HTTP RESPONSE Distribuição recebida")
+            logger.info(f"   📊 Tipo: {type(resp).__name__}")
+            if hasattr(resp, '__dict__'):
+                logger.debug(f"   🔍 Atributos: {list(resp.__dict__.keys())[:5]}...")
+            
         except Fault as fault:
             logger.error(f"SOAP Fault Distribuição: {fault}")
+            logger.error(f"   ❌ Falha na comunicação SOAP")
             # 🔍 DEBUG: Salva erro SOAP
             save_debug_soap(self.informante, "fault", str(fault), prefixo="nfe_dist")
             return None
+        except Exception as e:
+            logger.error(f"❌ [{self.informante}] Erro HTTP na distribuição: {e}")
+            logger.exception(e)
+            return None
         
         xml_str = etree.tostring(resp, encoding='utf-8').decode()
+        logger.info(f"📥 [{self.informante}] Resposta processada: {len(xml_str)} bytes")
         logger.debug(f"Resposta Distribuição:\n{xml_str}")
         
         # 🔍 DEBUG: Salva XML recebido
@@ -1664,8 +1685,25 @@ class NFeService:
                 'Content-Type': 'application/soap+xml; charset=utf-8',
             }
             
+            # 🌐 DEBUG HTTP: Informações da requisição
+            logger.info(f"🌐 [{self.informante}] HTTP REQUEST Protocolo NF-e:")
+            logger.info(f"   📍 URL: {url}")
+            logger.info(f"   🔑 Chave: {chave}")
+            logger.info(f"   📦 Método: POST")
+            logger.info(f"   📋 Headers: {headers}")
+            logger.info(f"   📏 Tamanho SOAP: {len(soap_envelope)} bytes")
+            logger.info(f"   🔐 Certificado: PKCS12 via sessão requests")
+            
             # Usa a sessão que já tem o certificado configurado
             resp = self.dist_client.transport.session.post(url, data=soap_envelope.encode('utf-8'), headers=headers)
+            
+            # 🌐 DEBUG HTTP: Informações da resposta
+            logger.info(f"✅ [{self.informante}] HTTP RESPONSE Protocolo:")
+            logger.info(f"   📊 Status Code: {resp.status_code}")
+            logger.info(f"   📋 Headers: {dict(resp.headers)}")
+            logger.info(f"   📏 Tamanho: {len(resp.content)} bytes")
+            logger.info(f"   ⏱️ Tempo resposta: {resp.elapsed.total_seconds():.2f}s")
+            
             resp.raise_for_status()
             
             # 🔍 DEBUG: Salva SOAP response completo (raw)

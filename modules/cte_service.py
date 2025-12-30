@@ -137,20 +137,39 @@ class CTeService:
         # 🔍 DEBUG: Salva XML enviado
         save_debug_soap_cte(self.informante, "request", xml_envio, prefixo="cte_dist")
         
+        # 🌐 DEBUG HTTP: Informações da requisição SOAP CT-e
+        url_dist = URL_CTE_DISTRIBUICAO_PROD if self.ambiente == '1' else URL_CTE_DISTRIBUICAO_HOM
+        logger.info(f"🌐 [{self.informante}] HTTP REQUEST CT-e Distribuição:")
+        logger.info(f"   📍 URL: {url_dist}")
+        logger.info(f"   🔐 Certificado: Configurado com PKCS12")
+        logger.info(f"   📦 Método: POST (SOAP)")
+        logger.info(f"   📋 Payload: distDFeInt (ultNSU={ult_nsu}, cUF={self.cuf}, tpAmb={self.ambiente})")
+        logger.info(f"   📏 Tamanho XML: {len(xml_envio)} bytes")
+        
         # Envia requisição SOAP
         try:
             resp = self.dist_client.service.cteDistDFeInteresse(cteDadosMsg=distInt)
+            
+            # 🌐 DEBUG HTTP: Informações da resposta
+            logger.info(f"✅ [{self.informante}] HTTP RESPONSE CT-e Distribuição recebida")
+            logger.info(f"   📊 Tipo: {type(resp).__name__}")
+            if hasattr(resp, '__dict__'):
+                logger.debug(f"   🔍 Atributos: {list(resp.__dict__.keys())[:5]}...")
+            
         except Fault as fault:
             logger.error(f"SOAP Fault CTe Distribuição: {fault}")
+            logger.error(f"   ❌ Falha na comunicação SOAP CT-e")
             # 🔍 DEBUG: Salva erro SOAP
             save_debug_soap_cte(self.informante, "fault", str(fault), prefixo="cte_dist")
             return None
         except Exception as e:
-            logger.error(f"Erro ao consultar CTe: {e}")
+            logger.error(f"❌ [{self.informante}] Erro HTTP na distribuição CT-e: {e}")
+            logger.exception(e)
             return None
         
         # Converte resposta para XML
         xml_str = etree.tostring(resp, encoding='utf-8').decode()
+        logger.info(f"📥 [{self.informante}] Resposta CT-e processada: {len(xml_str)} bytes")
         logger.debug(f"Resposta CTe Distribuição (primeiros 500 chars):\n{xml_str[:500]}")
         
         # 🔍 DEBUG: Salva XML recebido
