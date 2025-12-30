@@ -9,7 +9,7 @@ import os
 # Determina o diretório de dados
 if getattr(sys, 'frozen', False):
     app_data = Path(os.environ.get('APPDATA', Path.home()))
-    data_dir = app_data / "BOT Busca NFE"
+    data_dir = app_data / "Busca XML"
 else:
     data_dir = Path(__file__).parent
 

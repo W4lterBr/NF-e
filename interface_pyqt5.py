@@ -69,7 +69,7 @@ def get_data_dir():
     if getattr(sys, 'frozen', False):
         # Usa AppData do usuário para dados persistentes
         app_data = Path(os.environ.get('APPDATA', Path.home()))
-        data_dir = app_data / "BOT Busca NFE"
+        data_dir = app_data / "Busca XML"
     else:
         # Desenvolvimento: usa pasta local
         data_dir = Path(__file__).parent
@@ -80,7 +80,7 @@ def get_data_dir():
     except Exception as e:
         print(f"AVISO: Não foi possível criar {data_dir}: {e}")
         # Fallback para pasta temporária
-        data_dir = Path(os.environ.get('TEMP', Path.home())) / "BOT Busca NFE"
+        data_dir = Path(os.environ.get('TEMP', Path.home())) / "Busca XML"
         data_dir.mkdir(parents=True, exist_ok=True)
     
     return data_dir

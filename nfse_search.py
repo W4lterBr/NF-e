@@ -183,7 +183,7 @@ def get_data_dir():
     """Retorna o diretório de dados do aplicativo."""
     if getattr(sys, 'frozen', False):
         app_data = Path(os.environ.get('APPDATA', Path.home()))
-        data_dir = app_data / "BOT Busca NFE"
+        data_dir = app_data / "Busca XML"
     else:
         data_dir = Path(__file__).parent
     
