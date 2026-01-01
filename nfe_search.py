@@ -845,8 +845,16 @@ def salvar_xml_por_certificado(xml, cnpj_cpf, pasta_base="xmls", nome_certificad
         nNF = nNF or "SEM_NUMERO"
         xNome = xNome or "SEM_NOME"
         
+        # Determina caminho absoluto para pasta base
+        # Se pasta_base for relativa (ex: "xmls"), usa BASE como raiz
+        # Se for absoluta (ex: "C:\Storage"), usa diretamente
+        if os.path.isabs(pasta_base):
+            pasta_base_abs = pasta_base
+        else:
+            pasta_base_abs = os.path.join(BASE, pasta_base)
+        
         # Cria pasta com tipo de documento
-        pasta_dest = os.path.join(pasta_base, pasta_certificado, ano_mes, tipo_pasta)
+        pasta_dest = os.path.join(pasta_base_abs, pasta_certificado, ano_mes, tipo_pasta)
         os.makedirs(pasta_dest, exist_ok=True)
 
         nome_arquivo = f"{sanitize_filename(nNF)}-{sanitize_filename(xNome)[:40]}.xml"
