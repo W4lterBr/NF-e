@@ -226,12 +226,10 @@ def run_search(progress_cb: Optional[Callable[[str], None]] = None) -> Dict[str,
 
 def safe_open_pdf(pdf_path: str) -> tuple[bool, str]:
     """
-    Abre PDF de forma segura, evitando abrir o próprio executável.
+    Abre PDF de forma segura, SEMPRE usando leitor explícito (NUNCA a associação do Windows).
     
     Retorna (sucesso: bool, mensagem_erro: str)
     """
-    import winreg
-    
     pdf_path = str(pdf_path)
     
     # Verifica se é realmente um PDF
@@ -241,59 +239,99 @@ def safe_open_pdf(pdf_path: str) -> tuple[bool, str]:
     if not os.path.exists(pdf_path):
         return False, f"PDF não encontrado: {pdf_path}"
     
-    # PROTEÇÃO: Verifica se o PDF está associado ao próprio executável
-    try:
-        # Obtém qual programa abre PDFs no Windows
-        with winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, r".pdf") as key:
-            prog_id = winreg.QueryValue(key, None)
-        
-        with winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, rf"{prog_id}\shell\open\command") as key:
-            command = winreg.QueryValue(key, None)
-        
-        # Se o comando contém o nome do nosso executável, NÃO usar associação padrão
-        exe_name = Path(sys.executable).stem.lower()  # "busca xml" ou "python"
-        if exe_name in command.lower() and "busca" in command.lower():
-            # PDF está associado ao nosso programa! Usar leitor alternativo
-            print(f"[AVISO] PDF associado ao executável! Usando leitor alternativo...")
-            
-            # Tenta abrir com Edge (padrão do Windows 10/11)
-            edge_path = r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"
-            if os.path.exists(edge_path):
+    print(f"[SAFE PDF] Abrindo PDF com leitor explícito: {pdf_path}")
+    
+    # ESTRATÉGIA: NUNCA usa associação do Windows (os.startfile)
+    # SEMPRE tenta abrir com programas explícitos na ordem de prioridade
+    
+    # 1. Tenta Microsoft Edge (vem pré-instalado no Windows 10/11)
+    edge_paths = [
+        r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+        r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+    ]
+    for edge_path in edge_paths:
+        if os.path.exists(edge_path):
+            try:
+                print(f"[SAFE PDF] Tentando Edge: {edge_path}")
                 subprocess.Popen([edge_path, "--app=" + pdf_path], 
                                creationflags=subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS)
+                print(f"[SAFE PDF] ✅ PDF aberto com Edge")
                 return True, ""
-            
-            # Se Edge não existe, tenta Acrobat Reader
-            adobe_paths = [
-                r"C:\Program Files\Adobe\Acrobat DC\Acrobat\Acrobat.exe",
-                r"C:\Program Files (x86)\Adobe\Acrobat Reader DC\Reader\AcroRd32.exe",
-                r"C:\Program Files\Adobe\Acrobat Reader DC\Reader\AcroRd32.exe",
-            ]
-            for adobe_path in adobe_paths:
-                if os.path.exists(adobe_path):
-                    subprocess.Popen([adobe_path, pdf_path],
-                                   creationflags=subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS)
-                    return True, ""
-            
-            # Último recurso: tenta forçar abertura no navegador
+            except Exception as e:
+                print(f"[SAFE PDF] ❌ Erro ao abrir com Edge: {e}")
+    
+    # 2. Tenta Adobe Acrobat Reader
+    adobe_paths = [
+        r"C:\Program Files\Adobe\Acrobat DC\Acrobat\Acrobat.exe",
+        r"C:\Program Files (x86)\Adobe\Acrobat Reader DC\Reader\AcroRd32.exe",
+        r"C:\Program Files\Adobe\Acrobat Reader DC\Reader\AcroRd32.exe",
+    ]
+    for adobe_path in adobe_paths:
+        if os.path.exists(adobe_path):
             try:
-                subprocess.Popen(['cmd', '/c', 'start', 'msedge', pdf_path],
-                               creationflags=subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS,
-                               shell=False)
+                print(f"[SAFE PDF] Tentando Adobe: {adobe_path}")
+                subprocess.Popen([adobe_path, pdf_path],
+                               creationflags=subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS)
+                print(f"[SAFE PDF] ✅ PDF aberto com Adobe")
                 return True, ""
-            except:
-                pass
+            except Exception as e:
+                print(f"[SAFE PDF] ❌ Erro ao abrir com Adobe: {e}")
     
-    except Exception as e:
-        # Se não conseguiu verificar associação, tenta abrir normalmente
-        print(f"[DEBUG] Não foi possível verificar associação: {e}")
+    # 3. Tenta Google Chrome
+    chrome_paths = [
+        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+    ]
+    for chrome_path in chrome_paths:
+        if os.path.exists(chrome_path):
+            try:
+                print(f"[SAFE PDF] Tentando Chrome: {chrome_path}")
+                subprocess.Popen([chrome_path, "--app=" + pdf_path],
+                               creationflags=subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS)
+                print(f"[SAFE PDF] ✅ PDF aberto com Chrome")
+                return True, ""
+            except Exception as e:
+                print(f"[SAFE PDF] ❌ Erro ao abrir com Chrome: {e}")
     
-    # Usa método padrão do Windows (seguro se não estiver associado ao executável)
+    # 4. Tenta Firefox
+    firefox_paths = [
+        r"C:\Program Files\Mozilla Firefox\firefox.exe",
+        r"C:\Program Files (x86)\Mozilla Firefox\firefox.exe",
+    ]
+    for firefox_path in firefox_paths:
+        if os.path.exists(firefox_path):
+            try:
+                print(f"[SAFE PDF] Tentando Firefox: {firefox_path}")
+                subprocess.Popen([firefox_path, pdf_path],
+                               creationflags=subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS)
+                print(f"[SAFE PDF] ✅ PDF aberto com Firefox")
+                return True, ""
+            except Exception as e:
+                print(f"[SAFE PDF] ❌ Erro ao abrir com Firefox: {e}")
+    
+    # 5. ÚLTIMO RECURSO: Usa ShellExecute do Windows com parâmetro "open"
+    # (mais seguro que os.startfile, mas ainda usa associação)
     try:
-        os.startfile(pdf_path)
-        return True, ""
+        print(f"[SAFE PDF] Tentando ShellExecute (último recurso)...")
+        import ctypes
+        # ShellExecuteW(hwnd, operation, file, params, dir, showcmd)
+        result = ctypes.windll.shell32.ShellExecuteW(None, "open", pdf_path, None, None, 1)
+        if result > 32:  # Valores > 32 indicam sucesso
+            print(f"[SAFE PDF] ✅ PDF aberto com ShellExecute")
+            return True, ""
+        else:
+            print(f"[SAFE PDF] ❌ ShellExecute falhou (código: {result})")
     except Exception as e:
-        return False, f"Erro ao abrir PDF: {str(e)}"
+        print(f"[SAFE PDF] ❌ Erro no ShellExecute: {e}")
+    
+    # Se chegou aqui, nada funcionou
+    error_msg = (
+        "Não foi possível abrir o PDF.\n\n"
+        "Nenhum leitor de PDF foi encontrado no sistema.\n"
+        "Por favor, instale o Microsoft Edge, Adobe Reader, Chrome ou Firefox."
+    )
+    print(f"[SAFE PDF] ❌ FALHA TOTAL: {error_msg}")
+    return False, error_msg
 
 
 def resolve_xml_text(item: Dict[str, Any]) -> Optional[str]:
