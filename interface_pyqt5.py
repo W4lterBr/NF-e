@@ -224,6 +224,78 @@ def run_search(progress_cb: Optional[Callable[[str], None]] = None) -> Dict[str,
         sys.stdout = old_stdout
 
 
+def safe_open_pdf(pdf_path: str) -> tuple[bool, str]:
+    """
+    Abre PDF de forma segura, evitando abrir o próprio executável.
+    
+    Retorna (sucesso: bool, mensagem_erro: str)
+    """
+    import winreg
+    
+    pdf_path = str(pdf_path)
+    
+    # Verifica se é realmente um PDF
+    if not pdf_path.lower().endswith('.pdf'):
+        return False, "Arquivo não é um PDF"
+    
+    if not os.path.exists(pdf_path):
+        return False, f"PDF não encontrado: {pdf_path}"
+    
+    # PROTEÇÃO: Verifica se o PDF está associado ao próprio executável
+    try:
+        # Obtém qual programa abre PDFs no Windows
+        with winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, r".pdf") as key:
+            prog_id = winreg.QueryValue(key, None)
+        
+        with winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, rf"{prog_id}\shell\open\command") as key:
+            command = winreg.QueryValue(key, None)
+        
+        # Se o comando contém o nome do nosso executável, NÃO usar associação padrão
+        exe_name = Path(sys.executable).stem.lower()  # "busca xml" ou "python"
+        if exe_name in command.lower() and "busca" in command.lower():
+            # PDF está associado ao nosso programa! Usar leitor alternativo
+            print(f"[AVISO] PDF associado ao executável! Usando leitor alternativo...")
+            
+            # Tenta abrir com Edge (padrão do Windows 10/11)
+            edge_path = r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"
+            if os.path.exists(edge_path):
+                subprocess.Popen([edge_path, "--app=" + pdf_path], 
+                               creationflags=subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS)
+                return True, ""
+            
+            # Se Edge não existe, tenta Acrobat Reader
+            adobe_paths = [
+                r"C:\Program Files\Adobe\Acrobat DC\Acrobat\Acrobat.exe",
+                r"C:\Program Files (x86)\Adobe\Acrobat Reader DC\Reader\AcroRd32.exe",
+                r"C:\Program Files\Adobe\Acrobat Reader DC\Reader\AcroRd32.exe",
+            ]
+            for adobe_path in adobe_paths:
+                if os.path.exists(adobe_path):
+                    subprocess.Popen([adobe_path, pdf_path],
+                                   creationflags=subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS)
+                    return True, ""
+            
+            # Último recurso: tenta forçar abertura no navegador
+            try:
+                subprocess.Popen(['cmd', '/c', 'start', 'msedge', pdf_path],
+                               creationflags=subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS,
+                               shell=False)
+                return True, ""
+            except:
+                pass
+    
+    except Exception as e:
+        # Se não conseguiu verificar associação, tenta abrir normalmente
+        print(f"[DEBUG] Não foi possível verificar associação: {e}")
+    
+    # Usa método padrão do Windows (seguro se não estiver associado ao executável)
+    try:
+        os.startfile(pdf_path)
+        return True, ""
+    except Exception as e:
+        return False, f"Erro ao abrir PDF: {str(e)}"
+
+
 def resolve_xml_text(item: Dict[str, Any]) -> Optional[str]:
     try:
         chave = (item.get("chave") or "").strip()
@@ -2986,8 +3058,10 @@ class MainWindow(QMainWindow):
                     print(f"[DEBUG PDF] ⚡ Cache hit! Tempo: {time.time() - cache_start:.3f}s")
                     pdf_str = str(cached_pdf.absolute())
                     if sys.platform == "win32":
-                        # Usa os.startfile que é mais seguro e respeita associações do Windows
-                        os.startfile(pdf_str)
+                        # Usa safe_open_pdf para evitar abrir o próprio executável
+                        success, error = safe_open_pdf(pdf_str)
+                        if not success:
+                            raise Exception(error)
                     else:
                         subprocess.Popen(["xdg-open", pdf_str])
                     total_time = time.time() - start_time
@@ -3121,8 +3195,10 @@ class MainWindow(QMainWindow):
                 
                 pdf_str = str(pdf_path.absolute())
                 if sys.platform == "win32":
-                    # Usa os.startfile que é mais seguro e respeita associações do Windows
-                    os.startfile(pdf_str)
+                    # Usa safe_open_pdf para evitar abrir o próprio executável
+                    success, error = safe_open_pdf(pdf_str)
+                    if not success:
+                        raise Exception(error)
                 else:
                     subprocess.Popen(["xdg-open", pdf_str])
                 print(f"[DEBUG PDF] Etapa 4 concluída em {time.time() - open_start:.3f}s")
@@ -3182,8 +3258,10 @@ class MainWindow(QMainWindow):
                     print(f"[DEBUG PDF EMITIDOS] ⚡ Cache hit! Tempo: {time.time() - cache_start:.3f}s")
                     pdf_str = str(cached_pdf.absolute())
                     if sys.platform == "win32":
-                        # Usa os.startfile que é mais seguro e respeita associações do Windows
-                        os.startfile(pdf_str)
+                        # Usa safe_open_pdf para evitar abrir o próprio executável
+                        success, error = safe_open_pdf(pdf_str)
+                        if not success:
+                            raise Exception(error)
                     else:
                         subprocess.Popen(["xdg-open", pdf_str])
                     total_time = time.time() - start_time
@@ -3320,8 +3398,10 @@ class MainWindow(QMainWindow):
                 
                 pdf_str = str(pdf_path.absolute())
                 if sys.platform == "win32":
-                    # Usa os.startfile que é mais seguro e respeita associações do Windows
-                    os.startfile(pdf_str)
+                    # Usa safe_open_pdf para evitar abrir o próprio executável
+                    success, error = safe_open_pdf(pdf_str)
+                    if not success:
+                        raise Exception(error)
                 else:
                     subprocess.Popen(["xdg-open", pdf_str])
                 print(f"[DEBUG PDF EMITIDOS] Etapa 4 concluída em {time.time() - open_start:.3f}s")
@@ -3514,8 +3594,10 @@ class MainWindow(QMainWindow):
                 pdf_path = result.get("pdf_path")
                 try:
                     if sys.platform == "win32":
-                        # Usa os.startfile que é mais seguro e respeita associações do Windows
-                        os.startfile(pdf_path)
+                        # Usa safe_open_pdf para evitar abrir o próprio executável
+                        success, error = safe_open_pdf(pdf_path)
+                        if not success:
+                            raise Exception(error)
                     else:
                         subprocess.Popen(["xdg-open", pdf_path])
                     self.set_status("✅ PDF gerado e aberto com sucesso!", 2000)
