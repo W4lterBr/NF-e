@@ -309,26 +309,18 @@ def safe_open_pdf(pdf_path: str) -> tuple[bool, str]:
             except Exception as e:
                 print(f"[SAFE PDF] ❌ Erro ao abrir com Firefox: {e}")
     
-    # 5. ÚLTIMO RECURSO: Usa ShellExecute do Windows com parâmetro "open"
-    # (mais seguro que os.startfile, mas ainda usa associação)
-    try:
-        print(f"[SAFE PDF] Tentando ShellExecute (último recurso)...")
-        import ctypes
-        # ShellExecuteW(hwnd, operation, file, params, dir, showcmd)
-        result = ctypes.windll.shell32.ShellExecuteW(None, "open", pdf_path, None, None, 1)
-        if result > 32:  # Valores > 32 indicam sucesso
-            print(f"[SAFE PDF] ✅ PDF aberto com ShellExecute")
-            return True, ""
-        else:
-            print(f"[SAFE PDF] ❌ ShellExecute falhou (código: {result})")
-    except Exception as e:
-        print(f"[SAFE PDF] ❌ Erro no ShellExecute: {e}")
-    
-    # Se chegou aqui, nada funcionou
+    # Se chegou aqui, nenhum leitor explícito foi encontrado
+    # NÃO usa ShellExecute ou os.startfile para evitar abrir o próprio executável
     error_msg = (
-        "Não foi possível abrir o PDF.\n\n"
-        "Nenhum leitor de PDF foi encontrado no sistema.\n"
-        "Por favor, instale o Microsoft Edge, Adobe Reader, Chrome ou Firefox."
+        "❌ Nenhum leitor de PDF foi encontrado!\n\n"
+        "O sistema tentou abrir o PDF com:\n"
+        "• Microsoft Edge (recomendado)\n"
+        "• Adobe Acrobat Reader\n"
+        "• Google Chrome\n"
+        "• Mozilla Firefox\n\n"
+        "Por favor, instale pelo menos um desses programas.\n\n"
+        "IMPORTANTE: O Windows 10/11 já vem com o Edge instalado.\n"
+        "Se você está vendo este erro, pode ser necessário reinstalá-lo."
     )
     print(f"[SAFE PDF] ❌ FALHA TOTAL: {error_msg}")
     return False, error_msg
@@ -3190,36 +3182,8 @@ class MainWindow(QMainWindow):
         
         print(f"[DEBUG PDF] Etapa 3 concluída em {time.time() - recursive_start:.3f}s")
         
-        # Etapa 3.5: Se ainda não encontrou, busca pelo XML e depois o PDF (estrutura número-nome)
-        if not pdf_path and chave and informante:
-            print(f"[DEBUG PDF] Etapa 3.5: Busca por XML contendo a chave...")
-            xml_search_start = time.time()
-            try:
-                xmls_root = DATA_DIR / "xmls" / informante
-                if xmls_root.exists():
-                    # Busca recursiva por XML que contenha a chave
-                    xml_found = None
-                    for xml_file in xmls_root.rglob("*.xml"):
-                        try:
-                            xml_content = xml_file.read_text(encoding='utf-8', errors='ignore')
-                            if chave in xml_content:
-                                xml_found = xml_file
-                                print(f"[DEBUG PDF] ✅ XML encontrado: {xml_file}")
-                                break
-                        except:
-                            continue
-                    
-                    if xml_found:
-                        # Verifica se existe PDF com mesmo nome
-                        pdf_candidate = xml_found.with_suffix('.pdf')
-                        if pdf_candidate.exists():
-                            print(f"[DEBUG PDF] ✅ PDF encontrado via XML: {pdf_candidate}")
-                            pdf_path = pdf_candidate
-                        else:
-                            print(f"[DEBUG PDF] ❌ PDF não encontrado no mesmo local do XML")
-            except Exception as e:
-                print(f"[DEBUG PDF] Erro na busca por XML: {e}")
-            print(f"[DEBUG PDF] Etapa 3.5 concluída em {time.time() - xml_search_start:.3f}s")
+        # Etapa 3.5 REMOVIDA: Busca por XML lendo conteúdo era MUITO LENTA
+        # Se não encontrou o PDF nas etapas anteriores, vai direto para geração
         
         # Se PDF existe, abre imediatamente e adiciona ao cache
         print(f"[DEBUG PDF] Etapa 4: Abertura do PDF...")
