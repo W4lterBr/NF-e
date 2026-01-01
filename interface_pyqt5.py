@@ -3135,35 +3135,17 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(self, "Erro ao abrir PDF", f"Erro: {e}")
                 return
         
-        # Se não tem PDF, verifica se tem XML antes de gerar
-        print(f"[DEBUG PDF] Etapa 5: Verificando XML antes de gerar PDF...")
-        xml_check_start = time.time()
-        
-        # Busca o XML localmente primeiro
-        xml_text = resolve_xml_text(item)
-        if not xml_text:
-            print(f"[DEBUG PDF] ❌ XML não encontrado localmente")
-            QMessageBox.warning(
-                self, 
-                "XML não encontrado", 
-                f"Não foi possível encontrar o XML para a chave {chave}.\n\n"
-                "O PDF só pode ser gerado se o XML estiver disponível."
-            )
-            return
-        
-        print(f"[DEBUG PDF] ✅ XML encontrado, iniciando geração de PDF...")
-        print(f"[DEBUG PDF] Etapa 5 concluída em {time.time() - xml_check_start:.3f}s")
-        
-        # Tem XML, pode gerar PDF (LENTO) - executa em thread separada
-        print(f"[DEBUG PDF] Etapa 6: Geração de PDF necessária...")
-        generation_start = time.time()
-        self.set_status("⏳ Gerando PDF... Por favor aguarde...")
+        # Se não tem PDF, gera de forma assíncrona (busca XML + gera PDF em thread separada)
+        print(f"[DEBUG PDF] PDF não encontrado - iniciando geração assíncrona...")
+        self.set_status("⏳ Buscando XML e gerando PDF... Por favor aguarde...")
         QApplication.processEvents()
         
-        # Cria worker thread para não travar a interface
-        print(f"[DEBUG PDF] Criando worker thread para geração assíncrona...")
+        # Cria worker thread que buscará o XML e gerará o PDF sem travar a interface
+        print(f"[DEBUG PDF] Criando worker thread para busca de XML e geração de PDF...")
         self._process_pdf_async(item)
-        print(f"[DEBUG PDF] Worker criado - aguardando conclusão em background")
+        print(f"[DEBUG PDF] Worker criado - processamento em background")
+        total_time = time.time() - start_time
+        print(f"[DEBUG PDF] ✅ Worker iniciado em {total_time:.3f}s (interface não travada)")
         print(f"[DEBUG PDF] ========================================\n")
     
     def _on_table_emitidos_double_clicked(self, row: int, col: int):
@@ -3352,35 +3334,17 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(self, "Erro ao abrir PDF", f"Erro: {e}")
                 return
         
-        # Se não tem PDF, verifica se tem XML antes de gerar
-        print(f"[DEBUG PDF EMITIDOS] Etapa 5: Verificando XML antes de gerar PDF...")
-        xml_check_start = time.time()
-        
-        # Busca o XML localmente primeiro
-        xml_text = resolve_xml_text(item)
-        if not xml_text:
-            print(f"[DEBUG PDF EMITIDOS] ❌ XML não encontrado localmente")
-            QMessageBox.warning(
-                self, 
-                "XML não encontrado", 
-                f"Não foi possível encontrar o XML para a chave {chave}.\n\n"
-                "O PDF só pode ser gerado se o XML estiver disponível."
-            )
-            return
-        
-        print(f"[DEBUG PDF EMITIDOS] ✅ XML encontrado, iniciando geração de PDF...")
-        print(f"[DEBUG PDF EMITIDOS] Etapa 5 concluída em {time.time() - xml_check_start:.3f}s")
-        
-        # Tem XML, pode gerar PDF (LENTO) - executa em thread separada
-        print(f"[DEBUG PDF EMITIDOS] Etapa 6: Geração de PDF necessária...")
-        generation_start = time.time()
-        self.set_status("⏳ Gerando PDF... Por favor aguarde...")
+        # Se não tem PDF, gera de forma assíncrona (busca XML + gera PDF em thread separada)
+        print(f"[DEBUG PDF EMITIDOS] PDF não encontrado - iniciando geração assíncrona...")
+        self.set_status("⏳ Buscando XML e gerando PDF... Por favor aguarde...")
         QApplication.processEvents()
         
-        # Cria worker thread para não travar a interface
-        print(f"[DEBUG PDF EMITIDOS] Criando worker thread para geração assíncrona...")
+        # Cria worker thread que buscará o XML e gerará o PDF sem travar a interface
+        print(f"[DEBUG PDF EMITIDOS] Criando worker thread para busca de XML e geração de PDF...")
         self._process_pdf_async(item)
-        print(f"[DEBUG PDF EMITIDOS] Worker criado - aguardando conclusão em background")
+        print(f"[DEBUG PDF EMITIDOS] Worker criado - processamento em background")
+        total_time = time.time() - start_time
+        print(f"[DEBUG PDF EMITIDOS] ✅ Worker iniciado em {total_time:.3f}s (interface não travada)")
         print(f"[DEBUG PDF EMITIDOS] ========================================\n")
     
     def _process_pdf_async(self, item: Dict[str, Any]):

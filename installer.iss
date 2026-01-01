@@ -2,7 +2,7 @@
 ; Gera instalador profissional para Windows
 
 #define MyAppName "Busca XML"
-#define MyAppVersion "1.0.53"
+#define MyAppVersion "1.0.54"
 #define MyAppPublisher "DWM System Developer"
 #define MyAppURL "https://dwmsystems.up.railway.app/"
 #define MyAppExeName "Busca XML.exe"
