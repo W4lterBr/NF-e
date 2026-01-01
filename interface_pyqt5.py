@@ -247,6 +247,40 @@ def resolve_xml_text(item: Dict[str, Any]) -> Optional[str]:
                         print(f"[DEBUG XML] ⚠️ Erro ao ler arquivo: {e}")
         
         print(f"[DEBUG XML] Buscando XML nas pastas locais para chave: {chave}")
+        
+        # Busca prioritária: pasta xmls organizada por informante/tipo
+        # Estrutura: xmls/[informante]/[ano-mes]/[NFe|CTe|Resumos|Eventos]/
+        try:
+            informante = item.get('informante', '')
+            if informante:
+                informante_digits = ''.join(ch for ch in str(informante) if ch.isdigit())
+                if informante_digits:
+                    # Busca na estrutura organizada do nfe_search.py
+                    xmls_informante = DATA_DIR / "xmls" / informante_digits
+                    if xmls_informante.exists():
+                        print(f"[DEBUG XML] Buscando em estrutura organizada: {xmls_informante}")
+                        # Busca em todas as subpastas (ano-mes/tipo)
+                        for xml_file in xmls_informante.rglob(f"*{chave}*.xml"):
+                            try:
+                                print(f"[DEBUG XML] ✅ XML encontrado em estrutura organizada: {xml_file}")
+                                return xml_file.read_text(encoding="utf-8", errors="ignore")
+                            except Exception:
+                                continue
+                        
+                        # Busca pelo conteúdo (mais lento, mas garante encontrar)
+                        print(f"[DEBUG XML] Buscando por conteúdo na estrutura organizada...")
+                        for xml_file in xmls_informante.rglob("*.xml"):
+                            try:
+                                content = xml_file.read_text(encoding="utf-8", errors="ignore")
+                                if chave in content:
+                                    print(f"[DEBUG XML] ✅ XML encontrado por conteúdo: {xml_file}")
+                                    return content
+                            except Exception:
+                                continue
+        except Exception as e:
+            print(f"[DEBUG XML] ⚠️ Erro na busca organizada: {e}")
+        
+        # Busca alternativa: pastas antigas/legadas
         roots = [
             DATA_DIR / "xmls",
             DATA_DIR / "xmls_chave",
