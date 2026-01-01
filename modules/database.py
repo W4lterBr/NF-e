@@ -81,9 +81,17 @@ class DatabaseManager:
                 xml_completo TEXT,
                 baixado_em TEXT
             )''')
-            # Migração: adicionar coluna xml_completo se não existir
+            # Migração: adicionar colunas se não existirem
             try:
                 conn.execute("ALTER TABLE xmls_baixados ADD COLUMN xml_completo TEXT")
+            except:
+                pass  # Coluna já existe
+            try:
+                conn.execute("ALTER TABLE xmls_baixados ADD COLUMN caminho_arquivo TEXT")
+            except:
+                pass  # Coluna já existe
+            try:
+                conn.execute("ALTER TABLE xmls_baixados ADD COLUMN baixado_em TEXT")
             except:
                 pass  # Coluna já existe
             conn.execute('''CREATE TABLE IF NOT EXISTS nf_status (
