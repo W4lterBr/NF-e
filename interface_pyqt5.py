@@ -2036,30 +2036,18 @@ class MainWindow(QMainWindow):
         self.table.setItem(r, 8, cell(it.get("nome_emitente")))
         self.table.setItem(r, 9, cell(it.get("natureza")))
         self.table.setItem(r,10, cell(self._codigo_uf_to_sigla(it.get("uf") or "")))
-        # Coluna Base ICMS - ordenação numérica
-        base_icms_text = it.get("base_icms") or ""
-        base_icms_num = 0.0
-        try:
-            # Remove "R$ " e converte formato brasileiro para float
-            base_clean = str(base_icms_text).replace("R$", "").replace(".", "").replace(",", ".").strip()
-            if base_clean:
-                base_icms_num = float(base_clean)
-        except Exception:
-            pass
-        c_base = NumericTableWidgetItem(base_icms_text, base_icms_num)
+        
+        # Coluna Base ICMS - ordenação numérica com formatação BR
+        base_icms_raw = it.get("base_icms")
+        base_icms_formatado, base_icms_num = self._parse_valor(base_icms_raw)
+        c_base = NumericTableWidgetItem(base_icms_formatado, base_icms_num)
         c_base.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
         self.table.setItem(r,11, c_base)
-        # Coluna Valor ICMS - ordenação numérica
-        valor_icms_text = it.get("valor_icms") or ""
-        valor_icms_num = 0.0
-        try:
-            # Remove "R$ " e converte formato brasileiro para float
-            icms_clean = str(valor_icms_text).replace("R$", "").replace(".", "").replace(",", ".").strip()
-            if icms_clean:
-                valor_icms_num = float(icms_clean)
-        except Exception:
-            pass
-        c_icms = NumericTableWidgetItem(valor_icms_text, valor_icms_num)
+        
+        # Coluna Valor ICMS - ordenação numérica com formatação BR
+        valor_icms_raw = it.get("valor_icms")
+        valor_icms_formatado, valor_icms_num = self._parse_valor(valor_icms_raw)
+        c_icms = NumericTableWidgetItem(valor_icms_formatado, valor_icms_num)
         c_icms.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
         self.table.setItem(r,12, c_icms)
         self.table.setItem(r,13, cell(it.get("cfop")))
@@ -2177,29 +2165,17 @@ class MainWindow(QMainWindow):
         self.table_emitidos.setItem(r, 9, cell(it.get("natureza")))
         self.table_emitidos.setItem(r,10, cell(self._codigo_uf_to_sigla(it.get("uf") or "")))
         
-        # Coluna Base ICMS - ordenação numérica
-        base_icms_text = it.get("base_icms") or ""
-        base_icms_num = 0.0
-        try:
-            base_clean = str(base_icms_text).replace("R$", "").replace(".", "").replace(",", ".").strip()
-            if base_clean:
-                base_icms_num = float(base_clean)
-        except Exception:
-            pass
-        c_base = NumericTableWidgetItem(base_icms_text, base_icms_num)
+        # Coluna Base ICMS - ordenação numérica com formatação BR
+        base_icms_raw = it.get("base_icms")
+        base_icms_formatado, base_icms_num = self._parse_valor(base_icms_raw)
+        c_base = NumericTableWidgetItem(base_icms_formatado, base_icms_num)
         c_base.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
         self.table_emitidos.setItem(r,11, c_base)
         
-        # Coluna Valor ICMS - ordenação numérica
-        valor_icms_text = it.get("valor_icms") or ""
-        valor_icms_num = 0.0
-        try:
-            icms_clean = str(valor_icms_text).replace("R$", "").replace(".", "").replace(",", ".").strip()
-            if icms_clean:
-                valor_icms_num = float(icms_clean)
-        except Exception:
-            pass
-        c_icms = NumericTableWidgetItem(valor_icms_text, valor_icms_num)
+        # Coluna Valor ICMS - ordenação numérica com formatação BR
+        valor_icms_raw = it.get("valor_icms")
+        valor_icms_formatado, valor_icms_num = self._parse_valor(valor_icms_raw)
+        c_icms = NumericTableWidgetItem(valor_icms_formatado, valor_icms_num)
         c_icms.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
         self.table_emitidos.setItem(r,12, c_icms)
         
