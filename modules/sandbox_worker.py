@@ -71,8 +71,24 @@ def run_task(task_name: str, payload: Dict[str, Any], timeout: int = 240) -> Dic
                     python_exe = str(py_path)
                     break
             else:
-                # Última tentativa: usar 'python' do PATH
-                python_exe = "python"
+                # Última tentativa: buscar python.exe no PATH usando shutil.which
+                import shutil
+                found_python = shutil.which("python.exe") or shutil.which("python3.exe")
+                if found_python and Path(found_python).exists():
+                    # Verifica se não é o próprio executável
+                    if not found_python.lower().endswith(Path(sys.executable).name.lower()):
+                        python_exe = found_python
+                    else:
+                        # Se o which encontrou o próprio exe, erro crítico
+                        raise RuntimeError(
+                            "ERRO: Python não encontrado no sistema. "
+                            "Instale Python 3.10 ou superior para usar este recurso."
+                        )
+                else:
+                    raise RuntimeError(
+                        "ERRO: Python não encontrado no sistema. "
+                        "Instale Python 3.10 ou superior para usar este recurso."
+                    )
         
         proc = subprocess.Popen(
             [python_exe, "-u", str(worker_script)],
