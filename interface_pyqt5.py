@@ -49,19 +49,26 @@ class NumericTableWidgetItem(QTableWidgetItem):
 class CenterIconDelegate(QStyledItemDelegate):
     """Delegate que centraliza ícones em células"""
     def paint(self, painter, option, index):
-        if index.column() in (0, 6):  # XML e Status
-            # Força centralização do ícone
-            option.decorationAlignment = Qt.AlignCenter
-            option.decorationPosition = QStyleOptionViewItem.Top
-            option.displayAlignment = Qt.AlignCenter
-        super().paint(painter, option, index)
+        if index.column() == 0:  # Apenas coluna XML
+            # Desenha o fundo
+            painter.fillRect(option.rect, option.backgroundBrush)
+            
+            # Tamanho do ícone (definido antes para ser usado depois)
+            icon_size = 20
+            
+            # Pega o ícone
+            icon = index.data(Qt.DecorationRole)
+            if icon and not icon.isNull():
+                # Calcula posição centralizada
+                x = option.rect.x() + (option.rect.width() - icon_size) // 2
+                y = option.rect.y() + (option.rect.height() - icon_size) // 2
+                # Desenha o ícone centralizado
+                icon.paint(painter, x, y, icon_size, icon_size)
+        else:
+            super().paint(painter, option, index)
     
     def initStyleOption(self, option, index):
         super().initStyleOption(option, index)
-        # Força alinhamento centralizado para XML e Status
-        if index.column() in (0, 6):
-            option.decorationAlignment = Qt.AlignCenter
-            option.displayAlignment = Qt.AlignCenter
 
 def get_data_dir():
     """Retorna o diretório de dados do aplicativo (AppData para compilados, local para dev)."""
@@ -505,7 +512,7 @@ class MainWindow(QMainWindow):
         tab1_layout = QVBoxLayout(tab1)
         self.table = QTableWidget()
         headers = [
-            "XML","Num","D/Emit","Tipo","Valor","Venc.","Status",
+            "XML","Num","D/Emit","Tipo","Valor","Venc.",
             "Emissor CNPJ","Emissor Nome","Natureza","UF","Base ICMS",
             "Valor ICMS","CFOP","NCM","Tomador IE","Chave"
         ]
@@ -519,7 +526,6 @@ class MainWindow(QMainWindow):
         self.table.horizontalHeader().setDefaultAlignment(Qt.AlignCenter)
         # Aplica delegate para centralizar ícones
         self.table.setItemDelegateForColumn(0, CenterIconDelegate(self.table))
-        self.table.setItemDelegateForColumn(6, CenterIconDelegate(self.table))  # Status também
         # Menu de contexto para buscar XML completo
         self.table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self._on_table_context_menu)
@@ -540,16 +546,9 @@ class MainWindow(QMainWindow):
             hh.setStretchLastSection(False)
         except Exception:
             pass
-        # Column sizing to approximate the desired layout
+        # Colunas fixas para ícones, demais auto-ajustáveis
         try:
-            self.table.setColumnWidth(0, 50)  # XML - ajustado para ícone
-            self.table.setColumnWidth(1, 80)
-            self.table.setColumnWidth(2, 92)
-            self.table.setColumnWidth(4, 100)
-            self.table.setColumnWidth(5, 92)
-            self.table.setColumnWidth(6, 50)  # Status - ajustado para ícone
-            self.table.setColumnWidth(7, 130)
-            # Column 8 (Emissor Nome) no longer stretches during fill
+            self.table.setColumnWidth(0, 50)  # XML - ícone fixo
         except Exception:
             pass
         tab1_layout.addWidget(self.table)
@@ -562,7 +561,7 @@ class MainWindow(QMainWindow):
         # Cria tabela para notas emitidas pela empresa
         self.table_emitidos = QTableWidget()
         headers_emitidos = [
-            "XML","Num","D/Emit","Tipo","Valor","Venc.","Status",
+            "XML","Num","D/Emit","Tipo","Valor","Venc.",
             "Destinatário CNPJ","Destinatário Nome","Natureza","UF","Base ICMS",
             "Valor ICMS","CFOP","NCM","Tomador IE","Chave"
         ]
@@ -573,7 +572,6 @@ class MainWindow(QMainWindow):
         self.table_emitidos.setSortingEnabled(True)
         self.table_emitidos.horizontalHeader().setDefaultAlignment(Qt.AlignCenter)
         self.table_emitidos.setItemDelegateForColumn(0, CenterIconDelegate(self.table_emitidos))
-        self.table_emitidos.setItemDelegateForColumn(6, CenterIconDelegate(self.table_emitidos))
         self.table_emitidos.setContextMenuPolicy(Qt.CustomContextMenu)
         self.table_emitidos.customContextMenuRequested.connect(self._on_table_emitidos_context_menu)
         self.table_emitidos.cellDoubleClicked.connect(self._on_table_emitidos_double_clicked)
@@ -584,13 +582,8 @@ class MainWindow(QMainWindow):
             hh_emitidos = self.table_emitidos.horizontalHeader()
             hh_emitidos.setSectionResizeMode(QHeaderView.Interactive)
             hh_emitidos.setStretchLastSection(False)
-            self.table_emitidos.setColumnWidth(0, 50)
-            self.table_emitidos.setColumnWidth(1, 80)
-            self.table_emitidos.setColumnWidth(2, 92)
-            self.table_emitidos.setColumnWidth(4, 100)
-            self.table_emitidos.setColumnWidth(5, 92)
-            self.table_emitidos.setColumnWidth(6, 50)
-            self.table_emitidos.setColumnWidth(7, 130)
+            # Apenas coluna XML fixa, demais auto-ajustáveis
+            self.table_emitidos.setColumnWidth(0, 50)  # XML - ícone fixo
         except Exception:
             pass
         
@@ -1875,6 +1868,99 @@ class MainWindow(QMainWindow):
         }
         return codigo_to_uf.get(str(codigo).strip(), codigo)
     
+    def _verificar_notas_cinza(self):
+        """Verifica automaticamente notas com status cinza (RESUMO) e busca XML completo."""
+        try:
+            # Busca notas com status RESUMO
+            notas_resumo = [nota for nota in self.notes if (nota.get('xml_status') or '').upper() == 'RESUMO']
+            
+            if not notas_resumo:
+                return  # Nenhuma nota com RESUMO
+            
+            print(f"[AUTO-VERIFICAÇÃO] Encontradas {len(notas_resumo)} notas com status RESUMO (cinza)")
+            self.set_status(f"🔍 Verificando {len(notas_resumo)} notas com status cinza...", 0)
+            
+            # Busca XML completo de cada nota em background
+            for idx, nota in enumerate(notas_resumo, 1):
+                # Delay progressivo para não sobrecarregar
+                delay = idx * 2000  # 2 segundos entre cada busca
+                QTimer.singleShot(delay, lambda n=nota: self._buscar_xml_completo_silencioso(n))
+            
+        except Exception as e:
+            print(f"[ERRO] Erro ao verificar notas cinza: {e}")
+    
+    def _buscar_xml_completo_silencioso(self, item):
+        """Busca XML completo em background sem mostrar diálogos."""
+        try:
+            chave = item.get('chave')
+            if not chave:
+                return
+            
+            print(f"[AUTO-VERIFICAÇÃO] Buscando XML completo para chave: {chave}")
+            
+            # Usa a mesma lógica de _buscar_xml_completo mas sem diálogos
+            from modules.sandbox_task import run_task as sandbox_run_task
+            
+            certs = self.db.load_certificates()
+            if not certs:
+                return
+            
+            # Tenta com cada certificado
+            for cert in certs:
+                payload = {
+                    'cert': {
+                        'path': cert.get('caminho') or '',
+                        'senha': cert.get('senha') or '',
+                        'cnpj': cert.get('cnpj_cpf') or '',
+                        'cuf': cert.get('cUF_autor') or ''
+                    },
+                    'chave': chave,
+                    'prefer': ['nfeProc', 'NFe']
+                }
+                
+                try:
+                    result = sandbox_run_task('fetch_by_chave', payload, timeout=30)
+                    
+                    if result.get('ok') and result.get('data', {}).get('xml'):
+                        xml_text = result['data']['xml']
+                        
+                        # Salva XML
+                        informante = item.get('informante') or cert.get('cnpj_cpf')
+                        tipo = (item.get('tipo') or 'NFe').strip().upper().replace('-', '')
+                        data_emissao = (item.get('data_emissao') or '')[:10]
+                        
+                        if data_emissao and len(data_emissao) >= 7:
+                            year_month = data_emissao[:7]
+                        else:
+                            from datetime import datetime
+                            year_month = datetime.now().strftime("%Y-%m")
+                        
+                        xmls_root = DATA_DIR / "xmls" / informante / tipo / year_month
+                        xmls_root.mkdir(parents=True, exist_ok=True)
+                        xml_file = xmls_root / f"{chave}.xml"
+                        xml_file.write_text(xml_text, encoding='utf-8')
+                        
+                        # Atualiza banco
+                        self.db.register_xml_download(chave, str(xml_file), informante)
+                        self.db.save_note({
+                            'chave': chave,
+                            'xml_status': 'COMPLETO',
+                            'informante': informante
+                        })
+                        
+                        print(f"[AUTO-VERIFICAÇÃO] ✅ XML completo salvo: {chave}")
+                        
+                        # Atualiza interface
+                        QTimer.singleShot(100, self.refresh_all)
+                        break  # Sucesso, não precisa tentar outros certificados
+                        
+                except Exception as e:
+                    print(f"[AUTO-VERIFICAÇÃO] Erro ao buscar com certificado {cert.get('cnpj_cpf')}: {e}")
+                    continue
+                    
+        except Exception as e:
+            print(f"[ERRO] Erro em _buscar_xml_completo_silencioso: {e}")
+    
     def refresh_table(self):
         # Stop any ongoing fill
         try:
@@ -1941,6 +2027,13 @@ class MainWindow(QMainWindow):
             for r, it in enumerate(items):
                 self._populate_emitidos_row(r, it)
             
+            # Auto-ajusta largura das colunas ao conteúdo (exceto XML que é fixo)
+            try:
+                for col in range(1, self.table_emitidos.columnCount()):
+                    self.table_emitidos.resizeColumnToContents(col)
+            except Exception:
+                pass
+            
             try:
                 self.table_emitidos.setSortingEnabled(sorting_enabled)
             except Exception:
@@ -1953,25 +2046,40 @@ class MainWindow(QMainWindow):
             return QTableWidgetItem(str(c or ""))
         
         xml_status = (it.get("xml_status") or "RESUMO").upper()
+        status_nota = (it.get("status") or "").lower()
+        
+        # Verifica se a nota está cancelada
+        is_cancelada = 'cancel' in status_nota
         
         # Define texto e cores baseado no tipo (eventos não aparecem aqui pois são filtrados)
         if xml_status == "COMPLETO":
-            status_text = ""  # Apenas ícone, sem texto
-            bg_color = QColor(214, 245, 224)  # Verde claro
-            tooltip_text = "✅ XML Completo disponível"
+            if is_cancelada:
+                status_text = ""  # Apenas ícone, sem texto
+                bg_color = QColor(255, 220, 220)  # Vermelho claro
+                tooltip_text = "❌ XML Completo - Nota Cancelada"
+                icon_name = 'cancelado.png'
+            else:
+                status_text = ""  # Apenas ícone, sem texto
+                bg_color = QColor(214, 245, 224)  # Verde claro
+                tooltip_text = "✅ XML Completo disponível"
+                icon_name = 'xml.png'
         else:  # RESUMO
             status_text = ""  # Apenas ícone, sem texto
             bg_color = QColor(235, 235, 235)  # Cinza claro
             tooltip_text = "⚠️ Apenas Resumo - clique para baixar XML completo"
+            icon_name = 'xml.png'
         
         c0 = cell(status_text)
         c0.setBackground(QBrush(bg_color))
         c0.setTextAlignment(Qt.AlignCenter)
         c0.setToolTip(tooltip_text)
         try:
-            icon_path = BASE_DIR / 'Icone' / 'xml.png'
+            icon_path = BASE_DIR / 'Icone' / icon_name
             if icon_path.exists():
-                c0.setIcon(QIcon(str(icon_path)))
+                icon = QIcon(str(icon_path))
+                c0.setIcon(icon)
+                # Define tamanho do ícone para melhor centralização
+                self.table.setIconSize(QSize(20, 20))
         except Exception:
             pass
         self.table.setItem(r, 0, c0)
@@ -2017,58 +2125,29 @@ class MainWindow(QMainWindow):
             timestamp = 0.0
         self.table.setItem(r, 5, NumericTableWidgetItem(vencimento_br, timestamp))
         
-        # Coluna Status - ícone visual com cor de fundo
-        status_low = (it.get("status") or '').lower()
-        
-        if 'cancelad' in status_low:
-            # Cancelado: ✕ vermelho com fundo vermelho claro
-            c_status = cell("✕")
-            c_status.setForeground(QBrush(QColor(200, 0, 0)))
-            c_status.setBackground(QBrush(QColor(255, 220, 220)))
-            c_status.setFont(QFont("Arial", 16, QFont.Bold))
-        elif 'autorizad' in status_low:
-            # Autorizado: ✓ verde com fundo verde claro
-            c_status = cell("✓")
-            c_status.setForeground(QBrush(QColor(0, 150, 0)))
-            c_status.setBackground(QBrush(QColor(214, 245, 224)))
-            c_status.setFont(QFont("Arial", 16, QFont.Bold))
-        elif 'denegad' in status_low or 'rejeitad' in status_low:
-            # Denegado: ⚠ laranja com fundo amarelo claro
-            c_status = cell("⚠")
-            c_status.setForeground(QBrush(QColor(200, 120, 0)))
-            c_status.setBackground(QBrush(QColor(255, 245, 200)))
-            c_status.setFont(QFont("Arial", 14, QFont.Bold))
-        else:
-            # Outros: • cinza com fundo cinza claro
-            c_status = cell("•")
-            c_status.setForeground(QBrush(QColor(120, 120, 120)))
-            c_status.setBackground(QBrush(QColor(240, 240, 240)))
-            c_status.setFont(QFont("Arial", 14, QFont.Bold))
-        
-        c_status.setTextAlignment(Qt.AlignCenter)
-        self.table.setItem(r, 6, c_status)
-        self.table.setItem(r, 7, cell(it.get("cnpj_emitente")))
-        self.table.setItem(r, 8, cell(it.get("nome_emitente")))
-        self.table.setItem(r, 9, cell(it.get("natureza")))
-        self.table.setItem(r,10, cell(self._codigo_uf_to_sigla(it.get("uf") or "")))
+        # Colunas de dados (ajustados após remover coluna Status)
+        self.table.setItem(r, 6, cell(it.get("cnpj_emitente")))
+        self.table.setItem(r, 7, cell(it.get("nome_emitente")))
+        self.table.setItem(r, 8, cell(it.get("natureza")))
+        self.table.setItem(r, 9, cell(self._codigo_uf_to_sigla(it.get("uf") or "")))
         
         # Coluna Base ICMS - ordenação numérica com formatação BR
         base_icms_raw = it.get("base_icms")
         base_icms_formatado, base_icms_num = self._parse_valor(base_icms_raw)
         c_base = NumericTableWidgetItem(base_icms_formatado, base_icms_num)
         c_base.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        self.table.setItem(r,11, c_base)
+        self.table.setItem(r, 10, c_base)
         
         # Coluna Valor ICMS - ordenação numérica com formatação BR
         valor_icms_raw = it.get("valor_icms")
         valor_icms_formatado, valor_icms_num = self._parse_valor(valor_icms_raw)
         c_icms = NumericTableWidgetItem(valor_icms_formatado, valor_icms_num)
         c_icms.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        self.table.setItem(r,12, c_icms)
-        self.table.setItem(r,13, cell(it.get("cfop")))
-        self.table.setItem(r,14, cell(it.get("ncm")))
-        self.table.setItem(r,15, cell(it.get("ie_tomador")))
-        self.table.setItem(r,16, cell(it.get("chave")))
+        self.table.setItem(r, 11, c_icms)
+        self.table.setItem(r, 12, cell(it.get("cfop")))
+        self.table.setItem(r, 13, cell(it.get("ncm")))
+        self.table.setItem(r, 14, cell(it.get("ie_tomador")))
+        self.table.setItem(r, 15, cell(it.get("chave")))
     
     def _populate_emitidos_row(self, r: int, it: Dict[str, Any]):
         """Popula uma linha da tabela de emitidos (mesma estrutura que _populate_row)"""
@@ -2076,25 +2155,53 @@ class MainWindow(QMainWindow):
             return QTableWidgetItem(str(c or ""))
         
         xml_status = (it.get("xml_status") or "RESUMO").upper()
+        status_nota = (it.get("status") or "").lower()
+        
+        # Verifica se a nota está cancelada
+        is_cancelada = 'cancel' in status_nota
+        
+        # DEBUG: Log quando for a nota 29511
+        if it.get('numero') == '29511':
+            print(f"[DEBUG ICONE] Populando nota 29511:")
+            print(f"  xml_status: {xml_status}")
+            print(f"  status_nota (raw): {it.get('status')}")
+            print(f"  status_nota (lower): {status_nota}")
+            print(f"  is_cancelada: {is_cancelada}")
         
         # Define texto e cores baseado no tipo
         if xml_status == "COMPLETO":
-            status_text = ""
-            bg_color = QColor(214, 245, 224)
-            tooltip_text = "✅ XML Completo disponível"
+            if is_cancelada:
+                status_text = ""
+                bg_color = QColor(255, 220, 220)  # Vermelho claro
+                tooltip_text = "❌ XML Completo - Nota Cancelada"
+                icon_name = 'cancelado.png'
+            else:
+                status_text = ""
+                bg_color = QColor(214, 245, 224)  # Verde claro
+                tooltip_text = "✅ XML Completo disponível"
+                icon_name = 'xml.png'
         else:
             status_text = ""
             bg_color = QColor(235, 235, 235)
             tooltip_text = "⚠️ Apenas Resumo - clique para baixar XML completo"
+            icon_name = 'xml.png'
+        
+        # DEBUG: Log do ícone escolhido
+        if it.get('numero') == '29511':
+            print(f"  icon_name escolhido: {icon_name}")
+            print(f"  bg_color: {bg_color.name()}")
         
         c0 = cell(status_text)
         c0.setBackground(QBrush(bg_color))
         c0.setTextAlignment(Qt.AlignCenter)
         c0.setToolTip(tooltip_text)
         try:
-            icon_path = BASE_DIR / 'Icone' / 'xml.png'
+            icon_path = BASE_DIR / 'Icone' / icon_name
             if icon_path.exists():
-                c0.setIcon(QIcon(str(icon_path)))
+                icon = QIcon(str(icon_path))
+                c0.setIcon(icon)
+                # Define tamanho do ícone para melhor centralização
+                self.table_emitidos.setIconSize(QSize(20, 20))
         except Exception:
             pass
         self.table_emitidos.setItem(r, 0, c0)
@@ -2144,60 +2251,34 @@ class MainWindow(QMainWindow):
             timestamp = 0.0
         self.table_emitidos.setItem(r, 5, NumericTableWidgetItem(vencimento_br, timestamp))
         
-        # Coluna Status - ícone visual com cor de fundo
-        status_low = (it.get("status") or '').lower()
-        
-        if 'cancelad' in status_low:
-            c_status = cell("✕")
-            c_status.setForeground(QBrush(QColor(200, 0, 0)))
-            c_status.setBackground(QBrush(QColor(255, 220, 220)))
-            c_status.setFont(QFont("Arial", 16, QFont.Bold))
-        elif 'autorizad' in status_low:
-            c_status = cell("✓")
-            c_status.setForeground(QBrush(QColor(0, 150, 0)))
-            c_status.setBackground(QBrush(QColor(214, 245, 224)))
-            c_status.setFont(QFont("Arial", 16, QFont.Bold))
-        elif 'denegad' in status_low or 'rejeitad' in status_low:
-            c_status = cell("⚠")
-            c_status.setForeground(QBrush(QColor(200, 120, 0)))
-            c_status.setBackground(QBrush(QColor(255, 245, 200)))
-            c_status.setFont(QFont("Arial", 14, QFont.Bold))
-        else:
-            c_status = cell("•")
-            c_status.setForeground(QBrush(QColor(120, 120, 120)))
-            c_status.setBackground(QBrush(QColor(240, 240, 240)))
-            c_status.setFont(QFont("Arial", 14, QFont.Bold))
-        
-        c_status.setTextAlignment(Qt.AlignCenter)
-        self.table_emitidos.setItem(r, 6, c_status)
-        
+        # Colunas de dados (ajustados após remover coluna Status)
         # IMPORTANTE: Para emitidos, mostramos o CNPJ/CPF do destinatário
         # Os headers já foram renomeados para "Destinatário CNPJ" e "Destinatário Nome"
-        self.table_emitidos.setItem(r, 7, cell(it.get("cnpj_destinatario") or ""))
+        self.table_emitidos.setItem(r, 6, cell(it.get("cnpj_destinatario") or ""))
         # Nome do destinatário vem do campo nome_destinatario
-        self.table_emitidos.setItem(r, 8, cell(it.get("nome_destinatario") or ""))
+        self.table_emitidos.setItem(r, 7, cell(it.get("nome_destinatario") or ""))
         
-        self.table_emitidos.setItem(r, 9, cell(it.get("natureza")))
-        self.table_emitidos.setItem(r,10, cell(self._codigo_uf_to_sigla(it.get("uf") or "")))
+        self.table_emitidos.setItem(r, 8, cell(it.get("natureza")))
+        self.table_emitidos.setItem(r, 9, cell(self._codigo_uf_to_sigla(it.get("uf") or "")))
         
         # Coluna Base ICMS - ordenação numérica com formatação BR
         base_icms_raw = it.get("base_icms")
         base_icms_formatado, base_icms_num = self._parse_valor(base_icms_raw)
         c_base = NumericTableWidgetItem(base_icms_formatado, base_icms_num)
         c_base.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        self.table_emitidos.setItem(r,11, c_base)
+        self.table_emitidos.setItem(r, 10, c_base)
         
         # Coluna Valor ICMS - ordenação numérica com formatação BR
         valor_icms_raw = it.get("valor_icms")
         valor_icms_formatado, valor_icms_num = self._parse_valor(valor_icms_raw)
         c_icms = NumericTableWidgetItem(valor_icms_formatado, valor_icms_num)
         c_icms.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        self.table_emitidos.setItem(r,12, c_icms)
+        self.table_emitidos.setItem(r, 11, c_icms)
         
-        self.table_emitidos.setItem(r,13, cell(it.get("cfop")))
-        self.table_emitidos.setItem(r,14, cell(it.get("ncm")))
-        self.table_emitidos.setItem(r,15, cell(it.get("ie_tomador")))
-        self.table_emitidos.setItem(r,16, cell(it.get("chave")))
+        self.table_emitidos.setItem(r, 12, cell(it.get("cfop")))
+        self.table_emitidos.setItem(r, 13, cell(it.get("ncm")))
+        self.table_emitidos.setItem(r, 14, cell(it.get("ie_tomador")))
+        self.table_emitidos.setItem(r, 15, cell(it.get("chave")))
 
     def _fill_table_step(self):
         try:
@@ -2214,7 +2295,16 @@ class MainWindow(QMainWindow):
                     self.table.setSortingEnabled(True)
                 except Exception:
                     pass
+                # Auto-ajusta largura das colunas ao conteúdo (exceto XML que é fixo)
+                try:
+                    for col in range(1, self.table.columnCount()):
+                        self.table.resizeColumnToContents(col)
+                except Exception:
+                    pass
                 self.set_status(f"{total} registros carregados", 2000)
+                
+                # Verifica notas com status cinza (RESUMO) e busca XML completo automaticamente
+                QTimer.singleShot(1000, self._verificar_notas_cinza)
                 return
             start = self._table_fill_index
             end = min(start + self._table_fill_chunk, total)
@@ -2427,6 +2517,10 @@ class MainWindow(QMainWindow):
         
         item = flt[row]
         xml_status = (item.get('xml_status') or '').upper()
+        status_nota = (item.get('status') or '').lower()
+        
+        # Verifica se o status é indefinido (não autorizada, cancelada, denegada ou rejeitada)
+        is_status_indefinido = not any(x in status_nota for x in ['autorizad', 'cancel', 'denegad', 'rejeitad'])
         
         # Cria menu
         menu = QMenu(self)
@@ -2441,6 +2535,12 @@ class MainWindow(QMainWindow):
         else:
             action_buscar = None
         
+        # Opção: Consultar Status (só para status indefinido)
+        if is_status_indefinido:
+            action_consultar_status = menu.addAction("🔄 Consultar Status na SEFAZ")
+        else:
+            action_consultar_status = None
+        
         # Opção: Eventos (sempre disponível)
         menu.addSeparator()
         action_eventos = menu.addAction("📋 Ver Eventos")
@@ -2452,6 +2552,8 @@ class MainWindow(QMainWindow):
             self._mostrar_detalhes_nota(item)
         elif action == action_buscar:
             self._buscar_xml_completo(item)
+        elif action == action_consultar_status:
+            self._consultar_status_nota(item)
         elif action == action_eventos:
             self._mostrar_eventos(item)
     
@@ -2469,6 +2571,10 @@ class MainWindow(QMainWindow):
         
         item = flt[row]
         xml_status = (item.get('xml_status') or '').upper()
+        status_nota = (item.get('status') or '').lower()
+        
+        # Verifica se o status é indefinido (não autorizada, cancelada, denegada ou rejeitada)
+        is_status_indefinido = not any(x in status_nota for x in ['autorizad', 'cancel', 'denegad', 'rejeitad'])
         
         # Cria menu
         menu = QMenu(self)
@@ -2483,6 +2589,12 @@ class MainWindow(QMainWindow):
         else:
             action_buscar = None
         
+        # Opção: Consultar Status (só para status indefinido)
+        if is_status_indefinido:
+            action_consultar_status = menu.addAction("🔄 Consultar Status na SEFAZ")
+        else:
+            action_consultar_status = None
+        
         # Opção: Eventos (sempre disponível)
         menu.addSeparator()
         action_eventos = menu.addAction("📋 Ver Eventos")
@@ -2494,6 +2606,8 @@ class MainWindow(QMainWindow):
             self._mostrar_detalhes_nota(item)
         elif action == action_buscar:
             self._buscar_xml_completo(item)
+        elif action == action_consultar_status:
+            self._consultar_status_nota(item)
         elif action == action_eventos:
             self._mostrar_eventos(item)
     
@@ -2734,6 +2848,248 @@ class MainWindow(QMainWindow):
         except Exception as e:
             self.set_status(f"Erro: {str(e)}", 5000)
             QMessageBox.critical(self, "Erro", f"Erro ao buscar XML completo:\n\n{str(e)}")
+    
+    def _consultar_status_nota(self, item: Dict[str, Any]):
+        """Consulta o status atual de uma nota na SEFAZ"""
+        chave = item.get('chave')
+        if not chave or len(chave) != 44:
+            QMessageBox.warning(self, "Erro", "Chave de acesso inválida!")
+            return
+        
+        # Determina qual certificado usar
+        informante = item.get('informante')
+        certs = self.db.load_certificates()
+        
+        cert_to_use = None
+        if informante:
+            # Tenta usar o certificado que baixou esse resumo
+            for c in certs:
+                if c.get('informante') == informante:
+                    cert_to_use = c
+                    break
+        
+        if not cert_to_use and certs:
+            # Usa o primeiro certificado ativo
+            cert_to_use = certs[0]
+        
+        if not cert_to_use:
+            QMessageBox.warning(self, "Erro", "Nenhum certificado disponível!")
+            return
+        
+        # Consulta na SEFAZ
+        try:
+            from nfe_search import consultar_nfe_por_chave
+            
+            self.set_status(f"🔄 Consultando status da nota {item.get('numero', '')}...")
+            QApplication.processEvents()
+            
+            xml_resposta = consultar_nfe_por_chave(
+                chave=chave,
+                certificado_path=cert_to_use.get('caminho'),
+                senha=cert_to_use.get('senha'),
+                cnpj=cert_to_use.get('cnpj_cpf'),
+                cuf=cert_to_use.get('cUF_autor')
+            )
+            
+            if xml_resposta:
+                # Extrai o status da resposta
+                import re
+                from xml.etree import ElementTree as ET
+                
+                try:
+                    root = ET.fromstring(xml_resposta)
+                    
+                    # Procura pelo cStat (código de status)
+                    cstat = None
+                    xmotivo = None
+                    
+                    # Namespace comum em respostas NFe
+                    ns = {'nfe': 'http://www.portalfiscal.inf.br/nfe'}
+                    
+                    # Tenta encontrar cStat e xMotivo
+                    for cstat_elem in root.iter():
+                        if 'cStat' in cstat_elem.tag:
+                            cstat = cstat_elem.text
+                        if 'xMotivo' in cstat_elem.tag:
+                            xmotivo = cstat_elem.text
+                    
+                    # Interpreta o status
+                    if cstat:
+                        status_msg = f"Status: {cstat}"
+                        if xmotivo:
+                            status_msg += f"\n{xmotivo}"
+                        
+                        # Determina o novo status da nota
+                        novo_status = None
+                        if cstat in ['100', '150']:  # Autorizada
+                            novo_status = "Autorizado o uso da NF-e"
+                            icone = "✅"
+                            cor = "green"
+                        elif cstat in ['101', '151', '135', '155']:  # Cancelada
+                            novo_status = "Cancelamento homologado"
+                            icone = "❌"
+                            cor = "red"
+                        elif cstat in ['110', '301', '302']:  # Denegada
+                            novo_status = "Uso Denegado"
+                            icone = "⚠️"
+                            cor = "orange"
+                        elif cstat == '217':  # Nota não existe
+                            novo_status = "Nota não consta na base da SEFAZ"
+                            icone = "❓"
+                            cor = "gray"
+                        else:
+                            novo_status = xmotivo or f"Status {cstat}"
+                            icone = "ℹ️"
+                            cor = "blue"
+                        
+                        # Atualiza no banco de dados
+                        if novo_status and novo_status != item.get('status'):
+                            print(f"[DEBUG STATUS] Atualizando status da nota:")
+                            print(f"  Chave: {chave}")
+                            print(f"  Status antigo: {item.get('status')}")
+                            print(f"  Status novo: {novo_status}")
+                            
+                            self.db.atualizar_status_nota(chave, novo_status)
+                            
+                            # Recarrega os dados do banco para garantir sincronização
+                            print(f"[DEBUG STATUS] Recarregando notas do banco...")
+                            self.notes = self.db.load_notes(limit=1000)
+                            
+                            # Verifica se o status foi atualizado na memória
+                            nota_atualizada = next((n for n in self.notes if n.get('chave') == chave), None)
+                            if nota_atualizada:
+                                print(f"[DEBUG STATUS] Nota encontrada após reload:")
+                                print(f"  Status: {nota_atualizada.get('status')}")
+                                print(f"  xml_status: {nota_atualizada.get('xml_status')}")
+                            else:
+                                print(f"[DEBUG STATUS] ⚠️ Nota não encontrada após reload!")
+                            
+                            # Recarrega as tabelas para atualizar os ícones
+                            print(f"[DEBUG STATUS] Atualizando tabelas...")
+                            self.refresh_table()
+                            self.refresh_emitidos_table()
+                            
+                            self.set_status(f"✓ Status atualizado: {novo_status}", 5000)
+                            
+                            # Se foi cancelada, tenta buscar o evento de cancelamento automaticamente
+                            if cstat in ['101', '151', '135', '155']:  # Cancelada
+                                QTimer.singleShot(500, lambda: self._buscar_evento_cancelamento(item))
+                        else:
+                            self.set_status(f"Status consultado: {novo_status}", 5000)
+                        
+                        # Mostra resultado
+                        QMessageBox.information(
+                            self,
+                            f"{icone} Status da Nota",
+                            f"<h3>Consulta realizada com sucesso!</h3>"
+                            f"<p><b>Nota:</b> {item.get('numero', 'N/A')}</p>"
+                            f"<p><b>Código:</b> {cstat}</p>"
+                            f"<p><b>Status:</b> <span style='color: {cor};'>{novo_status}</span></p>"
+                            f"<p><b>Chave:</b> {chave}</p>"
+                            f"{'<p><i>Buscando evento de cancelamento...</i></p>' if cstat in ['101', '151', '135', '155'] else ''}"
+                        )
+                    else:
+                        # Não encontrou cStat na resposta
+                        self.set_status("⚠ Resposta da SEFAZ sem código de status", 3000)
+                        QMessageBox.warning(
+                            self,
+                            "Aviso",
+                            "A SEFAZ retornou uma resposta, mas não foi possível extrair o código de status.\n\n"
+                            "Tente novamente mais tarde."
+                        )
+                        
+                except ET.ParseError as e:
+                    self.set_status(f"Erro ao processar resposta XML", 3000)
+                    QMessageBox.warning(
+                        self,
+                        "Erro",
+                        f"Não foi possível processar a resposta da SEFAZ:\n\n{str(e)}"
+                    )
+            else:
+                self.set_status("Erro ao consultar status", 3000)
+                QMessageBox.warning(
+                    self,
+                    "Erro",
+                    "Não foi possível consultar o status na SEFAZ.\n\n"
+                    "Possíveis causas:\n"
+                    "- Problema de conexão com SEFAZ\n"
+                    "- Certificado sem permissão\n"
+                    "- Serviço temporariamente indisponível"
+                )
+                
+        except Exception as e:
+            self.set_status(f"Erro: {str(e)}", 5000)
+            QMessageBox.critical(self, "Erro", f"Erro ao consultar status:\n\n{str(e)}")
+    
+    def _buscar_evento_cancelamento(self, item: Dict[str, Any]):
+        """Busca automaticamente o evento de cancelamento na SEFAZ"""
+        chave = item.get('chave')
+        if not chave or len(chave) != 44:
+            return
+        
+        # Verifica se já tem o evento localmente
+        xmls_root = DATA_DIR / "xmls"
+        evento_encontrado = False
+        
+        try:
+            if xmls_root.exists():
+                for eventos_folder in xmls_root.rglob("Eventos"):
+                    for xml_file in eventos_folder.glob("*.xml"):
+                        try:
+                            xml_content = xml_file.read_text(encoding='utf-8')
+                            if chave in xml_content and '110111' in xml_content:  # 110111 = evento de cancelamento
+                                evento_encontrado = True
+                                self.set_status("✅ Evento de cancelamento já está salvo localmente", 3000)
+                                return
+                        except Exception:
+                            continue
+        except Exception:
+            pass
+        
+        # Se não encontrou, tenta buscar na SEFAZ
+        if not evento_encontrado:
+            informante = item.get('informante')
+            certs = self.db.load_certificates()
+            
+            cert_to_use = None
+            if informante:
+                for c in certs:
+                    if c.get('informante') == informante:
+                        cert_to_use = c
+                        break
+            
+            if not cert_to_use and certs:
+                cert_to_use = certs[0]
+            
+            if not cert_to_use:
+                self.set_status("⚠️ Nenhum certificado para buscar eventos", 3000)
+                return
+            
+            try:
+                # Busca o XML completo que deve conter o protocolo de cancelamento
+                from nfe_search import consultar_nfe_por_chave
+                
+                self.set_status("🔍 Buscando evento de cancelamento...", 0)
+                QApplication.processEvents()
+                
+                xml_resposta = consultar_nfe_por_chave(
+                    chave=chave,
+                    certificado_path=cert_to_use.get('caminho'),
+                    senha=cert_to_use.get('senha'),
+                    cnpj=cert_to_use.get('cnpj_cpf'),
+                    cuf=cert_to_use.get('cUF_autor')
+                )
+                
+                if xml_resposta and ('retCancNFe' in xml_resposta or 'procEventoNFe' in xml_resposta):
+                    # Salva o evento
+                    from nfe_search import salvar_xml_por_certificado
+                    salvar_xml_por_certificado(xml_resposta, informante or cert_to_use.get('cnpj_cpf'))
+                    self.set_status("✅ Evento de cancelamento baixado e salvo!", 3000)
+                else:
+                    self.set_status("ℹ️ Evento de cancelamento não disponível na SEFAZ", 3000)
+                    
+            except Exception as e:
+                self.set_status(f"⚠️ Erro ao buscar evento: {str(e)}", 3000)
     
     def _mostrar_eventos(self, item: Dict[str, Any]):
         """Mostra os eventos vinculados a uma NFe/CT-e"""
@@ -7246,3 +7602,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
