@@ -392,7 +392,7 @@ class MainWindow(QMainWindow):
         t = QHBoxLayout()
         self.search_edit = QLineEdit()
         self.search_edit.setPlaceholderText("Buscar por emitente, número ou CNPJ…")
-        self.search_edit.textChanged.connect(self.refresh_table)
+        self.search_edit.textChanged.connect(self._on_filter_changed)
         
         # Filtros de data
         from PyQt5.QtCore import QDate
@@ -401,7 +401,7 @@ class MainWindow(QMainWindow):
         self.date_inicio.setCalendarPopup(True)
         self.date_inicio.setDisplayFormat("dd/MM/yyyy")
         self.date_inicio.setDate(QDate.currentDate().addMonths(-3))  # Padrão: 3 meses atrás
-        self.date_inicio.dateChanged.connect(self.refresh_table)
+        self.date_inicio.dateChanged.connect(self._on_filter_changed)
         self.date_inicio.setToolTip("Data inicial do filtro")
         
         date_ate_label = QLabel("até:")
@@ -409,7 +409,7 @@ class MainWindow(QMainWindow):
         self.date_fim.setCalendarPopup(True)
         self.date_fim.setDisplayFormat("dd/MM/yyyy")
         self.date_fim.setDate(QDate.currentDate())  # Padrão: hoje
-        self.date_fim.dateChanged.connect(self.refresh_table)
+        self.date_fim.dateChanged.connect(self._on_filter_changed)
         self.date_fim.setToolTip("Data final do filtro")
         
         # Botão para limpar filtro de data
@@ -419,9 +419,9 @@ class MainWindow(QMainWindow):
         btn_clear_dates.clicked.connect(self._clear_date_filters)
         
         self.status_dd = QComboBox(); self.status_dd.addItems(["Todos","Autorizado","Cancelado","Denegado"])
-        self.status_dd.currentTextChanged.connect(self.refresh_table)
+        self.status_dd.currentTextChanged.connect(self._on_filter_changed)
         self.tipo_dd = QComboBox(); self.tipo_dd.addItems(["Todos","NFe","CTe","NFS-e"])
-        self.tipo_dd.currentTextChanged.connect(self.refresh_table)
+        self.tipo_dd.currentTextChanged.connect(self._on_filter_changed)
         
         # Seletor de quantidade de linhas exibidas
         limit_label = QLabel("Exibir:")
@@ -433,7 +433,7 @@ class MainWindow(QMainWindow):
         saved_limit = settings.value('display/limit', '100')  # Padrão: 100 linhas
         self.limit_dd.setCurrentText(str(saved_limit))
         
-        self.limit_dd.currentTextChanged.connect(self.refresh_table)
+        self.limit_dd.currentTextChanged.connect(self._on_filter_changed)
         self.limit_dd.currentTextChanged.connect(self._save_limit_preference)
         self.limit_dd.setToolTip("Quantidade de documentos a exibir na tabela")
         
@@ -1480,6 +1480,16 @@ class MainWindow(QMainWindow):
             settings.sync()
         except Exception as e:
             print(f"[DEBUG] Erro ao salvar preferência de limite: {e}")
+    
+    def _on_filter_changed(self):
+        """Atualiza ambas as abas quando qualquer filtro é alterado"""
+        try:
+            # Atualiza aba "Emitidos por terceiros"
+            self.refresh_table()
+            # Atualiza aba "Emitidos pela empresa"
+            self.refresh_emitidos_table()
+        except Exception as e:
+            print(f"[DEBUG] Erro ao atualizar tabelas após filtro: {e}")
 
     def filtered(self) -> List[Dict[str, Any]]:
         q = (self.search_edit.text() or "").lower().strip()
