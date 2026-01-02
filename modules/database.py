@@ -81,17 +81,9 @@ class DatabaseManager:
                 xml_completo TEXT,
                 baixado_em TEXT
             )''')
-            # Migração: adicionar colunas se não existirem
+            # Migração: adicionar coluna xml_completo se não existir
             try:
                 conn.execute("ALTER TABLE xmls_baixados ADD COLUMN xml_completo TEXT")
-            except:
-                pass  # Coluna já existe
-            try:
-                conn.execute("ALTER TABLE xmls_baixados ADD COLUMN caminho_arquivo TEXT")
-            except:
-                pass  # Coluna já existe
-            try:
-                conn.execute("ALTER TABLE xmls_baixados ADD COLUMN baixado_em TEXT")
             except:
                 pass  # Coluna já existe
             conn.execute('''CREATE TABLE IF NOT EXISTS nf_status (
@@ -121,6 +113,7 @@ class DatabaseManager:
                 ie_tomador TEXT,
                 nome_emitente TEXT,
                 cnpj_emitente TEXT,
+                nome_destinatario TEXT,
                 numero TEXT,
                 data_emissao TEXT,
                 tipo TEXT,
@@ -158,6 +151,17 @@ class DatabaseManager:
                              ON manifestacoes(informante)''')
             except Exception:
                 pass
+            
+            # Migração: Adiciona coluna nome_destinatario se não existir
+            try:
+                cursor = conn.execute("PRAGMA table_info(notas_detalhadas)")
+                columns = [row[1] for row in cursor.fetchall()]
+                if 'nome_destinatario' not in columns:
+                    print("[MIGRAÇÃO] Adicionando coluna nome_destinatario...")
+                    conn.execute("ALTER TABLE notas_detalhadas ADD COLUMN nome_destinatario TEXT")
+                    print("[MIGRAÇÃO] Coluna nome_destinatario adicionada com sucesso")
+            except Exception as e:
+                print(f"[MIGRAÇÃO] Erro ao adicionar coluna nome_destinatario: {e}")
             
             conn.commit()
     
@@ -337,14 +341,14 @@ class DatabaseManager:
                     # Update
                     conn.execute('''UPDATE notas_detalhadas 
                         SET ie_tomador = ?, nome_emitente = ?, cnpj_emitente = ?,
-                            numero = ?, data_emissao = ?, tipo = ?, valor = ?,
+                            nome_destinatario = ?, numero = ?, data_emissao = ?, tipo = ?, valor = ?,
                             cfop = ?, vencimento = ?, ncm = ?, status = ?,
                             natureza = ?, uf = ?, base_icms = ?, valor_icms = ?,
                             informante = ?, xml_status = ?, atualizado_em = ?
                         WHERE chave = ?''',
                         (data.get('ie_tomador'), data.get('nome_emitente'),
-                         data.get('cnpj_emitente'), data.get('numero'),
-                         data.get('data_emissao'), data.get('tipo'),
+                         data.get('cnpj_emitente'), data.get('nome_destinatario'),
+                         data.get('numero'), data.get('data_emissao'), data.get('tipo'),
                          data.get('valor'), data.get('cfop'),
                          data.get('vencimento'), data.get('ncm'),
                          data.get('status'), data.get('natureza'),
@@ -356,13 +360,13 @@ class DatabaseManager:
                     # Insert
                     conn.execute('''INSERT INTO notas_detalhadas
                         (chave, ie_tomador, nome_emitente, cnpj_emitente,
-                         numero, data_emissao, tipo, valor, cfop, vencimento,
+                         nome_destinatario, numero, data_emissao, tipo, valor, cfop, vencimento,
                          ncm, status, natureza, uf, base_icms, valor_icms,
                          informante, xml_status, atualizado_em)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
                         (chave, data.get('ie_tomador'), data.get('nome_emitente'),
-                         data.get('cnpj_emitente'), data.get('numero'),
-                         data.get('data_emissao'), data.get('tipo'),
+                         data.get('cnpj_emitente'), data.get('nome_destinatario'),
+                         data.get('numero'), data.get('data_emissao'), data.get('tipo'),
                          data.get('valor'), data.get('cfop'),
                          data.get('vencimento'), data.get('ncm'),
                          data.get('status'), data.get('natureza'),

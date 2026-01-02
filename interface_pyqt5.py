@@ -4387,6 +4387,7 @@ class MainWindow(QMainWindow):
                         'valor': valor,
                         'cnpj_emitente': cnpj_emitente_limpo,
                         'nome_emitente': nome_emitente,
+                        'nome_destinatario': nome_destinatario,
                         'ie_tomador': ie_destinatario,
                         'cfop': cfop,
                         'ncm': ncm,
