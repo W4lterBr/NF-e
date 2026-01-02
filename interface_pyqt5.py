@@ -2171,9 +2171,8 @@ class MainWindow(QMainWindow):
         # IMPORTANTE: Para emitidos, mostramos informante (que é o destinatário)
         # Os headers já foram renomeados para "Destinatário CNPJ" e "Destinatário Nome"
         self.table_emitidos.setItem(r, 7, cell(it.get("informante")))
-        # Para o nome do destinatário, tentamos obter de outro campo se existir
-        # Por enquanto, deixamos vazio ou usamos algum campo disponível
-        self.table_emitidos.setItem(r, 8, cell(""))  # Nome destinatário (não disponível na estrutura atual)
+        # Nome do destinatário vem do campo nome_destinatario
+        self.table_emitidos.setItem(r, 8, cell(it.get("nome_destinatario") or ""))
         
         self.table_emitidos.setItem(r, 9, cell(it.get("natureza")))
         self.table_emitidos.setItem(r,10, cell(self._codigo_uf_to_sigla(it.get("uf") or "")))
