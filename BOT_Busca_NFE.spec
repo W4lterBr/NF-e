@@ -11,6 +11,7 @@ block_cipher = None
 added_files = [
     ('Icone', 'Icone'),           # Ícones da interface
     ('Arquivo_xsd', 'Arquivo_xsd'), # Schemas XML para validação
+    ('version.txt', '.'),         # Arquivo de versão
     # CÓDIGO-FONTE (.py) NÃO É INCLUÍDO - apenas executável compilado
     # Dados do usuário (xmls/, notas.db) são criados em runtime no AppData
 ]
