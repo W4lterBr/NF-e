@@ -4312,8 +4312,9 @@ class MainWindow(QMainWindow):
                         erros.append(f"{xml_file.name}: Tipo não identificado")
                         continue
                     
-                    # Remove caracteres não numéricos do CNPJ
+                    # Remove caracteres não numéricos do CNPJ emitente e destinatário
                     cnpj_emitente_limpo = ''.join(c for c in cnpj_emitente if c.isdigit())
+                    cnpj_destinatario_limpo = ''.join(c for c in cnpj_destinatario if c.isdigit())
                     
                     # Determina se foi emitido pela empresa ou recebido
                     emitido_pela_empresa = cnpj_emitente_limpo in cnpjs_empresa
@@ -4363,7 +4364,7 @@ class MainWindow(QMainWindow):
                         'cnpj_emitente': cnpj_emitente_limpo,
                         'nome_emitente': nome_emitente,
                         'nome_destinatario': nome_destinatario,
-                        'cnpj_destinatario': cnpj_destinatario,
+                        'cnpj_destinatario': cnpj_destinatario_limpo,
                         'ie_tomador': ie_destinatario,
                         'cfop': cfop,
                         'ncm': ncm,
