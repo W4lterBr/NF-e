@@ -1786,6 +1786,65 @@ class MainWindow(QMainWindow):
         except Exception:
             return date_str
     
+    def _parse_valor(self, valor_raw) -> tuple:
+        """
+        Converte valor de diferentes formatos para float e string formatada BR.
+        
+        Retorna: (valor_formatado: str, valor_num: float)
+        
+        Suporta formatos:
+        - US: 1234.56 ou 1234567.89
+        - BR: 1.234,56 ou 1.234.567,89
+        - Já formatado: R$ 1.234,56
+        """
+        valor_formatado = ""
+        valor_num = 0.0
+        
+        try:
+            if valor_raw:
+                # Limpa prefixos e espaços
+                valor_str = str(valor_raw).replace("R$", "").strip()
+                
+                # Detecta formato: se tem vírgula E ponto, é formato BR (1.234,56)
+                if "," in valor_str and "." in valor_str:
+                    # Formato BR: 1.234,56 -> remove pontos, troca vírgula por ponto
+                    valor_str = valor_str.replace(".", "").replace(",", ".")
+                elif "," in valor_str:
+                    # Apenas vírgula: pode ser BR (1234,56) ou separador errado
+                    # Se vírgula está nos últimos 3 chars, é decimal BR
+                    pos_virgula = valor_str.rfind(",")
+                    if len(valor_str) - pos_virgula <= 3:  # ,XX ou ,X
+                        valor_str = valor_str.replace(",", ".")
+                    else:
+                        # Vírgula como separador de milhar (raro) - remove
+                        valor_str = valor_str.replace(",", "")
+                elif "." in valor_str:
+                    # Apenas ponto: pode ser US (1234.56) ou BR (1.234)
+                    # Se ponto está nos últimos 3 chars, é decimal US
+                    pos_ponto = valor_str.rfind(".")
+                    if len(valor_str) - pos_ponto <= 3:  # .XX ou .X
+                        # É decimal US - mantém como está
+                        pass
+                    else:
+                        # Ponto como separador de milhar BR - remove
+                        valor_str = valor_str.replace(".", "")
+                
+                valor_num = float(valor_str)
+                # Formata no padrão brasileiro
+                valor_formatado = f"R$ {valor_num:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+            else:
+                valor_formatado = ""
+        except Exception:
+            # Fallback: tenta conversão simples
+            try:
+                valor_num = float(str(valor_raw).replace(",", "."))
+                valor_formatado = f"R$ {valor_num:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+            except:
+                valor_formatado = str(valor_raw or "")
+                valor_num = 0.0
+        
+        return (valor_formatado, valor_num)
+    
     def _codigo_uf_to_sigla(self, codigo: str) -> str:
         """Converte código UF para sigla."""
         if not codigo:
@@ -1925,27 +1984,7 @@ class MainWindow(QMainWindow):
         self.table.setItem(r, 3, cell(it.get("tipo")))
         # Coluna Valor - ordenação numérica com exibição formatada
         valor_raw = it.get("valor")
-        valor_formatado = ""
-        valor_num = 0.0
-        try:
-            if valor_raw:
-                # Se já estiver formatado (R$ 1.234,56), precisa limpar antes
-                valor_str = str(valor_raw).replace("R$", "").strip()
-                # Remove pontos (milhares) e substitui vírgula por ponto (decimal)
-                valor_str = valor_str.replace(".", "").replace(",", ".")
-                valor_num = float(valor_str)
-                # Formata no padrão brasileiro
-                valor_formatado = f"R$ {valor_num:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
-            else:
-                valor_formatado = ""
-        except Exception as e:
-            # Se falhar, tenta conversão simples
-            try:
-                valor_num = float(str(valor_raw).replace(",", "."))
-                valor_formatado = f"R$ {valor_num:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
-            except:
-                valor_formatado = str(valor_raw or "")
-                valor_num = 0.0
+        valor_formatado, valor_num = self._parse_valor(valor_raw)
         c_val = NumericTableWidgetItem(valor_formatado, valor_num)
         c_val.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
         self.table.setItem(r, 4, c_val)
@@ -2083,23 +2122,7 @@ class MainWindow(QMainWindow):
         
         # Coluna Valor - ordenação numérica com exibição formatada
         valor_raw = it.get("valor")
-        valor_formatado = ""
-        valor_num = 0.0
-        try:
-            if valor_raw:
-                valor_str = str(valor_raw).replace("R$", "").strip()
-                valor_str = valor_str.replace(".", "").replace(",", ".")
-                valor_num = float(valor_str)
-                valor_formatado = f"R$ {valor_num:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
-            else:
-                valor_formatado = ""
-        except Exception:
-            try:
-                valor_num = float(str(valor_raw).replace(",", "."))
-                valor_formatado = f"R$ {valor_num:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
-            except:
-                valor_formatado = str(valor_raw or "")
-                valor_num = 0.0
+        valor_formatado, valor_num = self._parse_valor(valor_raw)
         c_val = NumericTableWidgetItem(valor_formatado, valor_num)
         c_val.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
         self.table_emitidos.setItem(r, 4, c_val)
