@@ -845,16 +845,8 @@ def salvar_xml_por_certificado(xml, cnpj_cpf, pasta_base="xmls", nome_certificad
         nNF = nNF or "SEM_NUMERO"
         xNome = xNome or "SEM_NOME"
         
-        # Determina caminho absoluto para pasta base
-        # Se pasta_base for relativa (ex: "xmls"), usa BASE como raiz
-        # Se for absoluta (ex: "C:\Storage"), usa diretamente
-        if os.path.isabs(pasta_base):
-            pasta_base_abs = pasta_base
-        else:
-            pasta_base_abs = os.path.join(BASE, pasta_base)
-        
         # Cria pasta com tipo de documento
-        pasta_dest = os.path.join(pasta_base_abs, pasta_certificado, ano_mes, tipo_pasta)
+        pasta_dest = os.path.join(pasta_base, pasta_certificado, ano_mes, tipo_pasta)
         os.makedirs(pasta_dest, exist_ok=True)
 
         nome_arquivo = f"{sanitize_filename(nNF)}-{sanitize_filename(xNome)[:40]}.xml"
@@ -1054,17 +1046,9 @@ class DatabaseManager:
                 xml_completo TEXT,
                 baixado_em TEXT
             )''')
-            # Migração: adicionar colunas se não existirem
+            # Migração: adicionar coluna xml_completo se não existir
             try:
                 cur.execute("ALTER TABLE xmls_baixados ADD COLUMN xml_completo TEXT")
-            except:
-                pass  # Coluna já existe
-            try:
-                cur.execute("ALTER TABLE xmls_baixados ADD COLUMN caminho_arquivo TEXT")
-            except:
-                pass  # Coluna já existe
-            try:
-                cur.execute("ALTER TABLE xmls_baixados ADD COLUMN baixado_em TEXT")
             except:
                 pass  # Coluna já existe
             cur.execute('''CREATE TABLE IF NOT EXISTS nf_status (
@@ -1084,6 +1068,11 @@ class DatabaseManager:
                 informante TEXT PRIMARY KEY,
                 ultimo_erro TIMESTAMP,
                 nsu_bloqueado TEXT
+            )''')
+            cur.execute('''CREATE TABLE IF NOT EXISTS notas_verificadas (
+                chave TEXT PRIMARY KEY,
+                verificada_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                resultado TEXT
             )''')
             conn.commit()
             logger.debug("Tabelas verificadas/criadas no banco")
@@ -1408,6 +1397,33 @@ class DatabaseManager:
                 return True
         except Exception as e:
             logger.error(f"Erro ao salvar config '{chave}': {e}")
+            return False
+    
+    def marcar_nota_verificada(self, chave, resultado='verificada'):
+        """Marca que uma nota já foi verificada para não verificar novamente"""
+        try:
+            with self._connect() as conn:
+                conn.execute(
+                    "INSERT OR REPLACE INTO notas_verificadas (chave, verificada_em, resultado) VALUES (?, datetime('now'), ?)",
+                    (chave, resultado)
+                )
+                conn.commit()
+                logger.debug(f"Nota marcada como verificada: {chave}")
+                return True
+        except Exception as e:
+            logger.error(f"Erro ao marcar nota verificada '{chave}': {e}")
+            return False
+    
+    def nota_ja_verificada(self, chave):
+        """Verifica se uma nota já foi verificada anteriormente"""
+        try:
+            with self._connect() as conn:
+                row = conn.execute(
+                    "SELECT 1 FROM notas_verificadas WHERE chave = ?", (chave,)
+                ).fetchone()
+                return row is not None
+        except Exception as e:
+            logger.debug(f"Erro ao verificar se nota foi verificada '{chave}': {e}")
             return False
 
 # -------------------------------------------------------------------

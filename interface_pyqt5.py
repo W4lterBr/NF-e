@@ -1871,16 +1871,23 @@ class MainWindow(QMainWindow):
     def _verificar_notas_cinza(self):
         """Verifica automaticamente notas com status cinza (RESUMO) e busca XML completo."""
         try:
-            # Busca notas com status RESUMO
-            notas_resumo = [nota for nota in self.notes if (nota.get('xml_status') or '').upper() == 'RESUMO']
+            # Busca notas com status RESUMO que ainda não foram verificadas
+            from nfe_search import Database
+            db_nfe = Database(str(DB_PATH))
+            
+            notas_resumo = [
+                nota for nota in self.notes 
+                if (nota.get('xml_status') or '').upper() == 'RESUMO' 
+                and not db_nfe.nota_ja_verificada(nota.get('chave'))
+            ]
             
             if not notas_resumo:
-                return  # Nenhuma nota com RESUMO
+                return  # Nenhuma nota pendente de verificação
             
-            print(f"[AUTO-VERIFICAÇÃO] Encontradas {len(notas_resumo)} notas com status RESUMO (cinza)")
-            self.set_status(f"🔍 Verificando {len(notas_resumo)} notas com status cinza...", 0)
+            print(f"[AUTO-VERIFICAÇÃO] Encontradas {len(notas_resumo)} notas pendentes de verificação")
+            self.set_status(f"🔍 {len(notas_resumo)} notas pendentes - verificando em background...", 3000)
             
-            # Busca XML completo de cada nota em background
+            # Busca XML completo de cada nota em background (thread separada)
             for idx, nota in enumerate(notas_resumo, 1):
                 # Delay progressivo para não sobrecarregar
                 delay = idx * 2000  # 2 segundos entre cada busca
@@ -1891,19 +1898,24 @@ class MainWindow(QMainWindow):
     
     def _buscar_xml_completo_silencioso(self, item):
         """Busca XML completo em background sem mostrar diálogos."""
+        chave = item.get('chave')
+        if not chave:
+            return
+        
         try:
-            chave = item.get('chave')
-            if not chave:
-                return
-            
             print(f"[AUTO-VERIFICAÇÃO] Buscando XML completo para chave: {chave}")
             
             # Usa a mesma lógica de _buscar_xml_completo mas sem diálogos
             from modules.sandbox_task import run_task as sandbox_run_task
+            from nfe_search import Database
             
+            db_nfe = Database(str(DB_PATH))
             certs = self.db.load_certificates()
             if not certs:
+                db_nfe.marcar_nota_verificada(chave, 'sem_certificados')
                 return
+            
+            xml_encontrado = False
             
             # Tenta com cada certificado
             for cert in certs:
@@ -1948,7 +1960,11 @@ class MainWindow(QMainWindow):
                             'informante': informante
                         })
                         
+                        # Marca como verificada com sucesso
+                        db_nfe.marcar_nota_verificada(chave, 'xml_completo')
+                        
                         print(f"[AUTO-VERIFICAÇÃO] ✅ XML completo salvo: {chave}")
+                        xml_encontrado = True
                         
                         # Atualiza interface
                         QTimer.singleShot(100, self.refresh_all)
@@ -1957,9 +1973,21 @@ class MainWindow(QMainWindow):
                 except Exception as e:
                     print(f"[AUTO-VERIFICAÇÃO] Erro ao buscar com certificado {cert.get('cnpj_cpf')}: {e}")
                     continue
+            
+            # Se não encontrou XML em nenhum certificado, marca como não encontrado
+            if not xml_encontrado:
+                db_nfe.marcar_nota_verificada(chave, 'nao_encontrado')
+                print(f"[AUTO-VERIFICAÇÃO] ⚠️ XML não encontrado: {chave}")
                     
         except Exception as e:
             print(f"[ERRO] Erro em _buscar_xml_completo_silencioso: {e}")
+            # Marca como erro para não tentar novamente
+            try:
+                from nfe_search import Database
+                db_nfe = Database(str(DB_PATH))
+                db_nfe.marcar_nota_verificada(chave, f'erro: {str(e)[:50]}')
+            except:
+                pass
     
     def refresh_table(self):
         # Stop any ongoing fill
