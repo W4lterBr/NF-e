@@ -1542,8 +1542,13 @@ class MainWindow(QMainWindow):
             if q:
                 if q not in (it.get("nome_emitente", "").lower()) and q not in (str(it.get("numero", "")).lower()) and q not in (it.get("cnpj_emitente", "").lower()):
                     continue
-            if st != "todos" and st not in (it.get("status", "").lower()):
-                continue
+            if st != "todos":
+                try:
+                    status_nota = (it.get("status") or "").lower()
+                    if st not in status_nota:
+                        continue
+                except Exception:
+                    continue
             if tp != "todos":
                 raw = (it.get("tipo", "") or "").strip().upper().replace('_','').replace(' ','')
                 if tp == "nfe" and raw not in ("NFE", "NF-E"):
@@ -1667,8 +1672,11 @@ class MainWindow(QMainWindow):
                 
                 # Filtro por status
                 if st != "todos":
-                    where_clauses.append("LOWER(status) LIKE ?")
-                    params.append(f"%{st}%")
+                    try:
+                        where_clauses.append("LOWER(status) LIKE ?")
+                        params.append(f"%{st}%")
+                    except Exception as e:
+                        print(f"[DEBUG] Erro ao aplicar filtro de status: {e}")
                 
                 # Filtro por tipo
                 if tp != "todos":
