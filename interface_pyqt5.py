@@ -4265,27 +4265,72 @@ class MainWindow(QMainWindow):
                     numero = None
                     data_emissao = None
                     valor = None
+                    cnpj_destinatario = None
+                    nome_destinatario = None
+                    ie_destinatario = None
+                    cfop = None
+                    ncm = None
+                    uf = None
+                    natureza = None
+                    base_icms = None
+                    valor_icms = None
+                    status_nfe = None
                     
                     # Tenta NFe
                     if tree.find('.//nfe:infNFe', namespaces=NS) is not None:
                         tipo = 'NFe'
                         chave_elem = tree.find('.//nfe:infNFe', namespaces=NS)
                         chave = chave_elem.get('Id', '').replace('NFe', '') if chave_elem is not None else None
+                        
+                        # Emitente
                         cnpj_emitente = tree.findtext('.//nfe:emit/nfe:CNPJ', namespaces=NS) or ''
                         nome_emitente = tree.findtext('.//nfe:emit/nfe:xNome', namespaces=NS) or ''
+                        uf = tree.findtext('.//nfe:emit/nfe:enderEmit/nfe:UF', namespaces=NS) or ''
+                        
+                        # Destinatário
+                        cnpj_destinatario = tree.findtext('.//nfe:dest/nfe:CNPJ', namespaces=NS) or tree.findtext('.//nfe:dest/nfe:CPF', namespaces=NS) or ''
+                        nome_destinatario = tree.findtext('.//nfe:dest/nfe:xNome', namespaces=NS) or ''
+                        ie_destinatario = tree.findtext('.//nfe:dest/nfe:IE', namespaces=NS) or ''
+                        
+                        # Dados da nota
                         numero = tree.findtext('.//nfe:ide/nfe:nNF', namespaces=NS) or ''
                         data_emissao = tree.findtext('.//nfe:ide/nfe:dhEmi', namespaces=NS) or tree.findtext('.//nfe:ide/nfe:dEmi', namespaces=NS) or ''
+                        natureza = tree.findtext('.//nfe:ide/nfe:natOp', namespaces=NS) or ''
+                        
+                        # Valores e impostos
                         valor = tree.findtext('.//nfe:total/nfe:ICMSTot/nfe:vNF', namespaces=NS) or '0'
+                        base_icms = tree.findtext('.//nfe:total/nfe:ICMSTot/nfe:vBC', namespaces=NS) or '0'
+                        valor_icms = tree.findtext('.//nfe:total/nfe:ICMSTot/nfe:vICMS', namespaces=NS) or '0'
+                        
+                        # CFOP e NCM do primeiro produto
+                        cfop = tree.findtext('.//nfe:det[1]/nfe:prod/nfe:CFOP', namespaces=NS) or ''
+                        ncm = tree.findtext('.//nfe:det[1]/nfe:prod/nfe:NCM', namespaces=NS) or ''
+                        
+                        # Status da nota (da autorização)
+                        status_nfe = tree.findtext('.//nfe:protNFe/nfe:infProt/nfe:cStat', namespaces=NS) or ''
                     
                     # Tenta CTe
                     elif tree.find('.//cte:infCte', namespaces=NS) is not None:
                         tipo = 'CTe'
                         chave_elem = tree.find('.//cte:infCte', namespaces=NS)
                         chave = chave_elem.get('Id', '').replace('CTe', '') if chave_elem is not None else None
+                        
+                        # Emitente
                         cnpj_emitente = tree.findtext('.//cte:emit/cte:CNPJ', namespaces=NS) or ''
                         nome_emitente = tree.findtext('.//cte:emit/cte:xNome', namespaces=NS) or ''
+                        uf = tree.findtext('.//cte:emit/cte:enderEmit/cte:UF', namespaces=NS) or ''
+                        
+                        # Destinatário (tomador)
+                        cnpj_destinatario = tree.findtext('.//cte:dest/cte:CNPJ', namespaces=NS) or tree.findtext('.//cte:dest/cte:CPF', namespaces=NS) or ''
+                        nome_destinatario = tree.findtext('.//cte:dest/cte:xNome', namespaces=NS) or ''
+                        
+                        # Dados do CT-e
                         numero = tree.findtext('.//cte:ide/cte:nCT', namespaces=NS) or ''
                         data_emissao = tree.findtext('.//cte:ide/cte:dhEmi', namespaces=NS) or ''
+                        natureza = tree.findtext('.//cte:ide/cte:natOp', namespaces=NS) or ''
+                        cfop = tree.findtext('.//cte:ide/cte:CFOP', namespaces=NS) or ''
+                        
+                        # Valor
                         valor = tree.findtext('.//cte:vPrest/cte:vTPrest', namespaces=NS) or '0'
                     
                     if not tipo or not chave:
@@ -4333,7 +4378,7 @@ class MainWindow(QMainWindow):
                     # Registra no banco de dados
                     self.db.register_xml_download(chave, str(dest_file), informante)
                     
-                    # Salva dados da nota no banco
+                    # Salva dados da nota no banco (com todos os campos extraídos)
                     nota_data = {
                         'chave': chave,
                         'numero': numero,
@@ -4342,6 +4387,14 @@ class MainWindow(QMainWindow):
                         'valor': valor,
                         'cnpj_emitente': cnpj_emitente_limpo,
                         'nome_emitente': nome_emitente,
+                        'ie_tomador': ie_destinatario,
+                        'cfop': cfop,
+                        'ncm': ncm,
+                        'natureza': natureza,
+                        'uf': uf,
+                        'base_icms': base_icms,
+                        'valor_icms': valor_icms,
+                        'status': 'Autorizado' if status_nfe == '100' else status_nfe,
                         'informante': informante,
                         'xml_status': 'COMPLETO'
                     }
