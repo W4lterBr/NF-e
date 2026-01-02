@@ -53,45 +53,8 @@ def run_task(task_name: str, payload: Dict[str, Any], timeout: int = 240) -> Dic
         # Run in subprocess with optimization flags
         env = {**os.environ.copy(), "PYTHONUNBUFFERED": "1", "PYTHONDONTWRITEBYTECODE": "1"}
         
-        # CORREÇÃO: Se estamos rodando no PyInstaller, usar python.exe do sistema
-        # ao invés do executável empacotado (que abrirá outra instância da interface)
-        python_exe = sys.executable
-        if getattr(sys, 'frozen', False):
-            # Estamos rodando no PyInstaller - encontrar python.exe do sistema
-            # Primeiro, tenta usar python do ambiente virtual se existir
-            possible_pythons = [
-                BASE_DIR / ".venv" / "Scripts" / "python.exe",  # venv local
-                Path(sys.executable).parent / "python.exe",  # pasta do executável
-                Path("C:/Python312/python.exe"),  # instalação padrão
-                Path("C:/Python311/python.exe"),
-                Path("C:/Python310/python.exe"),
-            ]
-            for py_path in possible_pythons:
-                if py_path.exists():
-                    python_exe = str(py_path)
-                    break
-            else:
-                # Última tentativa: buscar python.exe no PATH usando shutil.which
-                import shutil
-                found_python = shutil.which("python.exe") or shutil.which("python3.exe")
-                if found_python and Path(found_python).exists():
-                    # Verifica se não é o próprio executável
-                    if not found_python.lower().endswith(Path(sys.executable).name.lower()):
-                        python_exe = found_python
-                    else:
-                        # Se o which encontrou o próprio exe, erro crítico
-                        raise RuntimeError(
-                            "ERRO: Python não encontrado no sistema. "
-                            "Instale Python 3.10 ou superior para usar este recurso."
-                        )
-                else:
-                    raise RuntimeError(
-                        "ERRO: Python não encontrado no sistema. "
-                        "Instale Python 3.10 ou superior para usar este recurso."
-                    )
-        
         proc = subprocess.Popen(
-            [python_exe, "-u", str(worker_script)],
+            [sys.executable, "-u", str(worker_script)],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,

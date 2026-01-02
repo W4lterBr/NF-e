@@ -394,6 +394,19 @@ class DatabaseManager:
         except Exception:
             return False
     
+    def atualizar_status_nota(self, chave: str, novo_status: str) -> bool:
+        """Update note status in notas_detalhadas table."""
+        try:
+            with self._connect() as conn:
+                conn.execute(
+                    "UPDATE notas_detalhadas SET status = ?, atualizado_em = ? WHERE chave = ?",
+                    (novo_status, datetime.now().isoformat(), chave)
+                )
+                conn.commit()
+                return True
+        except Exception:
+            return False
+    
     def register_xml_download(self, chave: str, caminho: str, cnpj_cpf: str = "") -> bool:
         """Register downloaded XML in xmls_baixados table."""
         try:

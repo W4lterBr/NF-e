@@ -1508,12 +1508,31 @@ class MainWindow(QMainWindow):
         limit_text = self.limit_dd.currentText()
         limit = None if limit_text == "Todos" else int(limit_text)
         
+        # Função para normalizar CNPJ (remove pontuação)
+        def normalizar_cnpj(cnpj: str) -> str:
+            return ''.join(c for c in str(cnpj or '') if c.isdigit())
+        
+        # Carrega CNPJs dos certificados cadastrados (empresa)
+        try:
+            certs = self.db.load_certificates()
+            company_cnpjs = {normalizar_cnpj(c.get('cnpj_cpf') or '') for c in certs}
+            company_cnpjs.discard('')  # Remove string vazia se houver
+        except Exception as e:
+            print(f"[DEBUG] Erro ao carregar certificados para filtro: {e}")
+            company_cnpjs = set()
+        
         out: List[Dict[str, Any]] = []
         for it in (self.notes or []):
             # NÃO MOSTRAR eventos na interface (apenas armazenar em disco)
             xml_status = (it.get('xml_status') or '').upper()
             if xml_status == 'EVENTO':
                 continue
+            
+            # FILTRO PRINCIPAL: Exclui notas emitidas pela própria empresa
+            # Esta aba deve mostrar apenas "Emitidos por terceiros"
+            cnpj_emitente_normalizado = normalizar_cnpj(it.get('cnpj_emitente') or '')
+            if cnpj_emitente_normalizado in company_cnpjs:
+                continue  # Pula notas emitidas pela própria empresa
             
             if selected_cert:
                 # Filtra por 'informante' (CNPJ/CPF do certificado que trouxe a nota)
