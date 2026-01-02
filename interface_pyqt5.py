@@ -1545,7 +1545,18 @@ class MainWindow(QMainWindow):
             if st != "todos":
                 try:
                     status_nota = (it.get("status") or "").lower()
-                    if st not in status_nota:
+                    # Usa raiz das palavras para filtrar corretamente
+                    # "Cancelado" -> busca "cancel" (pega "Cancelamento de NF-e homologado")
+                    # "Autorizado" -> busca "autor" (pega "Autorizado o uso da NF-e")
+                    search_term = st
+                    if st == "cancelado":
+                        search_term = "cancel"
+                    elif st == "autorizado":
+                        search_term = "autor"
+                    elif st == "denegado":
+                        search_term = "denega"
+                    
+                    if search_term not in status_nota:
                         continue
                 except Exception:
                     continue
@@ -1673,8 +1684,17 @@ class MainWindow(QMainWindow):
                 # Filtro por status
                 if st != "todos":
                     try:
+                        # Usa raiz das palavras para filtrar corretamente
+                        search_term = st
+                        if st == "cancelado":
+                            search_term = "cancel"
+                        elif st == "autorizado":
+                            search_term = "autor"
+                        elif st == "denegado":
+                            search_term = "denega"
+                        
                         where_clauses.append("LOWER(status) LIKE ?")
-                        params.append(f"%{st}%")
+                        params.append(f"%{search_term}%")
                     except Exception as e:
                         print(f"[DEBUG] Erro ao aplicar filtro de status: {e}")
                 
