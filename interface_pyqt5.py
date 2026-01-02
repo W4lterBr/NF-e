@@ -2156,9 +2156,9 @@ class MainWindow(QMainWindow):
         c_status.setTextAlignment(Qt.AlignCenter)
         self.table_emitidos.setItem(r, 6, c_status)
         
-        # IMPORTANTE: Para emitidos, mostramos informante (que é o destinatário)
+        # IMPORTANTE: Para emitidos, mostramos o CNPJ/CPF do destinatário
         # Os headers já foram renomeados para "Destinatário CNPJ" e "Destinatário Nome"
-        self.table_emitidos.setItem(r, 7, cell(it.get("informante")))
+        self.table_emitidos.setItem(r, 7, cell(it.get("cnpj_destinatario") or ""))
         # Nome do destinatário vem do campo nome_destinatario
         self.table_emitidos.setItem(r, 8, cell(it.get("nome_destinatario") or ""))
         
@@ -4363,6 +4363,7 @@ class MainWindow(QMainWindow):
                         'cnpj_emitente': cnpj_emitente_limpo,
                         'nome_emitente': nome_emitente,
                         'nome_destinatario': nome_destinatario,
+                        'cnpj_destinatario': cnpj_destinatario,
                         'ie_tomador': ie_destinatario,
                         'cfop': cfop,
                         'ncm': ncm,
