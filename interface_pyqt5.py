@@ -6889,7 +6889,7 @@ def main():
         if last_error == ERROR_ALREADY_EXISTS:
             # REGISTRA NO LOG para análise posterior
             import datetime
-            log_file = DATA_DIR / "mutex_debug.log"
+            log_file = LOGS_DIR / "mutex_debug.log"
             try:
                 with open(log_file, "a", encoding="utf-8") as f:
                     timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
