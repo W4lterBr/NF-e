@@ -53,8 +53,29 @@ def run_task(task_name: str, payload: Dict[str, Any], timeout: int = 240) -> Dic
         # Run in subprocess with optimization flags
         env = {**os.environ.copy(), "PYTHONUNBUFFERED": "1", "PYTHONDONTWRITEBYTECODE": "1"}
         
+        # CORREÇÃO: Se estamos rodando no PyInstaller, usar python.exe do sistema
+        # ao invés do executável empacotado (que abrirá outra instância da interface)
+        python_exe = sys.executable
+        if getattr(sys, 'frozen', False):
+            # Estamos rodando no PyInstaller - encontrar python.exe do sistema
+            # Primeiro, tenta usar python do ambiente virtual se existir
+            possible_pythons = [
+                BASE_DIR / ".venv" / "Scripts" / "python.exe",  # venv local
+                Path(sys.executable).parent / "python.exe",  # pasta do executável
+                Path("C:/Python312/python.exe"),  # instalação padrão
+                Path("C:/Python311/python.exe"),
+                Path("C:/Python310/python.exe"),
+            ]
+            for py_path in possible_pythons:
+                if py_path.exists():
+                    python_exe = str(py_path)
+                    break
+            else:
+                # Última tentativa: usar 'python' do PATH
+                python_exe = "python"
+        
         proc = subprocess.Popen(
-            [sys.executable, "-u", str(worker_script)],
+            [python_exe, "-u", str(worker_script)],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
