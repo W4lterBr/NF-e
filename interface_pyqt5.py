@@ -931,6 +931,15 @@ class MainWindow(QMainWindow):
             if self._load_worker.isRunning():
                 self._load_worker.terminate()
         
+        # Finaliza thread de busca
+        if hasattr(self, '_search_worker') and self._search_worker and self._search_worker.isRunning():
+            print(f"[DEBUG] Aguardando finalização de thread de busca...")
+            self._search_worker.wait(2000)
+            if self._search_worker.isRunning():
+                print(f"[DEBUG] Forçando término de thread de busca...")
+                self._search_worker.terminate()
+                self._search_worker.wait(500)
+        
         # Finaliza threads de geração de PDF
         if hasattr(self, '_pdf_workers'):
             for worker in self._pdf_workers[:]:  # Cópia da lista
@@ -1447,10 +1456,15 @@ class MainWindow(QMainWindow):
                         self.btn_refresh.setEnabled(True)
                 except Exception:
                     pass
+                # Aguarda a thread finalizar antes de limpar referência
+                if self._load_worker and self._load_worker.isRunning():
+                    self._load_worker.quit()
+                    self._load_worker.wait()
                 self._load_worker = None
 
         self._load_worker = LoadNotesWorker(self.db, limit=1000)
         self._load_worker.finished_notes.connect(on_loaded)
+        self._load_worker.finished.connect(lambda: self._load_worker.deleteLater() if self._load_worker else None)
         self._load_worker.start()
     
     def _clear_date_filters(self):
