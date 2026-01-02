@@ -1456,15 +1456,16 @@ class MainWindow(QMainWindow):
                         self.btn_refresh.setEnabled(True)
                 except Exception:
                     pass
-                # Aguarda a thread finalizar antes de limpar referência
-                if self._load_worker and self._load_worker.isRunning():
-                    self._load_worker.quit()
-                    self._load_worker.wait()
+
+        def on_thread_finished():
+            """Chamado quando a thread realmente terminou de executar"""
+            if self._load_worker:
+                self._load_worker.deleteLater()
                 self._load_worker = None
 
         self._load_worker = LoadNotesWorker(self.db, limit=1000)
         self._load_worker.finished_notes.connect(on_loaded)
-        self._load_worker.finished.connect(lambda: self._load_worker.deleteLater() if self._load_worker else None)
+        self._load_worker.finished.connect(on_thread_finished)
         self._load_worker.start()
     
     def _clear_date_filters(self):
