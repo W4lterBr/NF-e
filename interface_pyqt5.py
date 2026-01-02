@@ -224,108 +224,6 @@ def run_search(progress_cb: Optional[Callable[[str], None]] = None) -> Dict[str,
         sys.stdout = old_stdout
 
 
-def safe_open_pdf(pdf_path: str) -> tuple[bool, str]:
-    """
-    Abre PDF de forma segura, SEMPRE usando leitor explícito (NUNCA a associação do Windows).
-    
-    Retorna (sucesso: bool, mensagem_erro: str)
-    """
-    pdf_path = str(pdf_path)
-    
-    # Verifica se é realmente um PDF
-    if not pdf_path.lower().endswith('.pdf'):
-        return False, "Arquivo não é um PDF"
-    
-    if not os.path.exists(pdf_path):
-        return False, f"PDF não encontrado: {pdf_path}"
-    
-    print(f"[SAFE PDF] Abrindo PDF com leitor explícito: {pdf_path}")
-    
-    # ESTRATÉGIA: NUNCA usa associação do Windows (os.startfile)
-    # SEMPRE tenta abrir com programas explícitos na ordem de prioridade
-    
-    # 1. Tenta Microsoft Edge (vem pré-instalado no Windows 10/11)
-    edge_paths = [
-        r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
-        r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
-    ]
-    for edge_path in edge_paths:
-        if os.path.exists(edge_path):
-            try:
-                print(f"[SAFE PDF] Tentando Edge: {edge_path}")
-                subprocess.Popen([edge_path, "--app=" + pdf_path], 
-                               creationflags=subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS)
-                print(f"[SAFE PDF] ✅ PDF aberto com Edge")
-                return True, ""
-            except Exception as e:
-                print(f"[SAFE PDF] ❌ Erro ao abrir com Edge: {e}")
-    
-    # 2. Tenta Adobe Acrobat Reader
-    adobe_paths = [
-        r"C:\Program Files\Adobe\Acrobat DC\Acrobat\Acrobat.exe",
-        r"C:\Program Files (x86)\Adobe\Acrobat Reader DC\Reader\AcroRd32.exe",
-        r"C:\Program Files\Adobe\Acrobat Reader DC\Reader\AcroRd32.exe",
-    ]
-    for adobe_path in adobe_paths:
-        if os.path.exists(adobe_path):
-            try:
-                print(f"[SAFE PDF] Tentando Adobe: {adobe_path}")
-                subprocess.Popen([adobe_path, pdf_path],
-                               creationflags=subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS)
-                print(f"[SAFE PDF] ✅ PDF aberto com Adobe")
-                return True, ""
-            except Exception as e:
-                print(f"[SAFE PDF] ❌ Erro ao abrir com Adobe: {e}")
-    
-    # 3. Tenta Google Chrome
-    chrome_paths = [
-        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
-        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
-    ]
-    for chrome_path in chrome_paths:
-        if os.path.exists(chrome_path):
-            try:
-                print(f"[SAFE PDF] Tentando Chrome: {chrome_path}")
-                subprocess.Popen([chrome_path, "--app=" + pdf_path],
-                               creationflags=subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS)
-                print(f"[SAFE PDF] ✅ PDF aberto com Chrome")
-                return True, ""
-            except Exception as e:
-                print(f"[SAFE PDF] ❌ Erro ao abrir com Chrome: {e}")
-    
-    # 4. Tenta Firefox
-    firefox_paths = [
-        r"C:\Program Files\Mozilla Firefox\firefox.exe",
-        r"C:\Program Files (x86)\Mozilla Firefox\firefox.exe",
-    ]
-    for firefox_path in firefox_paths:
-        if os.path.exists(firefox_path):
-            try:
-                print(f"[SAFE PDF] Tentando Firefox: {firefox_path}")
-                subprocess.Popen([firefox_path, pdf_path],
-                               creationflags=subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS)
-                print(f"[SAFE PDF] ✅ PDF aberto com Firefox")
-                return True, ""
-            except Exception as e:
-                print(f"[SAFE PDF] ❌ Erro ao abrir com Firefox: {e}")
-    
-    # Se chegou aqui, nenhum leitor explícito foi encontrado
-    # NÃO usa ShellExecute ou os.startfile para evitar abrir o próprio executável
-    error_msg = (
-        "❌ Nenhum leitor de PDF foi encontrado!\n\n"
-        "O sistema tentou abrir o PDF com:\n"
-        "• Microsoft Edge (recomendado)\n"
-        "• Adobe Acrobat Reader\n"
-        "• Google Chrome\n"
-        "• Mozilla Firefox\n\n"
-        "Por favor, instale pelo menos um desses programas.\n\n"
-        "IMPORTANTE: O Windows 10/11 já vem com o Edge instalado.\n"
-        "Se você está vendo este erro, pode ser necessário reinstalá-lo."
-    )
-    print(f"[SAFE PDF] ❌ FALHA TOTAL: {error_msg}")
-    return False, error_msg
-
-
 def resolve_xml_text(item: Dict[str, Any]) -> Optional[str]:
     try:
         chave = (item.get("chave") or "").strip()
@@ -349,40 +247,6 @@ def resolve_xml_text(item: Dict[str, Any]) -> Optional[str]:
                         print(f"[DEBUG XML] ⚠️ Erro ao ler arquivo: {e}")
         
         print(f"[DEBUG XML] Buscando XML nas pastas locais para chave: {chave}")
-        
-        # Busca prioritária: pasta xmls organizada por informante/tipo
-        # Estrutura: xmls/[informante]/[ano-mes]/[NFe|CTe|Resumos|Eventos]/
-        try:
-            informante = item.get('informante', '')
-            if informante:
-                informante_digits = ''.join(ch for ch in str(informante) if ch.isdigit())
-                if informante_digits:
-                    # Busca na estrutura organizada do nfe_search.py
-                    xmls_informante = DATA_DIR / "xmls" / informante_digits
-                    if xmls_informante.exists():
-                        print(f"[DEBUG XML] Buscando em estrutura organizada: {xmls_informante}")
-                        # Busca em todas as subpastas (ano-mes/tipo)
-                        for xml_file in xmls_informante.rglob(f"*{chave}*.xml"):
-                            try:
-                                print(f"[DEBUG XML] ✅ XML encontrado em estrutura organizada: {xml_file}")
-                                return xml_file.read_text(encoding="utf-8", errors="ignore")
-                            except Exception:
-                                continue
-                        
-                        # Busca pelo conteúdo (mais lento, mas garante encontrar)
-                        print(f"[DEBUG XML] Buscando por conteúdo na estrutura organizada...")
-                        for xml_file in xmls_informante.rglob("*.xml"):
-                            try:
-                                content = xml_file.read_text(encoding="utf-8", errors="ignore")
-                                if chave in content:
-                                    print(f"[DEBUG XML] ✅ XML encontrado por conteúdo: {xml_file}")
-                                    return content
-                            except Exception:
-                                continue
-        except Exception as e:
-            print(f"[DEBUG XML] ⚠️ Erro na busca organizada: {e}")
-        
-        # Busca alternativa: pastas antigas/legadas
         roots = [
             DATA_DIR / "xmls",
             DATA_DIR / "xmls_chave",
@@ -3088,10 +2952,8 @@ class MainWindow(QMainWindow):
                     print(f"[DEBUG PDF] ⚡ Cache hit! Tempo: {time.time() - cache_start:.3f}s")
                     pdf_str = str(cached_pdf.absolute())
                     if sys.platform == "win32":
-                        # Usa safe_open_pdf para evitar abrir o próprio executável
-                        success, error = safe_open_pdf(pdf_str)
-                        if not success:
-                            raise Exception(error)
+                        # Abre PDF com visualizador padrão do Windows (evita abrir interface se PDF estiver associado incorretamente)
+                        subprocess.Popen(["cmd", "/c", "start", "", pdf_str], shell=False, creationflags=subprocess.CREATE_NO_WINDOW)  # type: ignore[attr-defined]
                     else:
                         subprocess.Popen(["xdg-open", pdf_str])
                     total_time = time.time() - start_time
@@ -3182,8 +3044,64 @@ class MainWindow(QMainWindow):
         
         print(f"[DEBUG PDF] Etapa 3 concluída em {time.time() - recursive_start:.3f}s")
         
-        # Etapa 3.5 REMOVIDA: Busca por XML lendo conteúdo era MUITO LENTA
-        # Se não encontrou o PDF nas etapas anteriores, vai direto para geração
+        # Etapa 3.5: Se ainda não encontrou, busca pelo XML e depois o PDF (estrutura número-nome + Debug de notas)
+        if not pdf_path and chave:
+            print(f"[DEBUG PDF] Etapa 3.5: Busca por XML contendo a chave...")
+            xml_search_start = time.time()
+            try:
+                xmls_root = DATA_DIR / "xmls"
+                if xmls_root.exists():
+                    # Busca otimizada: primeiro nas pastas mais prováveis
+                    xml_found = None
+                    
+                    # Busca 1: Na pasta do informante (se tiver informante)
+                    if informante:
+                        informante_folder = xmls_root / informante
+                        if informante_folder.exists():
+                            for xml_file in informante_folder.rglob("*.xml"):
+                                if chave in xml_file.name or chave in xml_file.read_text(encoding='utf-8', errors='ignore'):
+                                    xml_found = xml_file
+                                    print(f"[DEBUG PDF] ✅ XML encontrado na pasta do informante: {xml_file}")
+                                    break
+                    
+                    # Busca 2: Em Debug de notas (muito comum para XMLs baixados)
+                    if not xml_found:
+                        debug_folder = xmls_root / "Debug de notas"
+                        if debug_folder.exists():
+                            for xml_file in debug_folder.glob("*.xml"):
+                                try:
+                                    if chave in xml_file.name or chave in xml_file.read_text(encoding='utf-8', errors='ignore'):
+                                        xml_found = xml_file
+                                        print(f"[DEBUG PDF] ✅ XML encontrado em Debug de notas: {xml_file}")
+                                        break
+                                except:
+                                    continue
+                    
+                    # Busca 3: Busca geral (último recurso)
+                    if not xml_found:
+                        for xml_file in xmls_root.rglob("*.xml"):
+                            try:
+                                # Ignora pastas de backup
+                                if 'backup' in str(xml_file).lower():
+                                    continue
+                                if chave in xml_file.name or chave in xml_file.read_text(encoding='utf-8', errors='ignore'):
+                                    xml_found = xml_file
+                                    print(f"[DEBUG PDF] ✅ XML encontrado: {xml_file}")
+                                    break
+                            except:
+                                continue
+                    
+                    if xml_found:
+                        # Verifica se existe PDF com mesmo nome
+                        pdf_candidate = xml_found.with_suffix('.pdf')
+                        if pdf_candidate.exists():
+                            print(f"[DEBUG PDF] ✅ PDF encontrado via XML: {pdf_candidate}")
+                            pdf_path = pdf_candidate
+                        else:
+                            print(f"[DEBUG PDF] ℹ️ PDF não existe ainda, será gerado em: {pdf_candidate}")
+            except Exception as e:
+                print(f"[DEBUG PDF] Erro na busca por XML: {e}")
+            print(f"[DEBUG PDF] Etapa 3.5 concluída em {time.time() - xml_search_start:.3f}s")
         
         # Se PDF existe, abre imediatamente e adiciona ao cache
         print(f"[DEBUG PDF] Etapa 4: Abertura do PDF...")
@@ -3197,10 +3115,8 @@ class MainWindow(QMainWindow):
                 
                 pdf_str = str(pdf_path.absolute())
                 if sys.platform == "win32":
-                    # Usa safe_open_pdf para evitar abrir o próprio executável
-                    success, error = safe_open_pdf(pdf_str)
-                    if not success:
-                        raise Exception(error)
+                    # Abre PDF com visualizador padrão do Windows (evita abrir interface se PDF estiver associado incorretamente)
+                    subprocess.Popen(["cmd", "/c", "start", "", pdf_str], shell=False, creationflags=subprocess.CREATE_NO_WINDOW)  # type: ignore[attr-defined]
                 else:
                     subprocess.Popen(["xdg-open", pdf_str])
                 print(f"[DEBUG PDF] Etapa 4 concluída em {time.time() - open_start:.3f}s")
@@ -3213,17 +3129,35 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(self, "Erro ao abrir PDF", f"Erro: {e}")
                 return
         
-        # Se não tem PDF, gera de forma assíncrona (busca XML + gera PDF em thread separada)
-        print(f"[DEBUG PDF] PDF não encontrado - iniciando geração assíncrona...")
-        self.set_status("⏳ Buscando XML e gerando PDF... Por favor aguarde...")
+        # Se não tem PDF, verifica se tem XML antes de gerar
+        print(f"[DEBUG PDF] Etapa 5: Verificando XML antes de gerar PDF...")
+        xml_check_start = time.time()
+        
+        # Busca o XML localmente primeiro
+        xml_text = resolve_xml_text(item)
+        if not xml_text:
+            print(f"[DEBUG PDF] ❌ XML não encontrado localmente")
+            QMessageBox.warning(
+                self, 
+                "XML não encontrado", 
+                f"Não foi possível encontrar o XML para a chave {chave}.\n\n"
+                "O PDF só pode ser gerado se o XML estiver disponível."
+            )
+            return
+        
+        print(f"[DEBUG PDF] ✅ XML encontrado, iniciando geração de PDF...")
+        print(f"[DEBUG PDF] Etapa 5 concluída em {time.time() - xml_check_start:.3f}s")
+        
+        # Tem XML, pode gerar PDF (LENTO) - executa em thread separada
+        print(f"[DEBUG PDF] Etapa 6: Geração de PDF necessária...")
+        generation_start = time.time()
+        self.set_status("⏳ Gerando PDF... Por favor aguarde...")
         QApplication.processEvents()
         
-        # Cria worker thread que buscará o XML e gerará o PDF sem travar a interface
-        print(f"[DEBUG PDF] Criando worker thread para busca de XML e geração de PDF...")
+        # Cria worker thread para não travar a interface
+        print(f"[DEBUG PDF] Criando worker thread para geração assíncrona...")
         self._process_pdf_async(item)
-        print(f"[DEBUG PDF] Worker criado - processamento em background")
-        total_time = time.time() - start_time
-        print(f"[DEBUG PDF] ✅ Worker iniciado em {total_time:.3f}s (interface não travada)")
+        print(f"[DEBUG PDF] Worker criado - aguardando conclusão em background")
         print(f"[DEBUG PDF] ========================================\n")
     
     def _on_table_emitidos_double_clicked(self, row: int, col: int):
@@ -3260,10 +3194,8 @@ class MainWindow(QMainWindow):
                     print(f"[DEBUG PDF EMITIDOS] ⚡ Cache hit! Tempo: {time.time() - cache_start:.3f}s")
                     pdf_str = str(cached_pdf.absolute())
                     if sys.platform == "win32":
-                        # Usa safe_open_pdf para evitar abrir o próprio executável
-                        success, error = safe_open_pdf(pdf_str)
-                        if not success:
-                            raise Exception(error)
+                        # Abre PDF com visualizador padrão do Windows (evita abrir interface se PDF estiver associado incorretamente)
+                        subprocess.Popen(["cmd", "/c", "start", "", pdf_str], shell=False, creationflags=subprocess.CREATE_NO_WINDOW)  # type: ignore[attr-defined]
                     else:
                         subprocess.Popen(["xdg-open", pdf_str])
                     total_time = time.time() - start_time
@@ -3400,10 +3332,8 @@ class MainWindow(QMainWindow):
                 
                 pdf_str = str(pdf_path.absolute())
                 if sys.platform == "win32":
-                    # Usa safe_open_pdf para evitar abrir o próprio executável
-                    success, error = safe_open_pdf(pdf_str)
-                    if not success:
-                        raise Exception(error)
+                    # Abre PDF com visualizador padrão do Windows (evita abrir interface se PDF estiver associado incorretamente)
+                    subprocess.Popen(["cmd", "/c", "start", "", pdf_str], shell=False, creationflags=subprocess.CREATE_NO_WINDOW)  # type: ignore[attr-defined]
                 else:
                     subprocess.Popen(["xdg-open", pdf_str])
                 print(f"[DEBUG PDF EMITIDOS] Etapa 4 concluída em {time.time() - open_start:.3f}s")
@@ -3416,17 +3346,35 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(self, "Erro ao abrir PDF", f"Erro: {e}")
                 return
         
-        # Se não tem PDF, gera de forma assíncrona (busca XML + gera PDF em thread separada)
-        print(f"[DEBUG PDF EMITIDOS] PDF não encontrado - iniciando geração assíncrona...")
-        self.set_status("⏳ Buscando XML e gerando PDF... Por favor aguarde...")
+        # Se não tem PDF, verifica se tem XML antes de gerar
+        print(f"[DEBUG PDF EMITIDOS] Etapa 5: Verificando XML antes de gerar PDF...")
+        xml_check_start = time.time()
+        
+        # Busca o XML localmente primeiro
+        xml_text = resolve_xml_text(item)
+        if not xml_text:
+            print(f"[DEBUG PDF EMITIDOS] ❌ XML não encontrado localmente")
+            QMessageBox.warning(
+                self, 
+                "XML não encontrado", 
+                f"Não foi possível encontrar o XML para a chave {chave}.\n\n"
+                "O PDF só pode ser gerado se o XML estiver disponível."
+            )
+            return
+        
+        print(f"[DEBUG PDF EMITIDOS] ✅ XML encontrado, iniciando geração de PDF...")
+        print(f"[DEBUG PDF EMITIDOS] Etapa 5 concluída em {time.time() - xml_check_start:.3f}s")
+        
+        # Tem XML, pode gerar PDF (LENTO) - executa em thread separada
+        print(f"[DEBUG PDF EMITIDOS] Etapa 6: Geração de PDF necessária...")
+        generation_start = time.time()
+        self.set_status("⏳ Gerando PDF... Por favor aguarde...")
         QApplication.processEvents()
         
-        # Cria worker thread que buscará o XML e gerará o PDF sem travar a interface
-        print(f"[DEBUG PDF EMITIDOS] Criando worker thread para busca de XML e geração de PDF...")
+        # Cria worker thread para não travar a interface
+        print(f"[DEBUG PDF EMITIDOS] Criando worker thread para geração assíncrona...")
         self._process_pdf_async(item)
-        print(f"[DEBUG PDF EMITIDOS] Worker criado - processamento em background")
-        total_time = time.time() - start_time
-        print(f"[DEBUG PDF EMITIDOS] ✅ Worker iniciado em {total_time:.3f}s (interface não travada)")
+        print(f"[DEBUG PDF EMITIDOS] Worker criado - aguardando conclusão em background")
         print(f"[DEBUG PDF EMITIDOS] ========================================\n")
     
     def _process_pdf_async(self, item: Dict[str, Any]):
@@ -3528,26 +3476,43 @@ class MainWindow(QMainWindow):
                         except Exception:
                             pass
                     
-                    # Determine PDF path
+                    # Determine PDF path - OTIMIZADO para buscar o XML em toda estrutura
                     if saved_xml_path:
                         pdf_path = Path(saved_xml_path).with_suffix('.pdf')
                     else:
                         if chave and informante:
-                            xmls_root = DATA_DIR / "xmls" / informante
+                            # Busca o XML em toda a estrutura do informante (incluindo Debug de notas)
+                            xmls_root = DATA_DIR / "xmls"
                             found_xml = None
-                            if xmls_root.exists():
-                                tipo_folder = xmls_root / tipo
-                                if tipo_folder.exists():
-                                    for xml_file in tipo_folder.rglob(f"{chave}.xml"):
+                            
+                            # Busca 1: Na pasta do informante (mais provável)
+                            informante_folder = xmls_root / informante
+                            if informante_folder.exists():
+                                for xml_file in informante_folder.rglob(f"{chave}.xml"):
+                                    found_xml = xml_file
+                                    break
+                            
+                            # Busca 2: Se não encontrou, busca em Debug de notas
+                            if not found_xml:
+                                debug_folder = xmls_root / "Debug de notas"
+                                if debug_folder.exists():
+                                    for xml_file in debug_folder.glob(f"*{chave}*.xml"):
                                         found_xml = xml_file
                                         break
-                                if not found_xml:
-                                    for xml_file in xmls_root.rglob(f"{chave}.xml"):
+                            
+                            # Busca 3: Se ainda não encontrou, busca em toda estrutura
+                            if not found_xml and xmls_root.exists():
+                                for xml_file in xmls_root.rglob(f"*{chave}*.xml"):
+                                    # Ignora pastas de backup
+                                    if 'backup' not in str(xml_file).lower():
                                         found_xml = xml_file
                                         break
+                            
                             if found_xml:
+                                # Salva PDF junto com o XML encontrado
                                 pdf_path = found_xml.with_suffix('.pdf')
                             else:
+                                # Último recurso: pasta temporária
                                 import tempfile
                                 tmp = Path(tempfile.gettempdir()) / "BOT_Busca_NFE_PDFs"
                                 tmp.mkdir(parents=True, exist_ok=True)
@@ -3596,10 +3561,8 @@ class MainWindow(QMainWindow):
                 pdf_path = result.get("pdf_path")
                 try:
                     if sys.platform == "win32":
-                        # Usa safe_open_pdf para evitar abrir o próprio executável
-                        success, error = safe_open_pdf(pdf_path)
-                        if not success:
-                            raise Exception(error)
+                        # Abre PDF com visualizador padrão do Windows (evita abrir interface se PDF estiver associado incorretamente)
+                        subprocess.Popen(["cmd", "/c", "start", "", pdf_path], shell=False, creationflags=subprocess.CREATE_NO_WINDOW)  # type: ignore[attr-defined]
                     else:
                         subprocess.Popen(["xdg-open", pdf_path])
                     self.set_status("✅ PDF gerado e aberto com sucesso!", 2000)
@@ -6872,74 +6835,37 @@ def main():
     os.environ.setdefault("PYTHONUTF8", "1")
     
     # ===== PROTEÇÃO CONTRA MÚLTIPLAS INSTÂNCIAS =====
-    # EXCEÇÃO: Se foi chamado com -u <script>, é um worker isolado (sandbox_task_runner.py)
-    # Esses workers devem poder rodar em paralelo para processar PDFs/SEFAZ
-    is_sandbox_worker = (
-        len(sys.argv) >= 3 and 
-        sys.argv[1] == "-u" and 
-        ("sandbox_task_runner.py" in sys.argv[2] or "_temp_runner.py" in sys.argv[2])
-    )
-    
-    if not is_sandbox_worker:
-        # Cria um mutex único para o sistema "Busca XML"
-        # Se já existir, significa que outra instância está rodando
-        if sys.platform == "win32":
-            kernel32 = ctypes.windll.kernel32
-            ERROR_ALREADY_EXISTS = 183
+    # Cria um mutex único para o sistema "Busca XML"
+    # Se já existir, significa que outra instância está rodando
+    if sys.platform == "win32":
+        kernel32 = ctypes.windll.kernel32
+        ERROR_ALREADY_EXISTS = 183
+        
+        # Nome único do mutex (pode ser qualquer string única)
+        mutex_name = "Global\\BuscaXML_SingleInstance_Mutex_9A8B7C6D"
+        
+        # Tenta criar o mutex
+        mutex = kernel32.CreateMutexW(None, False, mutex_name)
+        last_error = kernel32.GetLastError()
+        
+        # Se o mutex já existe, outra instância está rodando
+        if last_error == ERROR_ALREADY_EXISTS:
+            # Mostra mensagem de erro usando MessageBox do Windows (mais confiável que QMessageBox antes do QApplication)
+            user32 = ctypes.windll.user32
+            MB_OK = 0x00000000
+            MB_ICONWARNING = 0x00000030
+            MB_TOPMOST = 0x00040000
             
-            # Nome único do mutex (pode ser qualquer string única)
-            mutex_name = "Global\\BuscaXML_SingleInstance_Mutex_9A8B7C6D"
-            
-            # Tenta criar o mutex
-            mutex = kernel32.CreateMutexW(None, False, mutex_name)
-            last_error = kernel32.GetLastError()
-            
-            # Se o mutex já existe, outra instância está rodando
-            if last_error == ERROR_ALREADY_EXISTS:
-                # REGISTRA NO LOG para análise posterior
-                import datetime
-                log_file = LOGS_DIR / "mutex_debug.log"
-                try:
-                    with open(log_file, "a", encoding="utf-8") as f:
-                        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                        f.write(f"\n{'='*80}\n")
-                        f.write(f"[{timestamp}] TENTATIVA DE SEGUNDA INSTÂNCIA BLOQUEADA\n")
-                        f.write(f"{'='*80}\n")
-                        f.write(f"Executável: {sys.executable}\n")
-                        f.write(f"Argumentos: {sys.argv}\n")
-                        f.write(f"Diretório de trabalho: {os.getcwd()}\n")
-                        f.write(f"Variáveis de ambiente relevantes:\n")
-                        for var in ['TEMP', 'TMP', 'USERPROFILE', 'PROGRAMFILES']:
-                            f.write(f"  {var}: {os.environ.get(var, 'N/A')}\n")
-                        f.write(f"\n")
-                except Exception as e:
-                    # Se não conseguir logar, continua mesmo assim
-                    pass
-                
-                # Mostra mensagem de erro usando MessageBox do Windows (mais confiável que QMessageBox antes do QApplication)
-                user32 = ctypes.windll.user32
-                MB_OK = 0x00000000
-                MB_ICONWARNING = 0x00000030
-                MB_TOPMOST = 0x00040000
-                
-                # Mostra informações sobre COMO o programa foi chamado (para debug)
-                cmd_line = " ".join(sys.argv)
-                executable = sys.executable
-                
-                mensagem = (
-                    "O sistema 'Busca XML' já está em execução!\n\n"
-                    "Não é permitido abrir múltiplas instâncias do programa.\n\n"
-                    "Por favor, use a instância que já está aberta.\n\n"
-                    f"DEBUG - Como foi chamado:\n"
-                    f"Executável: {executable}\n"
-                    f"Argumentos: {cmd_line}\n\n"
-                    f"📋 Log salvo em: {log_file}"
-                )
-                user32.MessageBoxW(None, mensagem, "Busca XML - Já em Execução", MB_OK | MB_ICONWARNING | MB_TOPMOST)
-                sys.exit(1)
-            
-            # Mantém o mutex aberto durante toda a execução do programa
-            # Ele será automaticamente liberado quando o processo terminar
+            mensagem = (
+                "O sistema 'Busca XML' já está em execução!\n\n"
+                "Não é permitido abrir múltiplas instâncias do programa.\n\n"
+                "Por favor, use a instância que já está aberta."
+            )
+            user32.MessageBoxW(None, mensagem, "Busca XML - Já em Execução", MB_OK | MB_ICONWARNING | MB_TOPMOST)
+            sys.exit(1)
+        
+        # Mantém o mutex aberto durante toda a execução do programa
+        # Ele será automaticamente liberado quando o processo terminar
     # ===== FIM DA PROTEÇÃO =====
     
     app = QApplication(sys.argv)
