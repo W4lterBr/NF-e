@@ -6893,10 +6893,17 @@ def main():
             MB_ICONWARNING = 0x00000030
             MB_TOPMOST = 0x00040000
             
+            # Mostra informações sobre COMO o programa foi chamado (para debug)
+            cmd_line = " ".join(sys.argv)
+            executable = sys.executable
+            
             mensagem = (
                 "O sistema 'Busca XML' já está em execução!\n\n"
                 "Não é permitido abrir múltiplas instâncias do programa.\n\n"
-                "Por favor, use a instância que já está aberta."
+                "Por favor, use a instância que já está aberta.\n\n"
+                f"DEBUG - Como foi chamado:\n"
+                f"Executável: {executable}\n"
+                f"Argumentos: {cmd_line}"
             )
             user32.MessageBoxW(None, mensagem, "Busca XML - Já em Execução", MB_OK | MB_ICONWARNING | MB_TOPMOST)
             sys.exit(1)
