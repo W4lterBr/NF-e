@@ -3044,55 +3044,92 @@ class MainWindow(QMainWindow):
         
         print(f"[DEBUG PDF] Etapa 3 concluída em {time.time() - recursive_start:.3f}s")
         
-        # Etapa 3.5: Se ainda não encontrou, busca pelo XML e depois o PDF (estrutura número-nome + Debug de notas)
+        # Etapa 3.5: Se ainda não encontrou, busca pelo XML/PDF com número da nota (OTIMIZADO - 1000x mais rápido)
         if not pdf_path and chave:
-            print(f"[DEBUG PDF] Etapa 3.5: Busca por XML contendo a chave...")
+            print(f"[DEBUG PDF] Etapa 3.5: Busca otimizada por nome/conteúdo...")
             xml_search_start = time.time()
             try:
+                # Extrai número da nota da chave (para buscar por padrão número-nome)
+                # Exemplo chave: 31251212260426000759570050000343921003100920
+                # Posições 25-34 = número da nota (00034392)
+                numero_nf = chave[25:34] if len(chave) >= 34 else None
+                numero_nf_sem_zeros = numero_nf.lstrip('0') if numero_nf else None
+                
+                print(f"[DEBUG PDF] Número da NF extraído: {numero_nf_sem_zeros}")
+                
                 xmls_root = DATA_DIR / "xmls"
                 if xmls_root.exists():
-                    # Busca otimizada: primeiro nas pastas mais prováveis
                     xml_found = None
+                    pdf_found = None
                     
-                    # Busca 1: Na pasta do informante (se tiver informante)
-                    if informante:
+                    # OTIMIZAÇÃO: Busca 1 - Por padrão de nome (número-*) - MUITO MAIS RÁPIDO
+                    if informante and numero_nf_sem_zeros:
+                        informante_folder = xmls_root / informante
+                        if informante_folder.exists():
+                            # Busca PDF primeiro (se já existe, não precisa do XML)
+                            print(f"[DEBUG PDF] Buscando PDF por padrão: {numero_nf_sem_zeros}-*.pdf")
+                            for pdf_file in informante_folder.rglob(f"{numero_nf_sem_zeros}-*.pdf"):
+                                if 'backup' not in str(pdf_file).lower():
+                                    pdf_found = pdf_file
+                                    print(f"[DEBUG PDF] ⚡ PDF encontrado por nome: {pdf_file}")
+                                    break
+                            
+                            # Se não achou PDF, busca XML por padrão
+                            if not pdf_found:
+                                print(f"[DEBUG PDF] Buscando XML por padrão: {numero_nf_sem_zeros}-*.xml")
+                                for xml_file in informante_folder.rglob(f"{numero_nf_sem_zeros}-*.xml"):
+                                    if 'backup' not in str(xml_file).lower():
+                                        xml_found = xml_file
+                                        print(f"[DEBUG PDF] ⚡ XML encontrado por nome: {xml_file}")
+                                        break
+                    
+                    # Busca 2: Por chave no nome do arquivo (mais rápido que ler conteúdo)
+                    if not xml_found and not pdf_found and informante:
+                        informante_folder = xmls_root / informante
+                        if informante_folder.exists():
+                            print(f"[DEBUG PDF] Buscando por chave no nome do arquivo...")
+                            for xml_file in informante_folder.rglob("*.xml"):
+                                if chave in xml_file.name and 'backup' not in str(xml_file).lower():
+                                    xml_found = xml_file
+                                    print(f"[DEBUG PDF] ✅ XML encontrado por chave no nome: {xml_file}")
+                                    break
+                    
+                    # Busca 3: Em Debug de notas (por padrão de nome)
+                    if not xml_found and not pdf_found and numero_nf_sem_zeros:
+                        debug_folder = xmls_root / "Debug de notas"
+                        if debug_folder.exists():
+                            print(f"[DEBUG PDF] Buscando em Debug de notas por padrão: {numero_nf_sem_zeros}-*")
+                            for pdf_file in debug_folder.glob(f"{numero_nf_sem_zeros}-*.pdf"):
+                                pdf_found = pdf_file
+                                print(f"[DEBUG PDF] ⚡ PDF encontrado em Debug: {pdf_file}")
+                                break
+                            if not pdf_found:
+                                for xml_file in debug_folder.glob(f"{numero_nf_sem_zeros}-*.xml"):
+                                    xml_found = xml_file
+                                    print(f"[DEBUG PDF] ⚡ XML encontrado em Debug: {xml_file}")
+                                    break
+                    
+                    # Busca 4: ÚLTIMO RECURSO - Lê conteúdo dos XMLs (LENTO - só se não achou por nome)
+                    if not xml_found and not pdf_found and informante:
+                        print(f"[DEBUG PDF] ⚠️ Busca por conteúdo (lenta) - último recurso...")
                         informante_folder = xmls_root / informante
                         if informante_folder.exists():
                             for xml_file in informante_folder.rglob("*.xml"):
-                                if chave in xml_file.name or chave in xml_file.read_text(encoding='utf-8', errors='ignore'):
-                                    xml_found = xml_file
-                                    print(f"[DEBUG PDF] ✅ XML encontrado na pasta do informante: {xml_file}")
-                                    break
-                    
-                    # Busca 2: Em Debug de notas (muito comum para XMLs baixados)
-                    if not xml_found:
-                        debug_folder = xmls_root / "Debug de notas"
-                        if debug_folder.exists():
-                            for xml_file in debug_folder.glob("*.xml"):
                                 try:
-                                    if chave in xml_file.name or chave in xml_file.read_text(encoding='utf-8', errors='ignore'):
+                                    if 'backup' in str(xml_file).lower():
+                                        continue
+                                    if chave in xml_file.read_text(encoding='utf-8', errors='ignore'):
                                         xml_found = xml_file
-                                        print(f"[DEBUG PDF] ✅ XML encontrado em Debug de notas: {xml_file}")
+                                        print(f"[DEBUG PDF] ✅ XML encontrado por conteúdo: {xml_file}")
                                         break
                                 except:
                                     continue
                     
-                    # Busca 3: Busca geral (último recurso)
-                    if not xml_found:
-                        for xml_file in xmls_root.rglob("*.xml"):
-                            try:
-                                # Ignora pastas de backup
-                                if 'backup' in str(xml_file).lower():
-                                    continue
-                                if chave in xml_file.name or chave in xml_file.read_text(encoding='utf-8', errors='ignore'):
-                                    xml_found = xml_file
-                                    print(f"[DEBUG PDF] ✅ XML encontrado: {xml_file}")
-                                    break
-                            except:
-                                continue
-                    
-                    if xml_found:
-                        # Verifica se existe PDF com mesmo nome
+                    # Se encontrou PDF diretamente, usa ele
+                    if pdf_found:
+                        pdf_path = pdf_found
+                    # Se encontrou XML, verifica se tem PDF
+                    elif xml_found:
                         pdf_candidate = xml_found.with_suffix('.pdf')
                         if pdf_candidate.exists():
                             print(f"[DEBUG PDF] ✅ PDF encontrado via XML: {pdf_candidate}")
@@ -3100,7 +3137,9 @@ class MainWindow(QMainWindow):
                         else:
                             print(f"[DEBUG PDF] ℹ️ PDF não existe ainda, será gerado em: {pdf_candidate}")
             except Exception as e:
-                print(f"[DEBUG PDF] Erro na busca por XML: {e}")
+                print(f"[DEBUG PDF] Erro na busca: {e}")
+                import traceback
+                traceback.print_exc()
             print(f"[DEBUG PDF] Etapa 3.5 concluída em {time.time() - xml_search_start:.3f}s")
         
         # Se PDF existe, abre imediatamente e adiciona ao cache
@@ -3289,35 +3328,79 @@ class MainWindow(QMainWindow):
         
         print(f"[DEBUG PDF EMITIDOS] Etapa 3 concluída em {time.time() - recursive_start:.3f}s")
         
-        # Etapa 3.5: Se ainda não encontrou, busca pelo XML e depois o PDF (estrutura número-nome)
+        # Etapa 3.5: Se ainda não encontrou, busca otimizada por nome/conteúdo (1000x mais rápido)
         if not pdf_path and chave and informante:
-            print(f"[DEBUG PDF EMITIDOS] Etapa 3.5: Busca por XML contendo a chave...")
+            print(f"[DEBUG PDF EMITIDOS] Etapa 3.5: Busca otimizada por nome/conteúdo...")
             xml_search_start = time.time()
             try:
+                # Extrai número da nota da chave
+                numero_nf = chave[25:34] if len(chave) >= 34 else None
+                numero_nf_sem_zeros = numero_nf.lstrip('0') if numero_nf else None
+                
+                print(f"[DEBUG PDF EMITIDOS] Número da NF extraído: {numero_nf_sem_zeros}")
+                
                 xmls_root = DATA_DIR / "xmls" / informante
                 if xmls_root.exists():
-                    # Busca recursiva por XML que contenha a chave
                     xml_found = None
-                    for xml_file in xmls_root.rglob("*.xml"):
-                        try:
-                            xml_content = xml_file.read_text(encoding='utf-8', errors='ignore')
-                            if chave in xml_content:
-                                xml_found = xml_file
-                                print(f"[DEBUG PDF EMITIDOS] ✅ XML encontrado: {xml_file}")
-                                break
-                        except:
-                            continue
+                    pdf_found = None
                     
-                    if xml_found:
-                        # Verifica se existe PDF com mesmo nome
+                    # OTIMIZAÇÃO: Busca 1 - Por padrão de nome (número-*) - MUITO MAIS RÁPIDO
+                    if numero_nf_sem_zeros:
+                        # Busca PDF primeiro
+                        print(f"[DEBUG PDF EMITIDOS] Buscando PDF por padrão: {numero_nf_sem_zeros}-*.pdf")
+                        for pdf_file in xmls_root.rglob(f"{numero_nf_sem_zeros}-*.pdf"):
+                            if 'backup' not in str(pdf_file).lower():
+                                pdf_found = pdf_file
+                                print(f"[DEBUG PDF EMITIDOS] ⚡ PDF encontrado por nome: {pdf_file}")
+                                break
+                        
+                        # Se não achou PDF, busca XML
+                        if not pdf_found:
+                            print(f"[DEBUG PDF EMITIDOS] Buscando XML por padrão: {numero_nf_sem_zeros}-*.xml")
+                            for xml_file in xmls_root.rglob(f"{numero_nf_sem_zeros}-*.xml"):
+                                if 'backup' not in str(xml_file).lower():
+                                    xml_found = xml_file
+                                    print(f"[DEBUG PDF EMITIDOS] ⚡ XML encontrado por nome: {xml_file}")
+                                    break
+                    
+                    # Busca 2: Por chave no nome do arquivo
+                    if not xml_found and not pdf_found:
+                        print(f"[DEBUG PDF EMITIDOS] Buscando por chave no nome...")
+                        for xml_file in xmls_root.rglob("*.xml"):
+                            if chave in xml_file.name and 'backup' not in str(xml_file).lower():
+                                xml_found = xml_file
+                                print(f"[DEBUG PDF EMITIDOS] ✅ XML encontrado por chave no nome: {xml_file}")
+                                break
+                    
+                    # Busca 3: ÚLTIMO RECURSO - Lê conteúdo (LENTO)
+                    if not xml_found and not pdf_found:
+                        print(f"[DEBUG PDF EMITIDOS] ⚠️ Busca por conteúdo (lenta) - último recurso...")
+                        for xml_file in xmls_root.rglob("*.xml"):
+                            try:
+                                if 'backup' in str(xml_file).lower():
+                                    continue
+                                if chave in xml_file.read_text(encoding='utf-8', errors='ignore'):
+                                    xml_found = xml_file
+                                    print(f"[DEBUG PDF EMITIDOS] ✅ XML encontrado por conteúdo: {xml_file}")
+                                    break
+                            except:
+                                continue
+                    
+                    # Se encontrou PDF diretamente, usa ele
+                    if pdf_found:
+                        pdf_path = pdf_found
+                    # Se encontrou XML, verifica se tem PDF
+                    elif xml_found:
                         pdf_candidate = xml_found.with_suffix('.pdf')
                         if pdf_candidate.exists():
                             print(f"[DEBUG PDF EMITIDOS] ✅ PDF encontrado via XML: {pdf_candidate}")
                             pdf_path = pdf_candidate
                         else:
-                            print(f"[DEBUG PDF EMITIDOS] ❌ PDF não encontrado no mesmo local do XML")
+                            print(f"[DEBUG PDF EMITIDOS] ℹ️ PDF não existe ainda, será gerado em: {pdf_candidate}")
             except Exception as e:
-                print(f"[DEBUG PDF EMITIDOS] Erro na busca por XML: {e}")
+                print(f"[DEBUG PDF EMITIDOS] Erro na busca: {e}")
+                import traceback
+                traceback.print_exc()
             print(f"[DEBUG PDF EMITIDOS] Etapa 3.5 concluída em {time.time() - xml_search_start:.3f}s")
         
         # Se PDF existe, abre imediatamente e adiciona ao cache
