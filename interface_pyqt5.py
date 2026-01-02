@@ -434,6 +434,7 @@ class MainWindow(QMainWindow):
         btn_busca = QPushButton("Buscar na SEFAZ"); btn_busca.clicked.connect(self.do_search)
         btn_busca_completa = QPushButton("Busca Completa"); btn_busca_completa.clicked.connect(self.do_busca_completa)
         btn_busca_chave = QPushButton("Busca por chave"); btn_busca_chave.clicked.connect(self.buscar_por_chave)
+        btn_importar_xmls = QPushButton("📁 Importar XMLs"); btn_importar_xmls.clicked.connect(self.importar_xmls_pasta)
         
         # Seletor de intervalo entre buscas
         from PyQt5.QtWidgets import QSpinBox
@@ -471,6 +472,7 @@ class MainWindow(QMainWindow):
             self.btn_refresh.setIcon(_icon('refresh.png', QStyle.SP_BrowserReload))
             btn_busca.setIcon(_icon('search.png', QStyle.SP_FileDialogContentsView))
             btn_busca_completa.setIcon(_icon('search.png', QStyle.SP_FileDialogContentsView))
+            btn_importar_xmls.setIcon(self.style().standardIcon(QStyle.SP_DialogOpenButton))
         except Exception:
             pass
         t.addWidget(self.search_edit)
@@ -491,6 +493,7 @@ class MainWindow(QMainWindow):
         t.addWidget(btn_busca)
         t.addWidget(btn_busca_completa)
         t.addWidget(btn_busca_chave)
+        t.addWidget(btn_importar_xmls)
         v.addLayout(t)
 
         # Tabs: create a tab widget to host different views (emitidos por terceiros / pela empresa)
@@ -4146,6 +4149,214 @@ class MainWindow(QMainWindow):
             mensagem += f"\n\n({len(erros)} erros - veja o log para detalhes)"
         
         QMessageBox.information(self, "Busca por Chave", mensagem)
+
+    def importar_xmls_pasta(self):
+        """Importa XMLs de uma pasta, organiza como se tivesse buscado na SEFAZ e separa emitidos/recebidos."""
+        from datetime import datetime
+        from lxml import etree
+        import shutil
+        
+        try:
+            # Seleciona pasta com XMLs
+            pasta = QFileDialog.getExistingDirectory(self, "Selecionar pasta com XMLs para importar")
+            if not pasta:
+                return
+            
+            pasta_path = Path(pasta)
+            
+            # Busca todos os XMLs recursivamente
+            xmls_encontrados = list(pasta_path.rglob("*.xml"))
+            
+            if not xmls_encontrados:
+                QMessageBox.warning(self, "Importar XMLs", "Nenhum arquivo XML encontrado na pasta selecionada!")
+                return
+            
+            # Confirma importação
+            reply = QMessageBox.question(
+                self,
+                "Importar XMLs",
+                f"Encontrados {len(xmls_encontrados)} arquivo(s) XML.\n\n"
+                "A importação irá:\n"
+                "• Identificar se são NFe, CTe ou NFS-e\n"
+                "• Separar entre emitidos pela empresa ou recebidos\n"
+                "• Organizar na estrutura correta\n"
+                "• Registrar no banco de dados\n\n"
+                "Deseja continuar?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.Yes
+            )
+            
+            if reply != QMessageBox.Yes:
+                return
+            
+            # Carrega CNPJs da empresa para identificar emitidos
+            certificados = self.db.load_certificates()
+            cnpjs_empresa = set()
+            for cert in certificados:
+                cnpj = cert.get('cnpj_cpf', '') or cert.get('informante', '')
+                cnpj_limpo = ''.join(c for c in str(cnpj) if c.isdigit())
+                if cnpj_limpo:
+                    cnpjs_empresa.add(cnpj_limpo)
+            
+            print(f"[IMPORTAR] CNPJs da empresa: {cnpjs_empresa}")
+            
+            if not cnpjs_empresa:
+                QMessageBox.warning(self, "Importar XMLs", "Nenhum certificado cadastrado! Cadastre pelo menos um certificado primeiro.")
+                return
+            
+            # Progress dialog
+            progress = QProgressDialog("Importando XMLs...", "Cancelar", 0, len(xmls_encontrados), self)
+            progress.setWindowTitle("Importando")
+            progress.setWindowModality(Qt.WindowModal)
+            progress.show()
+            
+            # Namespaces
+            NS = {
+                'nfe': 'http://www.portalfiscal.inf.br/nfe',
+                'cte': 'http://www.portalfiscal.inf.br/cte'
+            }
+            
+            importados = 0
+            emitidos = 0
+            recebidos = 0
+            erros = []
+            
+            for idx, xml_file in enumerate(xmls_encontrados):
+                if progress.wasCanceled():
+                    break
+                
+                progress.setValue(idx)
+                progress.setLabelText(f"Processando {idx+1}/{len(xmls_encontrados)}...\n{xml_file.name}")
+                QApplication.processEvents()
+                
+                try:
+                    # Lê o XML
+                    xml_text = xml_file.read_text(encoding='utf-8')
+                    tree = etree.fromstring(xml_text.encode('utf-8'))
+                    
+                    # Identifica o tipo
+                    tipo = None
+                    chave = None
+                    cnpj_emitente = None
+                    nome_emitente = None
+                    numero = None
+                    data_emissao = None
+                    valor = None
+                    
+                    # Tenta NFe
+                    if tree.find('.//nfe:infNFe', namespaces=NS) is not None:
+                        tipo = 'NFe'
+                        chave_elem = tree.find('.//nfe:infNFe', namespaces=NS)
+                        chave = chave_elem.get('Id', '').replace('NFe', '') if chave_elem is not None else None
+                        cnpj_emitente = tree.findtext('.//nfe:emit/nfe:CNPJ', namespaces=NS) or ''
+                        nome_emitente = tree.findtext('.//nfe:emit/nfe:xNome', namespaces=NS) or ''
+                        numero = tree.findtext('.//nfe:ide/nfe:nNF', namespaces=NS) or ''
+                        data_emissao = tree.findtext('.//nfe:ide/nfe:dhEmi', namespaces=NS) or tree.findtext('.//nfe:ide/nfe:dEmi', namespaces=NS) or ''
+                        valor = tree.findtext('.//nfe:total/nfe:ICMSTot/nfe:vNF', namespaces=NS) or '0'
+                    
+                    # Tenta CTe
+                    elif tree.find('.//cte:infCte', namespaces=NS) is not None:
+                        tipo = 'CTe'
+                        chave_elem = tree.find('.//cte:infCte', namespaces=NS)
+                        chave = chave_elem.get('Id', '').replace('CTe', '') if chave_elem is not None else None
+                        cnpj_emitente = tree.findtext('.//cte:emit/cte:CNPJ', namespaces=NS) or ''
+                        nome_emitente = tree.findtext('.//cte:emit/cte:xNome', namespaces=NS) or ''
+                        numero = tree.findtext('.//cte:ide/cte:nCT', namespaces=NS) or ''
+                        data_emissao = tree.findtext('.//cte:ide/cte:dhEmi', namespaces=NS) or ''
+                        valor = tree.findtext('.//cte:vPrest/cte:vTPrest', namespaces=NS) or '0'
+                    
+                    if not tipo or not chave:
+                        erros.append(f"{xml_file.name}: Tipo não identificado")
+                        continue
+                    
+                    # Remove caracteres não numéricos do CNPJ
+                    cnpj_emitente_limpo = ''.join(c for c in cnpj_emitente if c.isdigit())
+                    
+                    # Determina se foi emitido pela empresa ou recebido
+                    emitido_pela_empresa = cnpj_emitente_limpo in cnpjs_empresa
+                    
+                    # Escolhe o informante (quem vai "organizar" o arquivo)
+                    if emitido_pela_empresa:
+                        # Emitido pela empresa - usa o CNPJ emitente
+                        informante = cnpj_emitente_limpo
+                        emitidos += 1
+                    else:
+                        # Recebido de terceiros - usa o primeiro CNPJ da empresa
+                        informante = list(cnpjs_empresa)[0]
+                        recebidos += 1
+                    
+                    # Extrai ano-mês da data de emissão
+                    year_month = datetime.now().strftime("%Y-%m")
+                    if data_emissao:
+                        if len(data_emissao) >= 7:
+                            year_month = data_emissao[:7]
+                    
+                    # Define pasta destino
+                    dest_folder = DATA_DIR / "xmls" / informante / tipo / year_month
+                    dest_folder.mkdir(parents=True, exist_ok=True)
+                    
+                    # Nome do arquivo destino
+                    if numero:
+                        # Usa padrão número-nome
+                        nome_limpo = ''.join(c for c in nome_emitente if c.isalnum() or c in (' ', '-', '_'))[:50]
+                        dest_file = dest_folder / f"{numero}-{nome_limpo}.xml"
+                    else:
+                        # Usa apenas a chave
+                        dest_file = dest_folder / f"{chave}.xml"
+                    
+                    # Copia o arquivo
+                    shutil.copy2(xml_file, dest_file)
+                    
+                    # Registra no banco de dados
+                    self.db.register_xml_download(chave, str(dest_file), informante)
+                    
+                    # Salva dados da nota no banco
+                    nota_data = {
+                        'chave': chave,
+                        'numero': numero,
+                        'data_emissao': data_emissao[:10] if len(data_emissao) >= 10 else data_emissao,
+                        'tipo': tipo,
+                        'valor': valor,
+                        'cnpj_emitente': cnpj_emitente_limpo,
+                        'nome_emitente': nome_emitente,
+                        'informante': informante,
+                        'xml_status': 'COMPLETO'
+                    }
+                    self.db.save_note(nota_data)
+                    
+                    importados += 1
+                    print(f"[IMPORTAR] {tipo} {numero} - {'EMITIDO' if emitido_pela_empresa else 'RECEBIDO'} - {dest_file}")
+                    
+                except Exception as e:
+                    erros.append(f"{xml_file.name}: {str(e)}")
+                    print(f"[ERRO IMPORTAR] {xml_file.name}: {e}")
+                    import traceback
+                    traceback.print_exc()
+            
+            progress.setValue(len(xmls_encontrados))
+            
+            # Atualiza interface
+            self.refresh_all()
+            
+            # Mostra resultado
+            mensagem = f"Importação concluída!\n\n"
+            mensagem += f"✅ Arquivos importados: {importados}\n"
+            mensagem += f"📤 Emitidos pela empresa: {emitidos}\n"
+            mensagem += f"📥 Recebidos de terceiros: {recebidos}\n"
+            
+            if erros:
+                mensagem += f"\n❌ Erros: {len(erros)}"
+                if len(erros) <= 5:
+                    mensagem += "\n\n" + "\n".join(erros[:5])
+                else:
+                    mensagem += "\n(Veja o console para detalhes)"
+            
+            QMessageBox.information(self, "Importar XMLs", mensagem)
+            
+        except Exception as e:
+            QMessageBox.critical(self, "Erro ao Importar", f"Erro: {e}")
+            import traceback
+            traceback.print_exc()
 
     def do_busca_completa(self):
         """Busca completa: reseta NSU para 0 e busca todos os XMLs da SEFAZ."""
