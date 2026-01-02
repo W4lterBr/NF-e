@@ -1872,8 +1872,8 @@ class MainWindow(QMainWindow):
         """Verifica automaticamente notas com status cinza (RESUMO) e busca XML completo."""
         try:
             # Busca notas com status RESUMO que ainda não foram verificadas
-            from nfe_search import Database
-            db_nfe = Database(str(DB_PATH))
+            from nfe_search import DatabaseManager
+            db_nfe = DatabaseManager(str(DB_PATH))
             
             notas_resumo = [
                 nota for nota in self.notes 
@@ -1907,9 +1907,9 @@ class MainWindow(QMainWindow):
             
             # Usa a mesma lógica de _buscar_xml_completo mas sem diálogos
             from modules.sandbox_task import run_task as sandbox_run_task
-            from nfe_search import Database
+            from nfe_search import DatabaseManager
             
-            db_nfe = Database(str(DB_PATH))
+            db_nfe = DatabaseManager(str(DB_PATH))
             certs = self.db.load_certificates()
             if not certs:
                 db_nfe.marcar_nota_verificada(chave, 'sem_certificados')
@@ -1983,8 +1983,8 @@ class MainWindow(QMainWindow):
             print(f"[ERRO] Erro em _buscar_xml_completo_silencioso: {e}")
             # Marca como erro para não tentar novamente
             try:
-                from nfe_search import Database
-                db_nfe = Database(str(DB_PATH))
+                from nfe_search import DatabaseManager
+                db_nfe = DatabaseManager(str(DB_PATH))
                 db_nfe.marcar_nota_verificada(chave, f'erro: {str(e)[:50]}')
             except:
                 pass
