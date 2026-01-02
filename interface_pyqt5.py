@@ -6887,6 +6887,26 @@ def main():
         
         # Se o mutex já existe, outra instância está rodando
         if last_error == ERROR_ALREADY_EXISTS:
+            # REGISTRA NO LOG para análise posterior
+            import datetime
+            log_file = DATA_DIR / "mutex_debug.log"
+            try:
+                with open(log_file, "a", encoding="utf-8") as f:
+                    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    f.write(f"\n{'='*80}\n")
+                    f.write(f"[{timestamp}] TENTATIVA DE SEGUNDA INSTÂNCIA BLOQUEADA\n")
+                    f.write(f"{'='*80}\n")
+                    f.write(f"Executável: {sys.executable}\n")
+                    f.write(f"Argumentos: {sys.argv}\n")
+                    f.write(f"Diretório de trabalho: {os.getcwd()}\n")
+                    f.write(f"Variáveis de ambiente relevantes:\n")
+                    for var in ['TEMP', 'TMP', 'USERPROFILE', 'PROGRAMFILES']:
+                        f.write(f"  {var}: {os.environ.get(var, 'N/A')}\n")
+                    f.write(f"\n")
+            except Exception as e:
+                # Se não conseguir logar, continua mesmo assim
+                pass
+            
             # Mostra mensagem de erro usando MessageBox do Windows (mais confiável que QMessageBox antes do QApplication)
             user32 = ctypes.windll.user32
             MB_OK = 0x00000000
@@ -6903,7 +6923,8 @@ def main():
                 "Por favor, use a instância que já está aberta.\n\n"
                 f"DEBUG - Como foi chamado:\n"
                 f"Executável: {executable}\n"
-                f"Argumentos: {cmd_line}"
+                f"Argumentos: {cmd_line}\n\n"
+                f"📋 Log salvo em: {log_file}"
             )
             user32.MessageBoxW(None, mensagem, "Busca XML - Já em Execução", MB_OK | MB_ICONWARNING | MB_TOPMOST)
             sys.exit(1)
