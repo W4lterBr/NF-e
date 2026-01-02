@@ -6872,65 +6872,74 @@ def main():
     os.environ.setdefault("PYTHONUTF8", "1")
     
     # ===== PROTEÇÃO CONTRA MÚLTIPLAS INSTÂNCIAS =====
-    # Cria um mutex único para o sistema "Busca XML"
-    # Se já existir, significa que outra instância está rodando
-    if sys.platform == "win32":
-        kernel32 = ctypes.windll.kernel32
-        ERROR_ALREADY_EXISTS = 183
-        
-        # Nome único do mutex (pode ser qualquer string única)
-        mutex_name = "Global\\BuscaXML_SingleInstance_Mutex_9A8B7C6D"
-        
-        # Tenta criar o mutex
-        mutex = kernel32.CreateMutexW(None, False, mutex_name)
-        last_error = kernel32.GetLastError()
-        
-        # Se o mutex já existe, outra instância está rodando
-        if last_error == ERROR_ALREADY_EXISTS:
-            # REGISTRA NO LOG para análise posterior
-            import datetime
-            log_file = LOGS_DIR / "mutex_debug.log"
-            try:
-                with open(log_file, "a", encoding="utf-8") as f:
-                    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    f.write(f"\n{'='*80}\n")
-                    f.write(f"[{timestamp}] TENTATIVA DE SEGUNDA INSTÂNCIA BLOQUEADA\n")
-                    f.write(f"{'='*80}\n")
-                    f.write(f"Executável: {sys.executable}\n")
-                    f.write(f"Argumentos: {sys.argv}\n")
-                    f.write(f"Diretório de trabalho: {os.getcwd()}\n")
-                    f.write(f"Variáveis de ambiente relevantes:\n")
-                    for var in ['TEMP', 'TMP', 'USERPROFILE', 'PROGRAMFILES']:
-                        f.write(f"  {var}: {os.environ.get(var, 'N/A')}\n")
-                    f.write(f"\n")
-            except Exception as e:
-                # Se não conseguir logar, continua mesmo assim
-                pass
+    # EXCEÇÃO: Se foi chamado com -u <script>, é um worker isolado (sandbox_task_runner.py)
+    # Esses workers devem poder rodar em paralelo para processar PDFs/SEFAZ
+    is_sandbox_worker = (
+        len(sys.argv) >= 3 and 
+        sys.argv[1] == "-u" and 
+        ("sandbox_task_runner.py" in sys.argv[2] or "_temp_runner.py" in sys.argv[2])
+    )
+    
+    if not is_sandbox_worker:
+        # Cria um mutex único para o sistema "Busca XML"
+        # Se já existir, significa que outra instância está rodando
+        if sys.platform == "win32":
+            kernel32 = ctypes.windll.kernel32
+            ERROR_ALREADY_EXISTS = 183
             
-            # Mostra mensagem de erro usando MessageBox do Windows (mais confiável que QMessageBox antes do QApplication)
-            user32 = ctypes.windll.user32
-            MB_OK = 0x00000000
-            MB_ICONWARNING = 0x00000030
-            MB_TOPMOST = 0x00040000
+            # Nome único do mutex (pode ser qualquer string única)
+            mutex_name = "Global\\BuscaXML_SingleInstance_Mutex_9A8B7C6D"
             
-            # Mostra informações sobre COMO o programa foi chamado (para debug)
-            cmd_line = " ".join(sys.argv)
-            executable = sys.executable
+            # Tenta criar o mutex
+            mutex = kernel32.CreateMutexW(None, False, mutex_name)
+            last_error = kernel32.GetLastError()
             
-            mensagem = (
-                "O sistema 'Busca XML' já está em execução!\n\n"
-                "Não é permitido abrir múltiplas instâncias do programa.\n\n"
-                "Por favor, use a instância que já está aberta.\n\n"
-                f"DEBUG - Como foi chamado:\n"
-                f"Executável: {executable}\n"
-                f"Argumentos: {cmd_line}\n\n"
-                f"📋 Log salvo em: {log_file}"
-            )
-            user32.MessageBoxW(None, mensagem, "Busca XML - Já em Execução", MB_OK | MB_ICONWARNING | MB_TOPMOST)
-            sys.exit(1)
-        
-        # Mantém o mutex aberto durante toda a execução do programa
-        # Ele será automaticamente liberado quando o processo terminar
+            # Se o mutex já existe, outra instância está rodando
+            if last_error == ERROR_ALREADY_EXISTS:
+                # REGISTRA NO LOG para análise posterior
+                import datetime
+                log_file = LOGS_DIR / "mutex_debug.log"
+                try:
+                    with open(log_file, "a", encoding="utf-8") as f:
+                        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        f.write(f"\n{'='*80}\n")
+                        f.write(f"[{timestamp}] TENTATIVA DE SEGUNDA INSTÂNCIA BLOQUEADA\n")
+                        f.write(f"{'='*80}\n")
+                        f.write(f"Executável: {sys.executable}\n")
+                        f.write(f"Argumentos: {sys.argv}\n")
+                        f.write(f"Diretório de trabalho: {os.getcwd()}\n")
+                        f.write(f"Variáveis de ambiente relevantes:\n")
+                        for var in ['TEMP', 'TMP', 'USERPROFILE', 'PROGRAMFILES']:
+                            f.write(f"  {var}: {os.environ.get(var, 'N/A')}\n")
+                        f.write(f"\n")
+                except Exception as e:
+                    # Se não conseguir logar, continua mesmo assim
+                    pass
+                
+                # Mostra mensagem de erro usando MessageBox do Windows (mais confiável que QMessageBox antes do QApplication)
+                user32 = ctypes.windll.user32
+                MB_OK = 0x00000000
+                MB_ICONWARNING = 0x00000030
+                MB_TOPMOST = 0x00040000
+                
+                # Mostra informações sobre COMO o programa foi chamado (para debug)
+                cmd_line = " ".join(sys.argv)
+                executable = sys.executable
+                
+                mensagem = (
+                    "O sistema 'Busca XML' já está em execução!\n\n"
+                    "Não é permitido abrir múltiplas instâncias do programa.\n\n"
+                    "Por favor, use a instância que já está aberta.\n\n"
+                    f"DEBUG - Como foi chamado:\n"
+                    f"Executável: {executable}\n"
+                    f"Argumentos: {cmd_line}\n\n"
+                    f"📋 Log salvo em: {log_file}"
+                )
+                user32.MessageBoxW(None, mensagem, "Busca XML - Já em Execução", MB_OK | MB_ICONWARNING | MB_TOPMOST)
+                sys.exit(1)
+            
+            # Mantém o mutex aberto durante toda a execução do programa
+            # Ele será automaticamente liberado quando o processo terminar
     # ===== FIM DA PROTEÇÃO =====
     
     app = QApplication(sys.argv)
