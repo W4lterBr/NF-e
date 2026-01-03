@@ -4954,21 +4954,22 @@ class MainWindow(QMainWindow):
                 try:
                     import re
                     
-                    # Detecta processamento de certificado
-                    if "Processando certificado" in line:
-                        match = re.search(r'CNPJ[=:]?\s*(\d+)', line, re.IGNORECASE)
+                    # Detecta processamento de certificado - várias variações
+                    if "Processando certificado" in line or "processando certificado" in line.lower():
+                        match = re.search(r'CNPJ[=:\s]+(\d+)', line, re.IGNORECASE)
                         if match:
                             cnpj = match.group(1)
                             self._search_stats['current_cert'] += 1
                             self._search_stats['last_cert'] = cnpj[-4:]
                             
                             # Atualiza progress bar
-                            self.search_progress.setValue(self._search_stats['current_cert'])
+                            current = min(self._search_stats['current_cert'], total_informantes)
+                            self.search_progress.setValue(current)
                             
                             # Atualiza resumo
                             elapsed = (datetime.now() - self._search_stats['start_time']).total_seconds()
                             self.search_summary_label.setText(
-                                f"🔄 Busca Completa: {self._search_stats['current_cert']}/{total_informantes} certificados | "
+                                f"🔄 Busca Completa: {current}/{total_informantes} certificados | "
                                 f"NFes: {self._search_stats['nfes_found']} | "
                                 f"CTes: {self._search_stats['ctes_found']} | "
                                 f"Cert: ...{self._search_stats['last_cert']} | "
@@ -4979,8 +4980,9 @@ class MainWindow(QMainWindow):
                     if "registrar_xml" in line.lower() or "infnfe" in line.lower():
                         self._search_stats['nfes_found'] += 1
                         elapsed = (datetime.now() - self._search_stats['start_time']).total_seconds()
+                        current = min(self._search_stats['current_cert'], total_informantes)
                         self.search_summary_label.setText(
-                            f"🔄 Busca Completa: {self._search_stats['current_cert']}/{total_informantes} certificados | "
+                            f"🔄 Busca Completa: {current}/{total_informantes} certificados | "
                             f"NFes: {self._search_stats['nfes_found']} | "
                             f"CTes: {self._search_stats['ctes_found']} | "
                             f"Cert: ...{self._search_stats['last_cert']} | "
@@ -4991,8 +4993,9 @@ class MainWindow(QMainWindow):
                     if "processar_cte" in line.lower() or "🚛" in line:
                         self._search_stats['ctes_found'] += 1
                         elapsed = (datetime.now() - self._search_stats['start_time']).total_seconds()
+                        current = min(self._search_stats['current_cert'], total_informantes)
                         self.search_summary_label.setText(
-                            f"🔄 Busca Completa: {self._search_stats['current_cert']}/{total_informantes} certificados | "
+                            f"🔄 Busca Completa: {current}/{total_informantes} certificados | "
                             f"NFes: {self._search_stats['nfes_found']} | "
                             f"CTes: {self._search_stats['ctes_found']} | "
                             f"Cert: ...{self._search_stats['last_cert']} | "
@@ -5003,7 +5006,7 @@ class MainWindow(QMainWindow):
                     pass  # Silencioso para evitar recursão
                 
                 # Detecta se a busca foi finalizada
-                if "Busca de NSU finalizada" in line or "Dormindo por" in line or "Busca concluída" in line:
+                if "Busca de NSU finalizada" in line or "Busca concluída" in line or "=== Busca concluída:" in line:
                     # Marca que a busca finalizou
                     self._search_in_progress = False
                     
@@ -5047,15 +5050,30 @@ class MainWindow(QMainWindow):
                     self.finished_search.emit(res)
             
             def on_finished(res: Dict[str, Any]):
+                # Força finalização da busca
+                self._search_in_progress = False
+                
+                # Oculta progress bar
+                self.search_progress.setVisible(False)
+                
                 if not res.get("ok"):
                     error = res.get('error') or res.get('message')
                     print(f"Erro na busca completa: {error}")
                     self.set_status(f"❌ Erro: {error[:50]}...", 5000)
-                    self._search_in_progress = False
-                    
-                    # Oculta progress bar em caso de erro
-                    self.search_progress.setVisible(False)
                     self.search_summary_label.setText(f"❌ Erro na busca completa")
+                else:
+                    # Busca finalizada com sucesso
+                    elapsed = (datetime.now() - self._search_stats['start_time']).total_seconds()
+                    minutos = int(elapsed / 60)
+                    segundos = int(elapsed % 60)
+                    tempo_str = f"{minutos}min {segundos}s" if minutos > 0 else f"{segundos}s"
+                    
+                    self.search_summary_label.setText(
+                        f"✅ Busca Completa finalizada! NFes: {self._search_stats['nfes_found']} | "
+                        f"CTes: {self._search_stats['ctes_found']} | "
+                        f"Tempo: {tempo_str}"
+                    )
+                    self.set_status("✅ Busca completa finalizada", 3000)
                     
                 # Atualiza interface
                 self.refresh_all()
