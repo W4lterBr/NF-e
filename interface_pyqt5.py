@@ -523,7 +523,7 @@ class MainWindow(QMainWindow):
         headers = [
             "XML","Num","D/Emit","Tipo","Valor","Venc.",
             "Emissor CNPJ","Emissor Nome","Natureza","UF","Base ICMS",
-            "Valor ICMS","CFOP","NCM","Tomador IE","Chave"
+            "Valor ICMS","Status","CFOP","NCM","Tomador IE","Chave"
         ]
         self.table.setColumnCount(len(headers))
         self.table.setHorizontalHeaderLabels(headers)
@@ -572,7 +572,7 @@ class MainWindow(QMainWindow):
         headers_emitidos = [
             "XML","Num","D/Emit","Tipo","Valor","Venc.",
             "Destinatário CNPJ","Destinatário Nome","Natureza","UF","Base ICMS",
-            "Valor ICMS","CFOP","NCM","Tomador IE","Chave"
+            "Valor ICMS","Status","CFOP","NCM","Tomador IE","Chave"
         ]
         self.table_emitidos.setColumnCount(len(headers_emitidos))
         self.table_emitidos.setHorizontalHeaderLabels(headers_emitidos)
@@ -2285,10 +2285,14 @@ class MainWindow(QMainWindow):
         c_icms = NumericTableWidgetItem(valor_icms_formatado, valor_icms_num)
         c_icms.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
         self.table.setItem(r, 11, c_icms)
-        self.table.setItem(r, 12, cell(it.get("cfop")))
-        self.table.setItem(r, 13, cell(it.get("ncm")))
-        self.table.setItem(r, 14, cell(it.get("ie_tomador")))
-        self.table.setItem(r, 15, cell(it.get("chave")))
+        
+        # Coluna Status
+        self.table.setItem(r, 12, cell(it.get("status")))
+        
+        self.table.setItem(r, 13, cell(it.get("cfop")))
+        self.table.setItem(r, 14, cell(it.get("ncm")))
+        self.table.setItem(r, 15, cell(it.get("ie_tomador")))
+        self.table.setItem(r, 16, cell(it.get("chave")))
     
     def _populate_emitidos_row(self, r: int, it: Dict[str, Any]):
         """Popula uma linha da tabela de emitidos (mesma estrutura que _populate_row)"""
@@ -2416,10 +2420,13 @@ class MainWindow(QMainWindow):
         c_icms.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
         self.table_emitidos.setItem(r, 11, c_icms)
         
-        self.table_emitidos.setItem(r, 12, cell(it.get("cfop")))
-        self.table_emitidos.setItem(r, 13, cell(it.get("ncm")))
-        self.table_emitidos.setItem(r, 14, cell(it.get("ie_tomador")))
-        self.table_emitidos.setItem(r, 15, cell(it.get("chave")))
+        # Coluna Status
+        self.table_emitidos.setItem(r, 12, cell(it.get("status")))
+        
+        self.table_emitidos.setItem(r, 13, cell(it.get("cfop")))
+        self.table_emitidos.setItem(r, 14, cell(it.get("ncm")))
+        self.table_emitidos.setItem(r, 15, cell(it.get("ie_tomador")))
+        self.table_emitidos.setItem(r, 16, cell(it.get("chave")))
 
     def _fill_table_step(self):
         try:
@@ -4992,8 +4999,8 @@ class MainWindow(QMainWindow):
                     break
                 
                 row = row_index.row()
-                # CORREÇÃO: Coluna 15 é "Chave", não coluna 1 (que é "Num")
-                chave = self.table.item(row, 15).text() if self.table.item(row, 15) else None
+                # Coluna 16 é "Chave" (após adicionar coluna Status na posição 12)
+                chave = self.table.item(row, 16).text() if self.table.item(row, 16) else None
                 
                 if not chave:
                     print(f"⚠️ Linha {row}: Chave não encontrada na tabela")
