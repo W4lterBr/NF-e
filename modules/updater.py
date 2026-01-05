@@ -156,8 +156,54 @@ class GitHubUpdater:
     def get_file_list(self) -> List[str]:
         """
         Retorna lista de arquivos Python para atualizar.
-        Busca recursivamente no repositório.
+        Busca dinamicamente TODOS os arquivos .py do repositório via GitHub API.
         """
+        try:
+            # Busca árvore completa do repositório
+            tree_url = f"{self.api_url}/git/trees/main?recursive=1"
+            response = requests.get(tree_url, timeout=30)
+            
+            if response.status_code != 200:
+                logger.warning("Falha ao buscar lista de arquivos via API, usando lista fixa")
+                return self._get_fallback_file_list()
+            
+            tree = response.json()
+            files_to_update = []
+            
+            # Filtra apenas arquivos .py (não .pyc)
+            for item in tree.get('tree', []):
+                path = item.get('path', '')
+                item_type = item.get('type', '')
+                
+                # Inclui apenas arquivos .py (não pastas)
+                if item_type == 'blob' and path.endswith('.py') and not path.endswith('.pyc'):
+                    # Exclui alguns arquivos específicos que não devem ser atualizados
+                    exclude_patterns = [
+                        '__pycache__',
+                        '.venv',
+                        'venv',
+                        'build/',
+                        'dist/',
+                        '.git/',
+                        'test_',  # Arquivos de teste locais
+                        'debug_',  # Scripts de debug locais
+                    ]
+                    
+                    # Verifica se o arquivo deve ser excluído
+                    should_exclude = any(pattern in path for pattern in exclude_patterns)
+                    
+                    if not should_exclude:
+                        files_to_update.append(path)
+            
+            logger.info(f"📋 Encontrados {len(files_to_update)} arquivos Python para atualizar")
+            return files_to_update if files_to_update else self._get_fallback_file_list()
+            
+        except Exception as e:
+            logger.error(f"Erro ao buscar lista de arquivos: {e}")
+            return self._get_fallback_file_list()
+    
+    def _get_fallback_file_list(self) -> List[str]:
+        """Lista fixa de arquivos como fallback se a API falhar."""
         files_to_update = [
             "nfe_search.py",
             "interface_pyqt5.py",
@@ -167,7 +213,7 @@ class GitHubUpdater:
             "modules/updater.py",
             "modules/sandbox_worker.py",
             "modules/sandbox_task.py",
-            "modules/sandbox_task_runner.py",  # ADICIONADO - worker isolado para PDFs/SEFAZ
+            "modules/sandbox_task_runner.py",
             "modules/certificate_manager.py",
             "modules/certificate_dialog.py",
             "modules/sefaz_integration.py",
