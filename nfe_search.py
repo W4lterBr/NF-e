@@ -686,14 +686,19 @@ def format_cnpj_cpf_dir(doc: str) -> str:
 
 def salvar_xml_por_certificado(xml, cnpj_cpf, pasta_base="xmls", nome_certificado=None):
     """
-    Salva o XML em uma pasta separada por certificado (apenas dígitos) e ano-mês de emissão.
+    Salva o XML em uma pasta organizada por CNPJ e ano-mês de emissão.
     Detecta automaticamente o tipo de documento e salva na pasta apropriada.
+    
+    ⚠️ PADRÃO DE NOMENCLATURA (v1.0.86+):
+    - Nome do arquivo: SEMPRE a chave de acesso (44 dígitos)
+    - Estrutura: xmls/{CNPJ}/{ANO-MES}/{TIPO}/{CHAVE}.xml
+    - Consulte: PADRAO_ARQUIVAMENTO.md
     
     Args:
         xml: String XML ou bytes do documento
         cnpj_cpf: CNPJ/CPF do certificado
-        pasta_base: Pasta base onde os XMLs serão salvos
-        nome_certificado: Nome personalizado do certificado (opcional). Se fornecido, será usado em vez do CNPJ.
+        pasta_base: Pasta base onde os XMLs serão salvos (padrão: "xmls")
+        nome_certificado: OBSOLETO - Mantido por compatibilidade mas não usado
     
     Tipos suportados:
     - NFe completas (procNFe) → NFe/
@@ -701,8 +706,7 @@ def salvar_xml_por_certificado(xml, cnpj_cpf, pasta_base="xmls", nome_certificad
     - Resumos NFe (resNFe) → Resumos/
     - Eventos (resEvento, procEventoNFe) → Eventos/
     
-    Exemplo: xmls/Walter Transportes/2025-08/NFe/00123-EMPRESA.xml
-    Exemplo: xmls/47539664000197/2025-08/Eventos/CANC-00123-EMPRESA.xml
+    Exemplo: xmls/47539664000197/2025-08/NFe/52260115045348000172570010014777191002562584.xml
     """
     import os
     from lxml import etree
@@ -730,11 +734,9 @@ def salvar_xml_por_certificado(xml, cnpj_cpf, pasta_base="xmls", nome_certificad
             logger.warning("XML contém apenas protocolo, não será salvo")
             return  # Não salva protocolos sem dados
         
-        # Define identificador da pasta: usa nome_certificado se fornecido, senão CNPJ formatado
-        if nome_certificado and nome_certificado.strip():
-            pasta_certificado = sanitize_filename(nome_certificado.strip())
-        else:
-            pasta_certificado = format_cnpj_cpf_dir(cnpj_cpf)
+        # ⚠️ SEMPRE usa CNPJ como pasta (PADRÃO v1.0.86)
+        # Ignora nome_certificado para garantir consistência
+        pasta_certificado = format_cnpj_cpf_dir(cnpj_cpf)
 
         # Parse o XML para extrair dados de organização
         root = etree.fromstring(xml.encode("utf-8") if isinstance(xml, str) else xml)
@@ -759,6 +761,33 @@ def salvar_xml_por_certificado(xml, cnpj_cpf, pasta_base="xmls", nome_certificad
             # Tipo desconhecido - salva em "Outros"
             tipo_pasta = "Outros"
             tipo_doc = "Outro"
+        
+        # ⚠️ EXTRAÇÃO DA CHAVE (PADRÃO v1.0.86)
+        # Chave é extraída aqui para ser usada como nome do arquivo
+        chave = None
+        try:
+            if tipo_doc in ["NFe", "CTe"]:
+                ns = '{http://www.portalfiscal.inf.br/nfe}' if tipo_doc == "NFe" else '{http://www.portalfiscal.inf.br/cte}'
+                infNFe = root.find(f'.//{ns}infNFe') if tipo_doc == "NFe" else root.find(f'.//{ns}infCte')
+                if infNFe is not None:
+                    chave_id = infNFe.attrib.get('Id', '')
+                    if chave_id:
+                        # Remove prefixo NFe/CTe da chave e pega últimos 44 dígitos
+                        chave = chave_id.replace('NFe', '').replace('CTe', '')[-44:]
+            elif tipo_doc == "ResNFe":
+                ns = '{http://www.portalfiscal.inf.br/nfe}'
+                chave = root.findtext(f'{ns}chNFe')
+            elif tipo_doc == "Evento":
+                ns = '{http://www.portalfiscal.inf.br/nfe}'
+                chave = root.findtext(f'.//{ns}chNFe')
+            
+            # Valida se a chave tem 44 dígitos
+            if chave and len(chave) != 44:
+                print(f"[AVISO] Chave inválida (len={len(chave)}): {chave}")
+                chave = None
+        except Exception as chave_err:
+            print(f"[ERRO ao extrair chave]: {chave_err}")
+            chave = None
         
         # Extrai informações para organização
         ide = None
@@ -849,32 +878,23 @@ def salvar_xml_por_certificado(xml, cnpj_cpf, pasta_base="xmls", nome_certificad
         pasta_dest = os.path.join(pasta_base, pasta_certificado, ano_mes, tipo_pasta)
         os.makedirs(pasta_dest, exist_ok=True)
 
-        nome_arquivo = f"{sanitize_filename(nNF)}-{sanitize_filename(xNome)[:40]}.xml"
+        # ⚠️ NOME DO ARQUIVO: SEMPRE A CHAVE (PADRÃO v1.0.86)
+        if chave and len(chave) == 44:
+            nome_arquivo = f"{chave}.xml"
+        else:
+            # Fallback para arquivos sem chave válida (muito raro)
+            nome_arquivo = f"{sanitize_filename(nNF)}-{sanitize_filename(xNome)[:40]}.xml"
+            print(f"[AVISO] XML sem chave válida, usando nome: {nome_arquivo}")
+        
         caminho_xml = os.path.join(pasta_dest, nome_arquivo)
 
         with open(caminho_xml, "w", encoding="utf-8") as f:
             f.write(xml)
         print(f"[SALVO {tipo_doc}] {caminho_xml}")
         
-        # Registra o caminho no banco de dados (xmls_baixados)
+        # ⚠️ REGISTRO NO BANCO (xmls_baixados) - PADRÃO v1.0.86
+        # Chave já foi extraída anteriormente
         try:
-            # Extrai chave do XML
-            chave = None
-            if tipo_doc in ["NFe", "CTe"]:
-                ns = '{http://www.portalfiscal.inf.br/nfe}' if tipo_doc == "NFe" else '{http://www.portalfiscal.inf.br/cte}'
-                infNFe = root.find(f'.//{ns}infNFe') if tipo_doc == "NFe" else root.find(f'.//{ns}infCte')
-                if infNFe is not None:
-                    chave_id = infNFe.attrib.get('Id', '')
-                    if chave_id:
-                        # Remove prefixo NFe/CTe da chave
-                        chave = chave_id.replace('NFe', '').replace('CTe', '')[-44:]
-            elif tipo_doc == "ResNFe":
-                ns = '{http://www.portalfiscal.inf.br/nfe}'
-                chave = root.findtext(f'{ns}chNFe')
-            elif tipo_doc == "Evento":
-                ns = '{http://www.portalfiscal.inf.br/nfe}'
-                chave = root.findtext(f'.//{ns}chNFe')
-            
             if chave and len(chave) == 44:
                 # Importa DatabaseManager para registrar
                 from pathlib import Path

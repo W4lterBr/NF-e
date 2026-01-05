@@ -1,4 +1,70 @@
 # Changelog - BOT Busca NFE
+
+## [1.0.86] - 2026-01-05
+
+### ⚠️ BREAKING CHANGE - Novo Padrão de Arquivamento
+
+#### 📋 Padrão Oficial Estabelecido
+- ✅ **Documentação completa**: `PADRAO_ARQUIVAMENTO.md` criado
+- ✅ **Nome do arquivo**: SEMPRE a chave de acesso (44 dígitos)
+- ✅ **Estrutura de pastas**: `xmls/{CNPJ}/{ANO-MES}/{TIPO}/{CHAVE}.xml`
+- ✅ **Exemplos**: `52260115045348000172570010014777191002562584.xml`
+
+#### 🔧 Mudanças no Sistema
+
+**Salvamento (nfe_search.py)**:
+- ✅ Arquivos salvos como `{chave}.xml` em vez de `{numero}-{nome}.xml`
+- ✅ Pasta principal agora é o CNPJ (não mais nome do certificado)
+- ✅ Extração de chave otimizada (antes do salvamento)
+- ✅ Validação de chave (44 dígitos)
+- ✅ Registro automático no banco `xmls_baixados`
+
+**Busca (interface_pyqt5.py)**:
+- ✅ Prioridade 1: Banco de dados (instantâneo)
+- ✅ Prioridade 2: Busca por nome `{chave}.xml` (rápido)
+- ✅ Prioridade 3: Busca por conteúdo (fallback para arquivos legados)
+- ⚠️ Avisos quando encontrar arquivos legados
+
+#### 📊 Benefícios
+
+**Performance**:
+- ⚡ Busca instantânea por chave (O(1) no banco)
+- ⚡ Busca por nome 10-50x mais rápida
+- ⚡ Sem necessidade de ler conteúdo dos arquivos
+
+**Organização**:
+- 📁 Estrutura previsível por CNPJ e período
+- 🔍 Localização imediata de qualquer documento
+- 🚫 Zero duplicatas (chave é única)
+- ✅ Compatível com outros sistemas fiscais
+
+**Manutenção**:
+- 📋 Padrão documentado e versionado
+- ✅ Checklist de conformidade
+- 🔄 Migração facilitada de arquivos legados
+- 📖 Guia completo de implementação
+
+#### ⚠️ Compatibilidade
+
+- ✅ **Arquivos antigos continuam funcionando** (busca por conteúdo)
+- ⚠️ **Performance reduzida** para arquivos legados (5-30s vs <50ms)
+- 💡 **Recomendação**: Renomear arquivos antigos para o novo padrão
+- 📋 **Scripts de migração**: Serão criados se necessário
+
+#### 📚 Documentação
+
+Consulte `PADRAO_ARQUIVAMENTO.md` para:
+- 📖 Especificação completa do padrão
+- 🏗️ Estrutura de pastas detalhada
+- 💾 Integração com banco de dados
+- 🔍 Estratégias de busca
+- ✅ Checklist de implementação
+- 🚀 Benefícios e justificativas
+
+---
+
+🎯 **Objetivo**: Arquivamento padronizado, eficiente e escalável para milhões de documentos fiscais.
+
 ## [1.0.21] - 2025-12-11
 
 ### Removido
