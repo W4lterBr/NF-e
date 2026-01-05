@@ -1123,6 +1123,28 @@ class DatabaseManager:
 
     def salvar_nota_detalhada(self, nota):
         with self._connect() as conn:
+            # Verifica se realmente tem XML salvo em disco
+            chave = nota['chave']
+            xml_status = nota.get('xml_status', 'RESUMO')  # Padrão é RESUMO, não COMPLETO
+            
+            # Se afirma ser COMPLETO, valida se o arquivo realmente existe
+            if xml_status == 'COMPLETO':
+                cursor = conn.execute(
+                    "SELECT caminho_arquivo FROM xmls_baixados WHERE chave = ?",
+                    (chave,)
+                )
+                row = cursor.fetchone()
+                
+                # Se não tem caminho registrado OU arquivo não existe, marca como RESUMO
+                if not row or not row[0]:
+                    xml_status = 'RESUMO'
+                    logger.warning(f"⚠️ Nota {chave[:25]}... marcada como COMPLETO mas sem arquivo em xmls_baixados. Corrigindo para RESUMO.")
+                else:
+                    from pathlib import Path
+                    if not Path(row[0]).exists():
+                        xml_status = 'RESUMO'
+                        logger.warning(f"⚠️ Nota {chave[:25]}... tem caminho registrado mas arquivo não existe. Corrigindo para RESUMO.")
+            
             conn.execute('''
                 INSERT OR REPLACE INTO notas_detalhadas (
                     chave, ie_tomador, nome_emitente, cnpj_emitente, numero,
@@ -1138,7 +1160,7 @@ class DatabaseManager:
                 nota.get('base_icms', ''), nota.get('valor_icms', ''),
                 nota['status'], nota['atualizado_em'],
                 nota.get('cnpj_destinatario', ''), 
-                nota.get('xml_status', 'COMPLETO'),
+                xml_status,  # Usa o status validado
                 nota.get('informante', '')
             ))
             conn.commit()
