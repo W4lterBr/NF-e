@@ -3647,37 +3647,28 @@ class MainWindow(QMainWindow):
                                 print(f"[DEBUG PDF] ⚡ PDF encontrado por nome: {pdf_file}")
                                 break
                         
-                        # Se não achou PDF, busca XML em toda estrutura
+                        # Se não achou PDF, busca XML em toda estrutura organizada
                         if not pdf_found:
                             print(f"[DEBUG PDF] Buscando XML por padrão: {numero_nf_sem_zeros}-*.xml")
                             for xml_file in xmls_root.rglob(f"{numero_nf_sem_zeros}-*.xml"):
-                                if 'backup' not in str(xml_file).lower():
-                                    xml_found = xml_file
-                                    print(f"[DEBUG PDF] ⚡ XML encontrado por nome: {xml_file}")
-                                    break
+                                # Ignora arquivos de debug/backup/sistema
+                                if any(x in str(xml_file).lower() for x in ['backup', 'debug', 'request', 'response', 'protocolo']):
+                                    continue
+                                xml_found = xml_file
+                                print(f"[DEBUG PDF] ⚡ XML encontrado por nome: {xml_file}")
+                                break
                     
-                    # Busca 2: Por chave no nome do arquivo (em toda estrutura)
+                    # Busca 2: Por chave no nome do arquivo (apenas estrutura organizada)
                     if not xml_found and not pdf_found:
                         print(f"[DEBUG PDF] Buscando por chave no nome do arquivo...")
                         for xml_file in xmls_root.rglob("*.xml"):
-                            if chave in xml_file.name and 'backup' not in str(xml_file).lower():
+                            # Ignora arquivos de debug/backup/sistema
+                            if any(x in str(xml_file).lower() for x in ['backup', 'debug', 'request', 'response', 'protocolo']):
+                                continue
+                            if chave in xml_file.name:
                                 xml_found = xml_file
                                 print(f"[DEBUG PDF] ✅ XML encontrado por chave no nome: {xml_file}")
                                 break
-                    
-                    # Busca 3: Em Debug de notas (por padrão de nome)
-                    if not xml_found and not pdf_found and numero_nf_sem_zeros:
-                        debug_folder = xmls_root / "Debug de notas"
-                        if debug_folder.exists():
-                            print(f"[DEBUG PDF] Buscando em Debug de notas por padrão: {numero_nf_sem_zeros}-*")
-                            for pdf_file in debug_folder.glob(f"{numero_nf_sem_zeros}-*.pdf"):
-                                pdf_found = pdf_file
-                                print(f"[DEBUG PDF] ⚡ PDF encontrado em Debug: {pdf_file}")
-                                break
-                            if not pdf_found:
-                                for xml_file in debug_folder.glob(f"{numero_nf_sem_zeros}-*.xml"):
-                                    xml_found = xml_file
-                                    print(f"[DEBUG PDF] ⚡ XML encontrado em Debug: {xml_file}")
                                     break
                     
                     # Busca 4: ÚLTIMO RECURSO - Lê conteúdo dos XMLs (LENTO - só se não achou por nome)
@@ -4129,36 +4120,36 @@ class MainWindow(QMainWindow):
                         except Exception:
                             pass
                     
-                    # Determine PDF path - OTIMIZADO para buscar o XML em toda estrutura
+                    # Determine PDF path - OTIMIZADO para buscar o XML na estrutura organizada
                     if saved_xml_path:
                         pdf_path = Path(saved_xml_path).with_suffix('.pdf')
                     else:
                         if chave and informante:
-                            # Busca o XML em toda a estrutura do informante (incluindo Debug de notas)
+                            # Busca o XML APENAS na estrutura organizada por CNPJ (xmls/{CNPJ}/...)
                             xmls_root = DATA_DIR / "xmls"
                             found_xml = None
                             
-                            # Busca 1: Na pasta do informante (mais provável)
+                            # Busca 1: Na pasta do informante por nome da chave (PADRÃO v1.0.86+)
                             informante_folder = xmls_root / informante
                             if informante_folder.exists():
+                                print(f"[DEBUG XML] Buscando {chave}.xml em: {informante_folder}")
                                 for xml_file in informante_folder.rglob(f"{chave}.xml"):
-                                    found_xml = xml_file
-                                    break
-                            
-                            # Busca 2: Se não encontrou, busca em Debug de notas
-                            if not found_xml:
-                                debug_folder = xmls_root / "Debug de notas"
-                                if debug_folder.exists():
-                                    for xml_file in debug_folder.glob(f"*{chave}*.xml"):
+                                    # Ignora pastas de debug/backup
+                                    if not any(x in str(xml_file).lower() for x in ['debug', 'backup', 'request', 'response']):
                                         found_xml = xml_file
+                                        print(f"[DEBUG XML] ✅ XML encontrado: {xml_file}")
                                         break
                             
-                            # Busca 3: Se ainda não encontrou, busca em toda estrutura
-                            if not found_xml and xmls_root.exists():
-                                for xml_file in xmls_root.rglob(f"*{chave}*.xml"):
-                                    # Ignora pastas de backup
-                                    if 'backup' not in str(xml_file).lower():
+                            # Busca 2: Busca por padrão antigo ou conteúdo (FALLBACK)
+                            if not found_xml and informante_folder.exists():
+                                print(f"[DEBUG XML] Buscando XMLs legados com chave no nome...")
+                                for xml_file in informante_folder.rglob("*.xml"):
+                                    # Ignora arquivos de sistema
+                                    if any(x in str(xml_file).lower() for x in ['debug', 'backup', 'request', 'response', 'protocolo']):
+                                        continue
+                                    if chave in xml_file.name:
                                         found_xml = xml_file
+                                        print(f"[DEBUG XML] ✅ XML legado encontrado: {xml_file}")
                                         break
                             
                             if found_xml:
