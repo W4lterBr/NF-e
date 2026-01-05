@@ -533,6 +533,10 @@ class MainWindow(QMainWindow):
         self.table.setSortingEnabled(True)
         # Centraliza ícones na coluna XML (coluna 0)
         self.table.horizontalHeader().setDefaultAlignment(Qt.AlignCenter)
+        # Permite arrastar colunas para reordenar
+        self.table.horizontalHeader().setSectionsMovable(True)
+        # Conecta sinal para salvar ordem quando mudada
+        self.table.horizontalHeader().sectionMoved.connect(lambda: self._save_column_order('table'))
         # Aplica delegate para centralizar ícones
         self.table.setItemDelegateForColumn(0, CenterIconDelegate(self.table))
         # Menu de contexto para buscar XML completo
@@ -580,6 +584,10 @@ class MainWindow(QMainWindow):
         self.table_emitidos.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.table_emitidos.setSortingEnabled(True)
         self.table_emitidos.horizontalHeader().setDefaultAlignment(Qt.AlignCenter)
+        # Permite arrastar colunas para reordenar
+        self.table_emitidos.horizontalHeader().setSectionsMovable(True)
+        # Conecta sinal para salvar ordem quando mudada
+        self.table_emitidos.horizontalHeader().sectionMoved.connect(lambda: self._save_column_order('table_emitidos'))
         self.table_emitidos.setItemDelegateForColumn(0, CenterIconDelegate(self.table_emitidos))
         self.table_emitidos.setContextMenuPolicy(Qt.CustomContextMenu)
         self.table_emitidos.customContextMenuRequested.connect(self._on_table_emitidos_context_menu)
@@ -598,6 +606,10 @@ class MainWindow(QMainWindow):
         
         tab2_layout.addWidget(self.table_emitidos)
         self.tabs.addTab(tab2, "Emitidos pela empresa")
+
+        # Restaura ordem personalizada das colunas
+        self._restore_column_order('table')
+        self._restore_column_order('table_emitidos')
 
         v.addWidget(self.tabs)
 
@@ -1452,6 +1464,46 @@ class MainWindow(QMainWindow):
             
         except Exception as e:
             QMessageBox.critical(self, "Erro", f"Erro ao baixar XMLs: {e}")
+
+    def _save_column_order(self, table_name: str):
+        """Salva a ordem das colunas quando o usuário reorganiza"""
+        try:
+            settings = QSettings('NFE_System', 'BOT_NFE')
+            table = self.table if table_name == 'table' else self.table_emitidos
+            header = table.horizontalHeader()
+            
+            # Obtém a ordem visual das colunas
+            order = []
+            for i in range(header.count()):
+                order.append(header.visualIndex(i))
+            
+            # Salva no QSettings
+            settings.setValue(f'columns/{table_name}/order', order)
+            print(f"✅ Ordem de colunas salva para {table_name}: {order}")
+        except Exception as e:
+            print(f"❌ Erro ao salvar ordem de colunas: {e}")
+    
+    def _restore_column_order(self, table_name: str):
+        """Restaura a ordem das colunas salva pelo usuário"""
+        try:
+            settings = QSettings('NFE_System', 'BOT_NFE')
+            saved_order = settings.value(f'columns/{table_name}/order', None)
+            
+            if not saved_order:
+                return  # Sem preferência salva, usa ordem padrão
+            
+            table = self.table if table_name == 'table' else self.table_emitidos
+            header = table.horizontalHeader()
+            
+            # Restaura a ordem visual
+            if isinstance(saved_order, list) and len(saved_order) == header.count():
+                for logical_index, visual_index in enumerate(saved_order):
+                    header.moveSection(header.visualIndex(logical_index), visual_index)
+                print(f"✅ Ordem de colunas restaurada para {table_name}")
+            else:
+                print(f"⚠️ Ordem salva inválida para {table_name}, usando padrão")
+        except Exception as e:
+            print(f"❌ Erro ao restaurar ordem de colunas: {e}")
 
     def refresh_all(self):
         # Evita reentrância e trava de UI: carrega notas em thread
