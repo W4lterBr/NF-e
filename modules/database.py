@@ -142,6 +142,23 @@ class DatabaseManager:
                 status TEXT,
                 protocolo TEXT,
                 UNIQUE(chave, tipo_evento, informante)
+            )''')            
+            
+            # Tabela de chaves canceladas (para não buscar mais eventos)
+            conn.execute('''CREATE TABLE IF NOT EXISTS chaves_canceladas (
+                chave TEXT PRIMARY KEY,
+                data_cancelamento TEXT NOT NULL,
+                motivo TEXT
+            )''')
+            
+            # Tabela de estado de sincronização (para retomar após interrupção)
+            conn.execute('''CREATE TABLE IF NOT EXISTS sync_state (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                ultima_chave TEXT,
+                total_docs INTEGER,
+                docs_processados INTEGER,
+                data_inicio TEXT,
+                status TEXT
             )''')
             
             # Índice para busca rápida
@@ -407,6 +424,19 @@ class DatabaseManager:
         except Exception:
             return False
     
+    def atualizar_xml_status(self, chave: str, novo_xml_status: str) -> bool:
+        """Update XML status in notas_detalhadas table (e.g., RESUMO -> COMPLETO)."""
+        try:
+            with self._connect() as conn:
+                conn.execute(
+                    "UPDATE notas_detalhadas SET xml_status = ?, atualizado_em = ? WHERE chave = ?",
+                    (novo_xml_status, datetime.now().isoformat(), chave)
+                )
+                conn.commit()
+                return True
+        except Exception:
+            return False
+    
     def register_xml_download(self, chave: str, caminho: str, cnpj_cpf: str = "") -> bool:
         """Register downloaded XML in xmls_baixados table."""
         try:
@@ -454,6 +484,90 @@ class DatabaseManager:
                     "UPDATE notas_detalhadas SET status = ? WHERE chave = ?",
                     (novo_status, chave)
                 )
+                conn.commit()
+                return True
+        except Exception:
+            return False
+    
+    def marcar_chave_cancelada(self, chave: str, motivo: str = 'Cancelamento') -> bool:
+        """Marca uma chave como cancelada para não buscar mais eventos."""
+        try:
+            from datetime import datetime
+            with self._connect() as conn:
+                conn.execute(
+                    '''INSERT OR REPLACE INTO chaves_canceladas (chave, data_cancelamento, motivo)
+                       VALUES (?, ?, ?)''',
+                    (chave, datetime.now().isoformat(), motivo)
+                )
+                conn.commit()
+                return True
+        except Exception:
+            return False
+    
+    def is_chave_cancelada(self, chave: str) -> bool:
+        """Verifica se uma chave está marcada como cancelada."""
+        try:
+            with self._connect() as conn:
+                result = conn.execute(
+                    "SELECT 1 FROM chaves_canceladas WHERE chave = ?",
+                    (chave,)
+                ).fetchone()
+                return result is not None
+        except Exception:
+            return False
+    
+    def save_sync_state(self, ultima_chave: str, total: int, processados: int) -> bool:
+        """Salva o estado atual da sincronização."""
+        try:
+            from datetime import datetime
+            with self._connect() as conn:
+                # Verifica se já existe um estado
+                existing = conn.execute("SELECT id FROM sync_state WHERE id = 1").fetchone()
+                
+                if existing:
+                    conn.execute(
+                        '''UPDATE sync_state 
+                           SET ultima_chave = ?, total_docs = ?, docs_processados = ?, status = 'em_progresso'
+                           WHERE id = 1''',
+                        (ultima_chave, total, processados)
+                    )
+                else:
+                    conn.execute(
+                        '''INSERT INTO sync_state (id, ultima_chave, total_docs, docs_processados, data_inicio, status)
+                           VALUES (1, ?, ?, ?, ?, 'em_progresso')''',
+                        (ultima_chave, total, processados, datetime.now().isoformat())
+                    )
+                conn.commit()
+                return True
+        except Exception as e:
+            print(f"[DB] Erro ao salvar estado da sync: {e}")
+            return False
+    
+    def get_sync_state(self) -> dict:
+        """Recupera o estado da sincronização pendente."""
+        try:
+            with self._connect() as conn:
+                row = conn.execute(
+                    "SELECT ultima_chave, total_docs, docs_processados, data_inicio, status FROM sync_state WHERE id = 1"
+                ).fetchone()
+                
+                if row and row[4] == 'em_progresso':
+                    return {
+                        'ultima_chave': row[0],
+                        'total_docs': row[1],
+                        'docs_processados': row[2],
+                        'data_inicio': row[3],
+                        'status': row[4]
+                    }
+                return None
+        except Exception:
+            return None
+    
+    def clear_sync_state(self) -> bool:
+        """Limpa o estado da sincronização (quando concluída ou cancelada)."""
+        try:
+            with self._connect() as conn:
+                conn.execute("UPDATE sync_state SET status = 'concluida' WHERE id = 1")
                 conn.commit()
                 return True
         except Exception:

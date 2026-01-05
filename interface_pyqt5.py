@@ -351,6 +351,15 @@ class MainWindow(QMainWindow):
         self._cache_building = False
         self._cache_worker = None  # Referência para a thread do cache
         self._refreshing_emitidos = False  # Flag para evitar múltiplos refreshes simultâneos
+        
+        # Sistema de trabalhos em background
+        self._trabalhos_ativos = []
+        self._sync_worker = None
+        self._sync_thread = None
+        self._ultimo_evento_usuario = datetime.now()
+        self._inatividade_timer = QTimer()
+        self._inatividade_timer.timeout.connect(self._check_inatividade)
+        self._inatividade_timer.start(10000)  # Verifica a cada 10 segundos
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -668,6 +677,8 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(100, self._atualizar_ufs_certificados)
         # Gera PDFs faltantes
         QTimer.singleShot(500, self._gerar_pdfs_faltantes)
+        # Verifica se há sincronização pendente
+        QTimer.singleShot(1500, self._verificar_sync_pendente)
         # Auto-start search removido - usuário deve clicar em "Buscar na SEFAZ"
         # QTimer.singleShot(2000, self._auto_start_search)
         self._apply_theme()
@@ -793,6 +804,48 @@ class MainWindow(QMainWindow):
             self._populate_certs_tree()
         except Exception as e:
             print(f"[ERRO] Erro ao atualizar certificados: {e}")
+    
+    def _verificar_sync_pendente(self):
+        """Verifica se há sincronização pendente e pergunta se quer retomar."""
+        try:
+            estado = self.db.get_sync_state()
+            if estado:
+                from datetime import datetime
+                
+                # Formata a data de início
+                try:
+                    data_inicio = datetime.fromisoformat(estado['data_inicio'])
+                    data_str = data_inicio.strftime("%d/%m/%Y às %H:%M:%S")
+                except:
+                    data_str = "data desconhecida"
+                
+                processados = estado.get('docs_processados', 0)
+                total = estado.get('total_docs', 0)
+                restantes = total - processados
+                percentual = int((processados / total) * 100) if total > 0 else 0
+                
+                resposta = QMessageBox.question(
+                    self,
+                    "🔄 Sincronização Pendente",
+                    f"<b>Foi detectada uma sincronização incompleta:</b><br><br>"
+                    f"📅 <b>Iniciada em:</b> {data_str}<br>"
+                    f"📊 <b>Progresso:</b> {processados}/{total} documentos ({percentual}%)<br>"
+                    f"⏳ <b>Restantes:</b> {restantes} documentos<br><br>"
+                    f"<b>Deseja retomar de onde parou?</b><br>"
+                    f"<i>(Se escolher 'Não', a sincronização será reiniciada do zero)</i>",
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.Yes
+                )
+                
+                if resposta == QMessageBox.Yes:
+                    print(f"[SYNC] Retomando sincronização: {processados}/{total} documentos")
+                    # Aguarda 1 segundo para a interface carregar completamente
+                    QTimer.singleShot(1000, lambda: self._retomar_sync_background(estado))
+                else:
+                    print("[SYNC] Usuário optou por não retomar. Limpando estado...")
+                    self.db.clear_sync_state()
+        except Exception as e:
+            print(f"[SYNC] Erro ao verificar sincronização pendente: {e}")
     
     def set_status(self, msg: str, timeout_ms: int = 0):
         self.status_label.setText(msg)
@@ -1028,6 +1081,8 @@ class MainWindow(QMainWindow):
         tarefas.addSeparator()
         add_action(tarefas, "Busca por chave", self.buscar_por_chave, "Ctrl+K", qstyle_icon=QStyle.SP_FileDialogListView)
         add_action(tarefas, "Certificados…", self.open_certificates, "Ctrl+Shift+C", qstyle_icon=QStyle.SP_DialogApplyButton)
+        tarefas.addSeparator()
+        add_action(tarefas, "⚙️ Gerenciador de Trabalhos", self._abrir_gerenciador_trabalhos, "Ctrl+Shift+G", qstyle_icon=QStyle.SP_ComputerIcon)
         tarefas.addSeparator()
         add_action(tarefas, "💾 Armazenamento…", self.open_storage_config, "Ctrl+Shift+A", qstyle_icon=QStyle.SP_DriveFDIcon)
         tarefas.addSeparator()
@@ -5368,6 +5423,1043 @@ class MainWindow(QMainWindow):
             dlg.exec_()
         except Exception as e:
             QMessageBox.critical(self, "Armazenamento", f"Erro: {e}")
+    
+    def _abrir_gerenciador_trabalhos(self):
+        """Abre o Gerenciador de Trabalhos"""
+        try:
+            dialog = GerenciadorTrabalhosDialog(self)
+            dialog.exec_()
+        except Exception as e:
+            QMessageBox.critical(self, "Erro", f"Erro ao abrir gerenciador: {e}")
+    
+    def _check_inatividade(self):
+        """Verifica inatividade e inicia sincronização automática"""
+        try:
+            if not hasattr(self, '_ultimo_evento_usuario') or not hasattr(self, '_sync_worker'):
+                return
+            
+            tempo_inativo = (datetime.now() - self._ultimo_evento_usuario).total_seconds()
+            
+            if tempo_inativo > 30 and not self._sync_worker:
+                print("[AUTO-SYNC] Usuário inativo há 30s, iniciando sincronização automática...")
+                self._iniciar_sync_background()
+        except Exception as e:
+            print(f"[AUTO-SYNC] Erro ao verificar inatividade: {e}")
+    
+    def _iniciar_sync_background(self):
+        """Inicia sincronização de eventos em background"""
+        if self._sync_worker:
+            return
+        
+        try:
+            from PyQt5.QtCore import QThread, pyqtSignal, QObject
+        except ImportError:
+            return
+        
+        try:
+            docs = self.filtered() if self.tabs.currentIndex() == 0 else self.filtered_emitidos()
+            if not docs:
+                return
+        except Exception:
+            return
+        
+        class SyncWorker(QObject):
+            progress = pyqtSignal(str, int, int)
+            finished = pyqtSignal()
+            error = pyqtSignal(str)
+            
+            def __init__(self, parent_window):
+                super().__init__()
+                self.parent = parent_window
+                self._pausado = False
+                self._cancelado = False
+            
+            def pausar(self):
+                self._pausado = True
+            
+            def retomar(self):
+                self._pausado = False
+            
+            def cancelar(self):
+                self._cancelado = True
+            
+            def run(self):
+                try:
+                    docs = self.parent.filtered() if self.parent.tabs.currentIndex() == 0 else self.parent.filtered_emitidos()
+                    if not docs:
+                        self.finished.emit()
+                        return
+                    
+                    total = len(docs)
+                    self.progress.emit(f"Iniciando {total} docs...", 0, total)
+                    
+                    # Salva estado inicial
+                    primeira_chave = docs[0].get('chave', '') if docs else ''
+                    self.parent.db.save_sync_state(primeira_chave, total, 0)
+                    
+                    for idx, item in enumerate(docs):
+                        if self._cancelado:
+                            break
+                        
+                        while self._pausado and not self._cancelado:
+                            import time
+                            time.sleep(0.5)
+                        
+                        if self._cancelado:
+                            break
+                        
+                        chave = item.get('chave', '')
+                        numero = item.get('numero', chave[:10])
+                        
+                        # Pula documentos cancelados
+                        if chave and self.parent.db.is_chave_cancelada(chave):
+                            self.progress.emit(f"Doc {numero} (cancelado - pulado)", idx+1, total)
+                            continue
+                        
+                        self.progress.emit(f"Doc {numero}", idx+1, total)
+                        
+                        try:
+                            informante = item.get('informante', '')
+                            certs = self.parent.db.load_certificates()
+                            cert_uf = next((c for c in certs if c.get('informante') == informante), certs[0] if certs else None)
+                            
+                            if cert_uf and chave and len(chave) == 44:
+                                from nfe_search import NFeService, salvar_xml_por_certificado
+                                from lxml import etree
+                                
+                                service = NFeService(
+                                    cert_path=cert_uf.get('caminho', ''),
+                                    senha=cert_uf.get('senha', ''),
+                                    informante=cert_uf.get('informante', ''),
+                                    cuf=cert_uf.get('cUF_autor', '50')
+                                )
+                                
+                                resposta_xml = service.consultar_eventos_chave(chave)
+                                if resposta_xml:
+                                    root = etree.fromstring(resposta_xml.encode('utf-8'))
+                                    eventos = root.findall('.//{http://www.portalfiscal.inf.br/nfe}retEvento')
+                                    
+                                    for evento in eventos:
+                                        tp_evento = evento.findtext('.//{http://www.portalfiscal.inf.br/nfe}tpEvento')
+                                        cstat = evento.findtext('.//{http://www.portalfiscal.inf.br/nfe}cStat')
+                                        
+                                        if cstat in ['135', '136'] and tp_evento:
+                                            evento_xml_str = etree.tostring(evento, encoding='utf-8').decode('utf-8')
+                                            salvar_xml_por_certificado(evento_xml_str, cert_uf.get('informante'))
+                                            
+                                            # Marca como cancelado para não buscar mais
+                                            if tp_evento == '110111' and cstat == '135':
+                                                self.parent.db.marcar_chave_cancelada(chave, 'Cancelamento de NF-e')
+                                                print(f"[SYNC] Chave {chave[:10]}... marcada como cancelada")
+                                            
+                                            if tp_evento in ['210200', '210210', '210220', '210240']:
+                                                self.parent.db.register_manifestacao(
+                                                    chave, tp_evento, cert_uf.get('informante'),
+                                                    datetime.now().isoformat()
+                                                )
+                        except Exception as e:
+                            print(f"[SYNC] Erro: {e}")
+                        
+                        # Salva progresso a cada 5 documentos
+                        if (idx + 1) % 5 == 0:
+                            self.parent.db.save_sync_state(chave, total, idx + 1)
+                        
+                        import time
+                        time.sleep(1.5)
+                    
+                    # Limpa estado ao concluir
+                    self.parent.db.clear_sync_state()
+                    self.finished.emit()
+                except Exception as e:
+                    self.error.emit(str(e))
+        
+        self._sync_thread = QThread()
+        self._sync_worker = SyncWorker(self)
+        self._sync_worker.moveToThread(self._sync_thread)
+        
+        self._sync_thread.started.connect(self._sync_worker.run)
+        self._sync_worker.finished.connect(self._on_sync_finished)
+        self._sync_worker.error.connect(self._on_sync_error)
+        self._sync_worker.progress.connect(self._on_sync_progress)
+        
+        trabalho = {
+            'id': datetime.now().timestamp(),
+            'nome': 'Sincronização de Eventos',
+            'tipo': 'sync_eventos',
+            'status': 'Em execução',
+            'progresso': 0,
+            'total': 0,
+            'mensagem': 'Iniciando...',
+            'worker': self._sync_worker
+        }
+        self._trabalhos_ativos.append(trabalho)
+        self._sync_thread.start()
+    
+    def _on_sync_progress(self, mensagem, atual, total):
+        """Atualiza progresso da sincronização"""
+        try:
+            for trabalho in self._trabalhos_ativos:
+                if trabalho.get('tipo') == 'sync_eventos' and trabalho.get('status') == 'Em execução':
+                    trabalho['progresso'] = atual
+                    trabalho['total'] = total
+                    trabalho['mensagem'] = mensagem
+                    break
+            self.statusBar().showMessage(f"Sincronizando: {mensagem} ({atual}/{total})", 2000)
+        except Exception:
+            pass
+    
+    def _on_sync_finished(self):
+        """Finaliza sincronização"""
+        try:
+            if self._sync_thread:
+                self._sync_thread.quit()
+                self._sync_thread.wait()
+            self._sync_worker = None
+            self._sync_thread = None
+            self._trabalhos_ativos = [t for t in self._trabalhos_ativos if t.get('tipo') != 'sync_eventos']
+            self.statusBar().showMessage("Sincronização concluída!", 5000)
+        except Exception:
+            pass
+    
+    def _on_sync_error(self, erro):
+        """Trata erros da sincronização"""
+        try:
+            if self._sync_thread:
+                self._sync_thread.quit()
+                self._sync_thread.wait()
+            self._sync_worker = None
+            self._sync_thread = None
+            self._trabalhos_ativos = [t for t in self._trabalhos_ativos if t.get('tipo') != 'sync_eventos']
+            # Não limpa o estado em caso de erro - permite retomar
+            self.statusBar().showMessage(f"Erro: {erro}", 5000)
+        except Exception:
+            pass
+    
+    def _retomar_sync_background(self, estado: dict):
+        """Retoma sincronização de onde parou."""
+        if self._sync_worker:
+            return
+        
+        try:
+            from PyQt5.QtCore import QThread, pyqtSignal, QObject
+        except ImportError:
+            return
+        
+        try:
+            docs = self.filtered() if self.tabs.currentIndex() == 0 else self.filtered_emitidos()
+            if not docs:
+                self.db.clear_sync_state()
+                return
+            
+            # Encontra o índice da última chave processada
+            ultima_chave = estado.get('ultima_chave', '')
+            idx_inicio = 0
+            
+            if ultima_chave:
+                for idx, doc in enumerate(docs):
+                    if doc.get('chave') == ultima_chave:
+                        idx_inicio = idx + 1  # Começa no próximo
+                        break
+            
+            # Se já processou todos, limpa estado
+            if idx_inicio >= len(docs):
+                self.db.clear_sync_state()
+                QMessageBox.information(
+                    self,
+                    "Sincronização Concluída",
+                    "Todos os documentos já foram processados!"
+                )
+                return
+            
+            # Cria slice dos docs restantes
+            docs_restantes = docs[idx_inicio:]
+            processados_anteriormente = estado.get('docs_processados', 0)
+            total_original = estado.get('total_docs', len(docs))
+            
+            print(f"[SYNC-RETOMAR] Retomando do documento {idx_inicio+1}/{len(docs)}")
+            
+        except Exception as e:
+            print(f"[SYNC-RETOMAR] Erro ao preparar retomada: {e}")
+            return
+        
+        class SyncWorkerRetomar(QObject):
+            progress = pyqtSignal(str, int, int)
+            finished = pyqtSignal()
+            error = pyqtSignal(str)
+            
+            def __init__(self, parent_window, docs_restantes, idx_inicio, processados_ant, total_orig):
+                super().__init__()
+                self.parent = parent_window
+                self.docs = docs_restantes
+                self.idx_inicio = idx_inicio
+                self.processados_anteriormente = processados_ant
+                self.total_original = total_orig
+                self._pausado = False
+                self._cancelado = False
+            
+            def pausar(self):
+                self._pausado = True
+            
+            def retomar(self):
+                self._pausado = False
+            
+            def cancelar(self):
+                self._cancelado = True
+            
+            def run(self):
+                try:
+                    if not self.docs:
+                        self.finished.emit()
+                        return
+                    
+                    total_docs = self.total_original
+                    self.progress.emit(f"Retomando... {len(self.docs)} docs restantes", 
+                                     self.processados_anteriormente, total_docs)
+                    
+                    for idx, item in enumerate(self.docs):
+                        if self._cancelado:
+                            break
+                        
+                        while self._pausado and not self._cancelado:
+                            import time
+                            time.sleep(0.5)
+                        
+                        if self._cancelado:
+                            break
+                        
+                        chave = item.get('chave', '')
+                        numero = item.get('numero', chave[:10])
+                        
+                        # Pula documentos cancelados
+                        if chave and self.parent.db.is_chave_cancelada(chave):
+                            atual_global = self.processados_anteriormente + idx + 1
+                            self.progress.emit(f"Doc {numero} (cancelado - pulado)", atual_global, total_docs)
+                            continue
+                        
+                        atual_global = self.processados_anteriormente + idx + 1
+                        self.progress.emit(f"Doc {numero}", atual_global, total_docs)
+                        
+                        try:
+                            informante = item.get('informante', '')
+                            certs = self.parent.db.load_certificates()
+                            cert_uf = next((c for c in certs if c.get('informante') == informante), certs[0] if certs else None)
+                            
+                            if cert_uf and chave and len(chave) == 44:
+                                from nfe_search import NFeService, salvar_xml_por_certificado
+                                from lxml import etree
+                                
+                                service = NFeService(
+                                    cert_path=cert_uf.get('caminho', ''),
+                                    senha=cert_uf.get('senha', ''),
+                                    informante=cert_uf.get('informante', ''),
+                                    cuf=cert_uf.get('cUF_autor', '50')
+                                )
+                                
+                                resposta_xml = service.consultar_eventos_chave(chave)
+                                if resposta_xml:
+                                    root = etree.fromstring(resposta_xml.encode('utf-8'))
+                                    eventos = root.findall('.//{http://www.portalfiscal.inf.br/nfe}retEvento')
+                                    
+                                    for evento in eventos:
+                                        tp_evento = evento.findtext('.//{http://www.portalfiscal.inf.br/nfe}tpEvento')
+                                        cstat = evento.findtext('.//{http://www.portalfiscal.inf.br/nfe}cStat')
+                                        
+                                        if cstat in ['135', '136'] and tp_evento:
+                                            evento_xml_str = etree.tostring(evento, encoding='utf-8').decode('utf-8')
+                                            salvar_xml_por_certificado(evento_xml_str, cert_uf.get('informante'))
+                                            
+                                            if tp_evento == '110111' and cstat == '135':
+                                                self.parent.db.marcar_chave_cancelada(chave, 'Cancelamento de NF-e')
+                                                print(f"[SYNC] Chave {chave[:10]}... marcada como cancelada")
+                                            
+                                            if tp_evento in ['210200', '210210', '210220', '210240']:
+                                                self.parent.db.register_manifestacao(
+                                                    chave, tp_evento, cert_uf.get('informante'),
+                                                    datetime.now().isoformat()
+                                                )
+                        except Exception as e:
+                            print(f"[SYNC] Erro: {e}")
+                        
+                        # Salva progresso a cada 5 documentos
+                        if (idx + 1) % 5 == 0:
+                            self.parent.db.save_sync_state(chave, total_docs, atual_global)
+                        
+                        import time
+                        time.sleep(1.5)
+                    
+                    # Limpa estado ao concluir
+                    self.parent.db.clear_sync_state()
+                    self.finished.emit()
+                except Exception as e:
+                    self.error.emit(str(e))
+        
+        self._sync_thread = QThread()
+        self._sync_worker = SyncWorkerRetomar(
+            self, docs_restantes, idx_inicio, 
+            processados_anteriormente, total_original
+        )
+        self._sync_worker.moveToThread(self._sync_thread)
+        
+        self._sync_thread.started.connect(self._sync_worker.run)
+        self._sync_worker.finished.connect(self._on_sync_finished)
+        self._sync_worker.error.connect(self._on_sync_error)
+        self._sync_worker.progress.connect(self._on_sync_progress)
+        
+        trabalho = {
+            'id': datetime.now().timestamp(),
+            'nome': 'Sincronização de Eventos (Retomada)',
+            'tipo': 'sync_eventos',
+            'status': 'Em execução',
+            'progresso': processados_anteriormente,
+            'total': total_original,
+            'mensagem': f'Retomando do doc {idx_inicio+1}...',
+            'worker': self._sync_worker
+        }
+        self._trabalhos_ativos.append(trabalho)
+        self._sync_thread.start()
+
+
+class GerenciadorTrabalhosDialog(QDialog):
+    """Dialog estilo Windows Task Manager para gerenciar trabalhos em background"""
+    
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.parent_window = parent
+        self.setWindowTitle("Gerenciador de Trabalhos")
+        self.resize(1000, 600)
+        self.setModal(False)
+        
+        # Estilo global do dialog
+        self.setStyleSheet("""
+            QDialog {
+                background-color: #fafafa;
+            }
+        """)
+        
+        # Layout principal
+        main_layout = QVBoxLayout()
+        main_layout.setSpacing(0)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        
+        # Header estilo Windows moderno
+        header = QWidget()
+        header.setStyleSheet("""
+            QWidget {
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                                          stop:0 #0078d4, stop:1 #005a9e);
+                border-bottom: 3px solid #004578;
+            }
+        """)
+        header_layout = QVBoxLayout()
+        header_layout.setContentsMargins(25, 20, 25, 20)
+        header_layout.setSpacing(8)
+        
+        # Título com ícone
+        titulo_layout = QHBoxLayout()
+        titulo_layout.setSpacing(10)
+        
+        icone_label = QLabel("⚙️")
+        icone_label.setTextFormat(Qt.PlainText)
+        icone_label.setTextInteractionFlags(Qt.NoTextInteraction)
+        icone_label.setOpenExternalLinks(False)
+        icone_label.setWordWrap(False)
+        icone_label.setFocusPolicy(Qt.NoFocus)
+        icone_label.setAttribute(Qt.WA_TransparentForMouseEvents, False)
+        icone_font = QFont()
+        icone_font.setFamily("Segoe UI Emoji")
+        icone_font.setPointSize(56)
+        icone_font.setUnderline(False)
+        icone_font.setStyleStrategy(QFont.PreferAntialias)
+        icone_label.setFont(icone_font)
+        icone_label.setAlignment(Qt.AlignCenter)
+        icone_label.setStyleSheet("""
+            QLabel {
+                color: white;
+                background: transparent;
+                text-decoration: none;
+                border: none;
+                border-bottom: none;
+                outline: none;
+            }
+        """)
+        titulo_layout.addWidget(icone_label)
+        
+        titulo = QLabel("Gerenciador de Trabalhos")
+        titulo.setTextFormat(Qt.PlainText)
+        titulo.setTextInteractionFlags(Qt.NoTextInteraction)
+        titulo.setOpenExternalLinks(False)
+        titulo.setWordWrap(False)
+        titulo.setFocusPolicy(Qt.NoFocus)
+        titulo.setAttribute(Qt.WA_TransparentForMouseEvents, False)
+        # Configura fonte explicitamente sem underline
+        titulo_font = QFont()
+        titulo_font.setFamily("Segoe UI")
+        titulo_font.setPointSize(20)
+        titulo_font.setBold(True)
+        titulo_font.setUnderline(False)
+        titulo_font.setStyleStrategy(QFont.PreferAntialias)
+        titulo.setFont(titulo_font)
+        titulo.setStyleSheet("""
+            QLabel {
+                color: white;
+                background: transparent;
+                padding-left: 10px;
+                border: none;
+                text-decoration: none;
+                border-bottom: none;
+                outline: none;
+            }
+        """)
+        titulo_layout.addWidget(titulo)
+        titulo_layout.addStretch()
+        
+        header_layout.addLayout(titulo_layout)
+        
+        subtitulo = QLabel("Acompanhe e controle todas as tarefas em segundo plano")
+        subtitulo.setTextFormat(Qt.PlainText)
+        subtitulo.setTextInteractionFlags(Qt.NoTextInteraction)
+        subtitulo.setOpenExternalLinks(False)
+        subtitulo.setWordWrap(False)
+        subtitulo.setFocusPolicy(Qt.NoFocus)
+        subtitulo.setAttribute(Qt.WA_TransparentForMouseEvents, False)
+        # Configura fonte explicitamente sem underline
+        subtitulo_font = QFont()
+        subtitulo_font.setFamily("Segoe UI")
+        subtitulo_font.setPointSize(11)
+        subtitulo_font.setUnderline(False)
+        subtitulo_font.setStyleStrategy(QFont.PreferAntialias)
+        subtitulo.setFont(subtitulo_font)
+        subtitulo.setStyleSheet("""
+            QLabel {
+                color: rgba(255, 255, 255, 0.9);
+                background: transparent;
+                padding-left: 52px;
+                border: none;
+                text-decoration: none;
+                border-bottom: none;
+                outline: none;
+            }
+        """)
+        header_layout.addWidget(subtitulo)
+        
+        header.setLayout(header_layout)
+        main_layout.addWidget(header)
+        
+        # Área de conteúdo com barra de ferramentas
+        content = QWidget()
+        content.setStyleSheet("background-color: #fafafa;")
+        content_layout = QVBoxLayout()
+        content_layout.setContentsMargins(20, 20, 20, 20)
+        content_layout.setSpacing(15)
+        
+        # Barra de ferramentas
+        toolbar = QWidget()
+        toolbar.setStyleSheet("""
+            QWidget {
+                background-color: white;
+                border: 1px solid #e0e0e0;
+                border-radius: 6px;
+                padding: 10px;
+            }
+        """)
+        toolbar_layout = QHBoxLayout()
+        toolbar_layout.setContentsMargins(10, 5, 10, 5)
+        
+        btn_atualizar = QPushButton("🔄 Atualizar")
+        btn_atualizar.setStyleSheet("""
+            QPushButton {
+                background-color: #0078d4;
+                color: white;
+                border: none;
+                padding: 8px 20px;
+                border-radius: 4px;
+                font-weight: bold;
+                font-size: 11px;
+            }
+            QPushButton:hover {
+                background-color: #005a9e;
+            }
+            QPushButton:pressed {
+                background-color: #004578;
+            }
+        """)
+        btn_atualizar.clicked.connect(self._atualizar_lista)
+        toolbar_layout.addWidget(btn_atualizar)
+        
+        btn_sync = QPushButton("⚡ Sincronizar Agora")
+        btn_sync.setStyleSheet("""
+            QPushButton {
+                background-color: #16c60c;
+                color: white;
+                border: none;
+                padding: 8px 20px;
+                border-radius: 4px;
+                font-weight: bold;
+                font-size: 11px;
+            }
+            QPushButton:hover {
+                background-color: #13a10e;
+            }
+            QPushButton:pressed {
+                background-color: #0e7c0a;
+            }
+        """)
+        btn_sync.clicked.connect(self._iniciar_sync_manual)
+        toolbar_layout.addWidget(btn_sync)
+        
+        toolbar_layout.addStretch()
+        
+        info_label = QLabel("⏱ Atualização automática a cada 1 segundo")
+        info_label.setStyleSheet("""
+            color: #666;
+            font-size: 10px;
+            background: transparent;
+        """)
+        toolbar_layout.addWidget(info_label)
+        
+        toolbar.setLayout(toolbar_layout)
+        content_layout.addWidget(toolbar)
+        
+        # Tabela de trabalhos com sombra
+        table_container = QWidget()
+        table_container.setStyleSheet("""
+            QWidget {
+                background-color: white;
+                border-radius: 6px;
+                border: 1px solid #e0e0e0;
+            }
+        """)
+        table_layout = QVBoxLayout()
+        table_layout.setContentsMargins(0, 0, 0, 0)
+        
+        self.table = QTableWidget()
+        self.table.setColumnCount(4)
+        self.table.setHorizontalHeaderLabels(["📋 Tarefa", "📊 Status", "📈 Progresso", "🎮 Ações"])
+        self.table.horizontalHeader().setStretchLastSection(False)
+        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Fixed)
+        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.Fixed)
+        self.table.setColumnWidth(1, 140)
+        self.table.setColumnWidth(3, 280)
+        self.table.verticalHeader().setVisible(False)
+        self.table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.table.setAlternatingRowColors(True)
+        self.table.setShowGrid(True)
+        self.table.setStyleSheet("""
+            QTableWidget {
+                background-color: white;
+                gridline-color: #f0f0f0;
+                border: none;
+                border-radius: 6px;
+                selection-background-color: #e3f2fd;
+            }
+            QTableWidget::item {
+                padding: 12px 8px;
+                border: none;
+            }
+            QTableWidget::item:selected {
+                background-color: #e3f2fd;
+                color: #0078d4;
+            }
+            QHeaderView::section {
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                                          stop:0 #f8f8f8, stop:1 #ececec);
+                padding: 12px 8px;
+                border: none;
+                border-right: 1px solid #e0e0e0;
+                border-bottom: 2px solid #0078d4;
+                font-weight: bold;
+                font-size: 11px;
+                color: #333;
+            }
+            QHeaderView::section:first {
+                border-top-left-radius: 6px;
+            }
+            QHeaderView::section:last {
+                border-top-right-radius: 6px;
+                border-right: none;
+            }
+        """)
+        
+        table_layout.addWidget(self.table)
+        table_container.setLayout(table_layout)
+        content_layout.addWidget(table_container)
+        
+        # Rodapé com informações detalhadas
+        footer = QWidget()
+        footer.setStyleSheet("""
+            QWidget {
+                background-color: white;
+                border: 1px solid #e0e0e0;
+                border-radius: 6px;
+                padding: 12px;
+            }
+        """)
+        footer_layout = QHBoxLayout()
+        footer_layout.setContentsMargins(15, 10, 15, 10)
+        
+        self.status_label = QLabel("ℹ Nenhum trabalho em execução")
+        self.status_label.setStyleSheet("""
+            QLabel {
+                background-color: transparent;
+                color: #666;
+                font-size: 12px;
+                font-weight: bold;
+            }
+        """)
+        footer_layout.addWidget(self.status_label)
+        
+        footer_layout.addStretch()
+        
+        self.info_label = QLabel("")
+        self.info_label.setStyleSheet("""
+            QLabel {
+                background-color: transparent;
+                color: #999;
+                font-size: 10px;
+            }
+        """)
+        footer_layout.addWidget(self.info_label)
+        
+        footer.setLayout(footer_layout)
+        content_layout.addWidget(footer)
+        
+        content.setLayout(content_layout)
+        main_layout.addWidget(content)
+        
+        self.setLayout(main_layout)
+        
+        # Timer para atualizar a lista
+        self.update_timer = QTimer()
+        self.update_timer.timeout.connect(self._atualizar_lista)
+        self.update_timer.start(1000)
+        
+        # Atualização inicial
+        self._atualizar_lista()
+    
+    def _iniciar_sync_manual(self):
+        """Inicia sincronização manual"""
+        if self.parent_window and hasattr(self.parent_window, '_iniciar_sync_background'):
+            self.parent_window._iniciar_sync_background()
+            QMessageBox.information(
+                self,
+                "Sincronização Iniciada",
+                "A sincronização de eventos foi iniciada em segundo plano.\n\n"
+                "Você pode acompanhar o progresso nesta janela."
+            )
+    
+    def _atualizar_lista(self):
+        """Atualiza a lista de trabalhos"""
+        if not self.parent_window or not hasattr(self.parent_window, '_trabalhos_ativos'):
+            return
+        
+        trabalhos = self.parent_window._trabalhos_ativos
+        self.table.setRowCount(len(trabalhos))
+        
+        # Configura altura das linhas
+        for i in range(len(trabalhos)):
+            self.table.setRowHeight(i, 80)
+        
+        for idx, trabalho in enumerate(trabalhos):
+            # Coluna 0: Nome da tarefa com estilo
+            nome_widget = QWidget()
+            nome_layout = QVBoxLayout()
+            nome_layout.setContentsMargins(12, 10, 12, 10)
+            nome_layout.setSpacing(5)
+            
+            nome_label = QLabel(f"🔄 {trabalho.get('nome', 'Tarefa')}")
+            nome_label.setWordWrap(True)
+            nome_label.setStyleSheet("""
+                font-size: 13px;
+                font-weight: bold;
+                color: #333;
+            """)
+            nome_layout.addWidget(nome_label)
+            
+            tipo_label = QLabel(f"Tipo: {trabalho.get('tipo', 'desconhecido')}")
+            tipo_label.setStyleSheet("""
+                font-size: 10px;
+                color: #999;
+            """)
+            nome_layout.addWidget(tipo_label)
+            
+            nome_widget.setLayout(nome_layout)
+            self.table.setCellWidget(idx, 0, nome_widget)
+            
+            # Coluna 1: Status com badge colorido
+            status = trabalho.get('status', 'Desconhecido')
+            status_widget = QWidget()
+            status_layout = QHBoxLayout()
+            status_layout.setContentsMargins(8, 8, 8, 8)
+            
+            status_label = QLabel(status)
+            status_label.setAlignment(Qt.AlignCenter)
+            
+            if status == 'Em execução':
+                status_label.setStyleSheet("""
+                    background-color: #0078d4;
+                    color: white;
+                    padding: 6px 12px;
+                    border-radius: 12px;
+                    font-weight: bold;
+                    font-size: 11px;
+                """)
+            elif status == 'Pausado':
+                status_label.setStyleSheet("""
+                    background-color: #ff8c00;
+                    color: white;
+                    padding: 6px 12px;
+                    border-radius: 12px;
+                    font-weight: bold;
+                    font-size: 11px;
+                """)
+            elif status == 'Concluído':
+                status_label.setStyleSheet("""
+                    background-color: #16c60c;
+                    color: white;
+                    padding: 6px 12px;
+                    border-radius: 12px;
+                    font-weight: bold;
+                    font-size: 11px;
+                """)
+            else:
+                status_label.setStyleSheet("""
+                    background-color: #d13438;
+                    color: white;
+                    padding: 6px 12px;
+                    border-radius: 12px;
+                    font-weight: bold;
+                    font-size: 11px;
+                """)
+            
+            status_layout.addWidget(status_label)
+            status_widget.setLayout(status_layout)
+            self.table.setCellWidget(idx, 1, status_widget)
+            
+            # Coluna 2: Progresso com barra e informações
+            progresso_widget = QWidget()
+            progresso_layout = QVBoxLayout()
+            progresso_layout.setContentsMargins(12, 10, 12, 10)
+            progresso_layout.setSpacing(5)
+            
+            # Mensagem acima da barra
+            mensagem = trabalho.get('mensagem', '')
+            total = trabalho.get('total', 0)
+            atual = trabalho.get('progresso', 0)
+            
+            msg_label = QLabel(mensagem)
+            msg_label.setWordWrap(True)
+            msg_label.setStyleSheet("""
+                font-size: 11px;
+                color: #000;
+                font-weight: bold;
+            """)
+            progresso_layout.addWidget(msg_label)
+            
+            # Barra de progresso
+            progresso_bar = QProgressBar()
+            progresso_bar.setMaximum(trabalho.get('total', 100))
+            progresso_bar.setValue(trabalho.get('progresso', 0))
+            progresso_bar.setTextVisible(True)
+            progresso_bar.setFixedHeight(26)
+            progresso_bar.setStyleSheet("""
+                QProgressBar {
+                    border: 2px solid #e0e0e0;
+                    border-radius: 5px;
+                    text-align: center;
+                    background-color: #f5f5f5;
+                    color: #000;
+                    font-weight: bold;
+                    font-size: 11px;
+                }
+                QProgressBar::chunk {
+                    background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                                              stop:0 #0078d4, stop:1 #00bcf2);
+                    border-radius: 3px;
+                }
+            """)
+            
+            if total > 0:
+                percentual = int((atual / total) * 100)
+                progresso_bar.setFormat(f"{atual}/{total} ({percentual}%)")
+            else:
+                progresso_bar.setFormat("Aguardando...")
+            
+            progresso_layout.addWidget(progresso_bar)
+            progresso_widget.setLayout(progresso_layout)
+            self.table.setCellWidget(idx, 2, progresso_widget)
+            
+            # Coluna 3: Ações com botões estilizados
+            acoes_widget = QWidget()
+            acoes_layout = QHBoxLayout()
+            acoes_layout.setContentsMargins(10, 8, 10, 8)
+            acoes_layout.setSpacing(10)
+            
+            worker = trabalho.get('worker')
+            
+            if status == 'Em execução':
+                btn_pausar = QPushButton("⏸ Pausar")
+                btn_pausar.setFixedHeight(36)
+                btn_pausar.setCursor(Qt.PointingHandCursor)
+                btn_pausar.setStyleSheet("""
+                    QPushButton {
+                        background-color: #ff8c00;
+                        color: white;
+                        border: none;
+                        padding: 6px 16px;
+                        border-radius: 5px;
+                        font-weight: bold;
+                        font-size: 12px;
+                    }
+                    QPushButton:hover {
+                        background-color: #ff7700;
+                    }
+                    QPushButton:pressed {
+                        background-color: #e67700;
+                    }
+                """)
+                btn_pausar.clicked.connect(lambda checked, w=worker, t=trabalho: self._pausar(w, t))
+                acoes_layout.addWidget(btn_pausar)
+            elif status == 'Pausado':
+                btn_retomar = QPushButton("▶ Retomar")
+                btn_retomar.setFixedHeight(36)
+                btn_retomar.setCursor(Qt.PointingHandCursor)
+                btn_retomar.setStyleSheet("""
+                    QPushButton {
+                        background-color: #16c60c;
+                        color: white;
+                        border: none;
+                        padding: 6px 16px;
+                        border-radius: 5px;
+                        font-weight: bold;
+                        font-size: 12px;
+                    }
+                    QPushButton:hover {
+                        background-color: #13a10e;
+                    }
+                    QPushButton:pressed {
+                        background-color: #0e7c0a;
+                    }
+                """)
+                btn_retomar.clicked.connect(lambda checked, w=worker, t=trabalho: self._retomar(w, t))
+                acoes_layout.addWidget(btn_retomar)
+            
+            btn_cancelar = QPushButton("✖ Cancelar")
+            btn_cancelar.setFixedHeight(36)
+            btn_cancelar.setCursor(Qt.PointingHandCursor)
+            btn_cancelar.setStyleSheet("""
+                QPushButton {
+                    background-color: #d13438;
+                    color: white;
+                    border: none;
+                    padding: 6px 16px;
+                    border-radius: 5px;
+                    font-weight: bold;
+                    font-size: 12px;
+                }
+                QPushButton:hover {
+                    background-color: #b52d30;
+                }
+                QPushButton:pressed {
+                    background-color: #992628;
+                }
+            """)
+            btn_cancelar.clicked.connect(lambda checked, w=worker, t=trabalho: self._cancelar(w, t))
+            acoes_layout.addWidget(btn_cancelar)
+            
+            acoes_layout.addStretch()
+            acoes_widget.setLayout(acoes_layout)
+            self.table.setCellWidget(idx, 3, acoes_widget)
+        
+        # Atualizar rodapé com informações detalhadas
+        if trabalhos:
+            em_execucao = sum(1 for t in trabalhos if t.get('status') == 'Em execução')
+            pausados = sum(1 for t in trabalhos if t.get('status') == 'Pausado')
+            concluidos = sum(1 for t in trabalhos if t.get('status') == 'Concluído')
+            
+            if em_execucao > 0:
+                self.status_label.setText(f"✅ {em_execucao} trabalho(s) em execução")
+                self.status_label.setStyleSheet("""
+                    QLabel {
+                        background-color: transparent;
+                        color: #16c60c;
+                        font-size: 12px;
+                        font-weight: bold;
+                    }
+                """)
+            elif pausados > 0:
+                self.status_label.setText(f"⏸ {pausados} trabalho(s) pausado(s)")
+                self.status_label.setStyleSheet("""
+                    QLabel {
+                        background-color: transparent;
+                        color: #ff8c00;
+                        font-size: 12px;
+                        font-weight: bold;
+                    }
+                """)
+            else:
+                self.status_label.setText(f"✅ Todos os trabalhos concluídos")
+                self.status_label.setStyleSheet("""
+                    QLabel {
+                        background-color: transparent;
+                        color: #16c60c;
+                        font-size: 12px;
+                        font-weight: bold;
+                    }
+                """)
+            
+            # Info adicional
+            from datetime import datetime
+            agora = datetime.now().strftime("%H:%M:%S")
+            self.info_label.setText(f"Total: {len(trabalhos)} | Ativos: {em_execucao} | Pausados: {pausados} | Concluídos: {concluidos} | Atualizado: {agora}")
+        else:
+            self.status_label.setText("ℹ Nenhum trabalho em execução")
+            self.status_label.setStyleSheet("""
+                QLabel {
+                    background-color: transparent;
+                    color: #666;
+                    font-size: 12px;
+                    font-weight: bold;
+                }
+            """)
+            self.info_label.setText("Clique em 'Sincronizar Agora' para iniciar uma nova tarefa")
+    
+    def _pausar(self, worker, trabalho):
+        """Pausa um trabalho"""
+        if worker:
+            worker.pausar()
+            trabalho['status'] = 'Pausado'
+            self._atualizar_lista()
+    
+    def _retomar(self, worker, trabalho):
+        """Retoma um trabalho pausado"""
+        if worker:
+            worker.retomar()
+            trabalho['status'] = 'Em execução'
+            self._atualizar_lista()
+    
+    def _cancelar(self, worker, trabalho):
+        """Cancela um trabalho"""
+        resposta = QMessageBox.question(
+            self,
+            "Cancelar Trabalho",
+            f"Deseja realmente cancelar a tarefa '{trabalho.get('nome', 'Tarefa')}'?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No
+        )
+        
+        if resposta == QMessageBox.Yes:
+            if worker:
+                worker.cancelar()
+            trabalho['status'] = 'Cancelado'
+            self._atualizar_lista()
+    
+    def closeEvent(self, event):
+        """Para o timer ao fechar"""
+        self.update_timer.stop()
+        super().closeEvent(event)
 
 
 class CertificateDialog(QDialog):

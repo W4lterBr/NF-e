@@ -752,7 +752,7 @@ def salvar_xml_por_certificado(xml, cnpj_cpf, pasta_base="xmls", nome_certificad
         elif root_tag == 'resNFe':
             tipo_pasta = "Resumos"
             tipo_doc = "ResNFe"
-        elif root_tag in ['resEvento', 'procEventoNFe', 'evento']:
+        elif root_tag in ['resEvento', 'procEventoNFe', 'evento', 'retEvento']:
             tipo_pasta = "Eventos"
             tipo_doc = "Evento"
         else:
@@ -1784,6 +1784,80 @@ class NFeService:
         # NÃO valida XML de resposta da SEFAZ (esquemas podem variar)
         logger.debug(f"Resposta Protocolo (raw):\n{resp_xml}")
         return resp_xml
+    
+    def consultar_eventos_chave(self, chave):
+        """
+        Consulta eventos de uma chave específica na SEFAZ.
+        
+        Args:
+            chave: Chave de 44 dígitos da NF-e/CT-e
+            
+        Returns:
+            XML com os eventos encontrados ou None se não houver
+        """
+        logger.debug(f"Consultando eventos para chave={chave}")
+        
+        # Define URL do serviço baseado no cUF (extrai da chave)
+        cuf_from_chave = chave[:2] if len(chave) == 44 else str(self.cuf)
+        
+        # URLs dos serviços de consulta de eventos (NFeConsultaProtocolo4 retorna eventos junto)
+        url_map = {
+            '31': 'https://nfe.fazenda.mg.gov.br/nfe2/services/NFeConsultaProtocolo4',  # MG
+            '50': 'https://nfe.sefaz.ms.gov.br/ws/NFeConsultaProtocolo4',  # MS
+            '51': 'https://www.sefazvirtual.fazenda.gov.br/NFeConsultaProtocolo4/NFeConsultaProtocolo4.asmx',  # SVRS
+            '52': 'https://www.sefazvirtual.fazenda.gov.br/NFeConsultaProtocolo4/NFeConsultaProtocolo4.asmx',  # GO
+            '35': 'https://nfe.fazenda.sp.gov.br/ws/nfeconsultaprotocolo4.asmx',  # SP
+            '33': 'https://nfe.fazenda.rj.gov.br/ws/NFeConsultaProtocolo4',  # RJ
+            '41': 'https://nfe.sefa.pr.gov.br/nfe/NFeConsultaProtocolo4',  # PR
+            '53': 'https://nfe.sefaz.df.gov.br/ws/NFeConsultaProtocolo4',  # DF
+        }
+        url = url_map.get(cuf_from_chave, 'https://www.sefazvirtual.fazenda.gov.br/NFeConsultaProtocolo4/NFeConsultaProtocolo4.asmx')
+        
+        # Monta XML de consulta (mesmo serviço que retorna protocolo também retorna eventos)
+        xml_consulta = f'''<consSitNFe xmlns="http://www.portalfiscal.inf.br/nfe" versao="4.00"><tpAmb>1</tpAmb><xServ>CONSULTAR</xServ><chNFe>{chave}</chNFe></consSitNFe>'''
+        
+        logger.debug(f"XML consulta eventos:\n{xml_consulta}")
+        logger.debug(f"URL do serviço (cUF={cuf_from_chave}): {url}")
+        
+        # Envia requisição SOAP
+        try:
+            soap_envelope = f'''<?xml version="1.0" encoding="utf-8"?>
+<soap12:Envelope xmlns:soap12="http://www.w3.org/2003/05/soap-envelope" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema">
+  <soap12:Body>
+    <nfeDadosMsg xmlns="http://www.portalfiscal.inf.br/nfe/wsdl/NFeConsultaProtocolo4">{xml_consulta}</nfeDadosMsg>
+  </soap12:Body>
+</soap12:Envelope>'''
+            
+            save_debug_soap(self.informante, "request_eventos", soap_envelope, prefixo=f"eventos_{chave[:10]}")
+            
+            headers = {
+                'Content-Type': 'application/soap+xml; charset=utf-8',
+            }
+            
+            logger.info(f"🔍 Consultando eventos da chave: {chave}")
+            
+            resp = self.dist_client.transport.session.post(url, data=soap_envelope.encode('utf-8'), headers=headers)
+            resp.raise_for_status()
+            
+            save_debug_soap(self.informante, "response_eventos", resp.content.decode('utf-8'), prefixo=f"eventos_{chave[:10]}")
+            
+            # Extrai corpo da resposta SOAP
+            resp_tree = etree.fromstring(resp.content)
+            body = resp_tree.find('.//{http://www.w3.org/2003/05/soap-envelope}Body')
+            if body is not None and len(body) > 0:
+                resp_xml = etree.tostring(body[0], encoding="utf-8").decode()
+                logger.debug(f"Resposta eventos:\n{resp_xml[:500]}")
+                return resp_xml
+            else:
+                logger.warning("Resposta SOAP sem corpo")
+                return None
+                
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Erro na requisição HTTP eventos: {e}")
+            return None
+        except Exception as e:
+            logger.error(f"Erro ao consultar eventos: {e}")
+            return None
 
 # -------------------------------------------------------------------
 # Fluxo Principal
@@ -2065,6 +2139,20 @@ def run_single_cycle():
                 logger.info(f"📄 [{cnpj}] NF-e: Primeiros 800 caracteres da resposta:")
                 logger.info(resp[:800] if len(resp) > 800 else resp)
                 
+                # 🔍 DEBUG: Salva resposta completa da SEFAZ para análise
+                cabecalho_debug = f"""
+=== RESPOSTA COMPLETA DA SEFAZ ===
+Informante: {inf}
+CNPJ: {cnpj}
+NSU solicitado: {last_nsu}
+Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+Tamanho: {len(resp)} bytes
+UF: {cuf}
+
+=== XML DA RESPOSTA ===
+"""
+                save_debug_soap(inf, "resposta_sefaz_completa", cabecalho_debug + resp, prefixo="analise")
+                
                 cStat = parser.extract_cStat(resp)
                 ult   = parser.extract_last_nsu(resp)
                 max_nsu = parser.extract_max_nsu(resp)
@@ -2079,16 +2167,92 @@ def run_single_cycle():
                 
                 if docs_list:
                     logger.info(f"📦 [{cnpj}] NF-e: Encontrados {len(docs_list)} documento(s) na resposta")
+                    logger.info(f"🔧 [{cnpj}] VERSÃO DO CÓDIGO: Processamento de eventos ATIVADO (v2026-01-04)")
+                    
+                    # 🔍 DEBUG: Salva resumo dos documentos encontrados
+                    resumo_docs = f"=== RESUMO DOS DOCUMENTOS ENCONTRADOS ===\n"
+                    resumo_docs += f"Total de documentos: {len(docs_list)}\n"
+                    resumo_docs += f"cStat: {cStat}\n"
+                    resumo_docs += f"ultNSU: {ult}\n"
+                    resumo_docs += f"maxNSU: {max_nsu}\n\n"
+                    
                     for idx, (nsu, xml) in enumerate(docs_list, 1):
                         logger.info(f"📄 [{cnpj}] NF-e: Processando doc {idx}/{len(docs_list)}, NSU={nsu}")
                         try:
                             validar_xml_auto(xml, 'leiauteNFe_v4.00.xsd')
                             logger.info(f"✅ [{cnpj}] NF-e: XML válido (NSU={nsu})")
                             
-                            tree   = etree.fromstring(xml.encode('utf-8'))
+                            tree = etree.fromstring(xml.encode('utf-8'))
+                            
+                            # Verifica se é um EVENTO (resEvento, procEventoNFe)
+                            root_tag = tree.tag.split('}')[-1] if '}' in tree.tag else tree.tag
+                            logger.info(f"🏷️ [{cnpj}] Tag raiz do documento: {root_tag} (NSU={nsu})")
+                            
+                            # 🔍 DEBUG: Adiciona ao resumo
+                            resumo_docs += f"Doc {idx} - NSU {nsu}:\n"
+                            resumo_docs += f"  Tag raiz: {root_tag}\n"
+                            resumo_docs += f"  Tamanho: {len(xml)} bytes\n"
+                            
+                            if root_tag in ['resEvento', 'procEventoNFe', 'evento']:
+                                logger.info(f"📋 [{cnpj}] NF-e: Evento detectado (NSU={nsu})")
+                                # Processa evento
+                                try:
+                                    ns = '{http://www.portalfiscal.inf.br/nfe}'
+                                    
+                                    # Extrai chave do evento
+                                    chave = tree.findtext(f'.//{ns}chNFe') or tree.findtext('.//chNFe')
+                                    if not chave or len(chave) != 44:
+                                        logger.warning(f"⚠️ [{cnpj}] Evento sem chave válida (NSU={nsu}), pulando")
+                                        resumo_docs += f"  Tipo: EVENTO (chave inválida)\n\n"
+                                        continue
+                                    
+                                    # Extrai tipo de evento
+                                    tpEvento = tree.findtext(f'.//{ns}tpEvento') or tree.findtext('.//tpEvento')
+                                    descEvento = tree.findtext(f'.//{ns}descEvento') or tree.findtext('.//descEvento') or 'Evento'
+                                    
+                                    logger.info(f"📋 [{cnpj}] Evento tipo {tpEvento} ({descEvento}) para chave {chave}")
+                                    
+                                    # 🔍 DEBUG: Adiciona detalhes do evento ao resumo
+                                    resumo_docs += f"  Tipo: EVENTO\n"
+                                    resumo_docs += f"  Código: {tpEvento}\n"
+                                    resumo_docs += f"  Descrição: {descEvento}\n"
+                                    resumo_docs += f"  Chave: {chave}\n"
+                                    
+                                    # 🔍 DEBUG: Salva XML do evento individualmente
+                                    save_debug_soap(inf, f"evento_{tpEvento}_NSU{nsu}", xml, prefixo="extraido")
+                                    
+                                    # Salva o evento na pasta Eventos (função já suporta eventos)
+                                    nome_cert = db.get_cert_nome_by_informante(inf)
+                                    salvar_xml_por_certificado(xml, cnpj, pasta_base="xmls", nome_certificado=nome_cert)
+                                    logger.info(f"💾 [{cnpj}] Evento salvo na pasta Eventos/")
+                                    
+                                    # Processa o evento (atualiza status da nota se for cancelamento, etc)
+                                    processar_evento_status(xml, chave, db)
+                                    
+                                    # Registra manifestação no banco (se for manifestação do destinatário)
+                                    if tpEvento and tpEvento.startswith('2102'):  # Manifestações: 210200, 210210, 210220, 210240
+                                        cStat_evento = tree.findtext(f'.//{ns}cStat') or tree.findtext('.//cStat')
+                                        protocolo = tree.findtext(f'.//{ns}nProt') or tree.findtext('.//nProt')
+                                        
+                                        if cStat_evento == '135':  # Evento registrado
+                                            if not db.check_manifestacao_exists(chave, tpEvento, cnpj):
+                                                db.register_manifestacao(chave, tpEvento, cnpj, 'REGISTRADA', protocolo)
+                                                logger.info(f"✅ [{cnpj}] Manifestação {tpEvento} registrada para chave {chave}")
+                                    
+                                    docs_count += 1
+                                    continue  # Pula para próximo documento
+                                    
+                                except Exception as e:
+                                    logger.warning(f"⚠️ [{cnpj}] Erro ao processar evento (NSU={nsu}): {e}")
+                                    import traceback
+                                    traceback.print_exc()
+                                    continue
+                            
+                            # Se não é evento, processa como NF-e normal
                             infnfe = tree.find('.//{http://www.portalfiscal.inf.br/nfe}infNFe')
                             if infnfe is None:
                                 logger.warning(f"⚠️ [{cnpj}] NF-e: infNFe não encontrado no XML (NSU={nsu}), pulando")
+                                resumo_docs += f"  Tipo: Desconhecido (sem infNFe)\n\n"
                                 continue
                             
                             # Verifica modelo do documento (55 = NF-e, 65 = NFC-e)
@@ -2097,13 +2261,22 @@ def run_single_cycle():
                                 modelo = ide.findtext('{http://www.portalfiscal.inf.br/nfe}mod', '')
                                 if modelo == '65':
                                     logger.info(f"🛒 [{cnpj}] NFC-e (modelo 65) detectada no NSU={nsu}, pulando (sistema busca apenas NF-e modelo 55)")
+                                    resumo_docs += f"  Tipo: NFC-e (modelo 65) - IGNORADO\n\n"
                                     continue
                                 elif modelo and modelo != '55':
                                     logger.warning(f"⚠️ [{cnpj}] Modelo desconhecido '{modelo}' no NSU={nsu}, pulando")
+                                    resumo_docs += f"  Tipo: Modelo {modelo} - IGNORADO\n\n"
                                     continue
                             
                             chave  = infnfe.attrib.get('Id','')[-44:]
                             logger.info(f"🔑 [{cnpj}] NF-e (modelo 55): Chave extraída = {chave}")
+                            
+                            # 🔍 DEBUG: Adiciona informações da NF-e ao resumo
+                            resumo_docs += f"  Tipo: NF-e (modelo 55)\n"
+                            resumo_docs += f"  Chave: {chave}\n"
+                            
+                            # 🔍 DEBUG: Salva XML da NF-e individualmente
+                            save_debug_soap(inf, f"nfe_NSU{nsu}_chave{chave[:8]}", xml, prefixo="extraido")
                             
                             db.registrar_xml(chave, cnpj)
                             
@@ -2129,6 +2302,14 @@ def run_single_cycle():
                             logger.info(f"✅ [{cnpj}] NF-e: Documento {docs_count} processado (chave={chave})")
                         except Exception as e:
                             logger.exception(f"❌ [{cnpj}] NF-e: Erro ao processar docZip NSU={nsu}: {e}")
+                    
+                    # 🔍 DEBUG: Salva resumo completo dos documentos processados
+                    resumo_docs += f"\n=== RESUMO FINAL ===\n"
+                    resumo_docs += f"Total processado com sucesso: {docs_count}\n"
+                    resumo_docs += f"Informante: {inf}\n"
+                    resumo_docs += f"CNPJ: {cnpj}\n"
+                    save_debug_soap(inf, "resumo_documentos", resumo_docs, prefixo="analise")
+                    logger.info(f"📊 [{cnpj}] Resumo de documentos salvo em Debug de notas/")
                 else:
                     logger.info(f"📭 [{cnpj}] NF-e: Nenhum documento na resposta (docs_list vazio ou None)")
                 
