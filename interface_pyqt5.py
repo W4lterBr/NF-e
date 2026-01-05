@@ -1498,7 +1498,10 @@ class MainWindow(QMainWindow):
             # Restaura a ordem visual
             if isinstance(saved_order, list) and len(saved_order) == header.count():
                 for logical_index, visual_index in enumerate(saved_order):
-                    header.moveSection(header.visualIndex(logical_index), visual_index)
+                    # Garante que ambos os valores sejam inteiros
+                    visual_index = int(visual_index)
+                    current_visual = header.visualIndex(logical_index)
+                    header.moveSection(current_visual, visual_index)
                 print(f"✅ Ordem de colunas restaurada para {table_name}")
             else:
                 print(f"⚠️ Ordem salva inválida para {table_name}, usando padrão")
