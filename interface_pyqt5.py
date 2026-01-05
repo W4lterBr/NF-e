@@ -450,7 +450,6 @@ class MainWindow(QMainWindow):
         btn_busca = QPushButton("Buscar na SEFAZ"); btn_busca.clicked.connect(self.do_search)
         btn_busca_completa = QPushButton("Busca Completa"); btn_busca_completa.clicked.connect(self.do_busca_completa)
         btn_busca_chave = QPushButton("Busca por chave"); btn_busca_chave.clicked.connect(self.buscar_por_chave)
-        btn_importar_xmls = QPushButton("📁 Importar XMLs"); btn_importar_xmls.clicked.connect(self.importar_xmls_pasta)
         
         # Seletor de intervalo entre buscas
         from PyQt5.QtWidgets import QSpinBox
@@ -488,7 +487,6 @@ class MainWindow(QMainWindow):
             self.btn_refresh.setIcon(_icon('refresh.png', QStyle.SP_BrowserReload))
             btn_busca.setIcon(_icon('search.png', QStyle.SP_FileDialogContentsView))
             btn_busca_completa.setIcon(_icon('search.png', QStyle.SP_FileDialogContentsView))
-            btn_importar_xmls.setIcon(self.style().standardIcon(QStyle.SP_DialogOpenButton))
         except Exception:
             pass
         t.addWidget(self.search_edit)
@@ -509,7 +507,6 @@ class MainWindow(QMainWindow):
         t.addWidget(btn_busca)
         t.addWidget(btn_busca_completa)
         t.addWidget(btn_busca_chave)
-        t.addWidget(btn_importar_xmls)
         v.addLayout(t)
 
         # Tabs: create a tab widget to host different views (emitidos por terceiros / pela empresa)
@@ -1081,6 +1078,7 @@ class MainWindow(QMainWindow):
         tarefas.addSeparator()
         add_action(tarefas, "Busca por chave", self.buscar_por_chave, "Ctrl+K", qstyle_icon=QStyle.SP_FileDialogListView)
         add_action(tarefas, "Certificados…", self.open_certificates, "Ctrl+Shift+C", qstyle_icon=QStyle.SP_DialogApplyButton)
+        add_action(tarefas, "📁 Importar XMLs", self.importar_xmls_pasta, "Ctrl+I", qstyle_icon=QStyle.SP_DialogOpenButton)
         tarefas.addSeparator()
         add_action(tarefas, "⚙️ Gerenciador de Trabalhos", self._abrir_gerenciador_trabalhos, "Ctrl+Shift+G", qstyle_icon=QStyle.SP_ComputerIcon)
         tarefas.addSeparator()
