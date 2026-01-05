@@ -5195,16 +5195,43 @@ class MainWindow(QMainWindow):
             traceback.print_exc()
         
         # PRIORIDADE 2: Busca em diretórios estruturados por informante
-        # Formato: DATA_DIR/xmls/{informante}/{tipo}/{ano-mes}/{chave}.xml
+        # Formato: DATA_DIR/xmls/{informante}/{ano-mes}/{tipo}/{numero}-{nome}.xml
         print(f"    📂 DATA_DIR: {DATA_DIR}")
         xmls_dir = DATA_DIR / 'xmls'
         if xmls_dir.exists():
             print(f"    📂 Buscando em estrutura: {xmls_dir}")
+            
+            # Primeiro tenta busca rápida por nome de arquivo com chave
             print(f"    📂 Procurando arquivo: {chave}.xml")
             for xml_file in xmls_dir.rglob(f"{chave}.xml"):
                 print(f"    ✅ Arquivo encontrado: {xml_file}")
                 return xml_file
-            print(f"    ⚠️ Arquivo {chave}.xml não encontrado em {xmls_dir}")
+            
+            # Se não encontrar, busca recursiva por XMLs e verifica conteúdo
+            # (os XMLs são salvos como numero-nome.xml, então precisamos buscar no conteúdo)
+            print(f"    🔍 Chave não encontrada no nome, buscando no conteúdo dos XMLs...")
+            xml_files = list(xmls_dir.rglob("*.xml"))
+            
+            # Filtra arquivos de debug/protocolo
+            xml_files = [
+                f for f in xml_files 
+                if not any(x in f.name.lower() for x in ['debug', 'protocolo', 'request', 'response'])
+            ]
+            
+            print(f"    📊 Total de XMLs para verificar: {len(xml_files)}")
+            
+            # Busca a chave no conteúdo (limitado aos primeiros 1000 arquivos para não travar)
+            for xml_file in xml_files[:1000]:
+                try:
+                    with open(xml_file, 'r', encoding='utf-8') as f:
+                        content = f.read(2000)  # Lê apenas início do arquivo
+                        if chave in content:
+                            print(f"    ✅ Arquivo encontrado por conteúdo: {xml_file}")
+                            return xml_file
+                except Exception:
+                    continue
+            
+            print(f"    ⚠️ Chave {chave} não encontrada em nenhum XML")
         else:
             print(f"    ⚠️ Diretório não existe: {xmls_dir}")
         
@@ -5258,9 +5285,38 @@ class MainWindow(QMainWindow):
         xmls_dir = DATA_DIR / 'xmls'
         if xmls_dir.exists():
             print(f"    📂 Buscando em estrutura: {xmls_dir}")
+            
+            # Primeiro tenta busca rápida por nome de arquivo com chave
             for pdf_file in xmls_dir.rglob(f"{chave}.pdf"):
                 print(f"    ✅ Arquivo encontrado: {pdf_file}")
                 return pdf_file
+            
+            # Se não encontrar, procura PDF que corresponda a XML com a chave
+            # (busca arquivos .xml e verifica se existe .pdf correspondente)
+            print(f"    🔍 Chave não encontrada no nome, buscando PDF correspondente ao XML...")
+            xml_files = list(xmls_dir.rglob("*.xml"))
+            
+            # Filtra arquivos de debug/protocolo
+            xml_files = [
+                f for f in xml_files 
+                if not any(x in f.name.lower() for x in ['debug', 'protocolo', 'request', 'response'])
+            ]
+            
+            # Busca a chave no conteúdo do XML e verifica se existe PDF
+            for xml_file in xml_files[:1000]:
+                try:
+                    with open(xml_file, 'r', encoding='utf-8') as f:
+                        content = f.read(2000)  # Lê apenas início do arquivo
+                        if chave in content:
+                            # Verifica se existe PDF com mesmo nome
+                            pdf_file = xml_file.with_suffix('.pdf')
+                            if pdf_file.exists():
+                                print(f"    ✅ PDF encontrado correspondente ao XML: {pdf_file}")
+                                return pdf_file
+                            else:
+                                print(f"    ⚠️ XML encontrado mas PDF não existe: {xml_file.name}")
+                except Exception:
+                    continue
         
         # PRIORIDADE 3: Busca em diretórios legados
         diretorios = [

@@ -856,6 +856,43 @@ def salvar_xml_por_certificado(xml, cnpj_cpf, pasta_base="xmls", nome_certificad
             f.write(xml)
         print(f"[SALVO {tipo_doc}] {caminho_xml}")
         
+        # Registra o caminho no banco de dados (xmls_baixados)
+        try:
+            # Extrai chave do XML
+            chave = None
+            if tipo_doc in ["NFe", "CTe"]:
+                ns = '{http://www.portalfiscal.inf.br/nfe}' if tipo_doc == "NFe" else '{http://www.portalfiscal.inf.br/cte}'
+                infNFe = root.find(f'.//{ns}infNFe') if tipo_doc == "NFe" else root.find(f'.//{ns}infCte')
+                if infNFe is not None:
+                    chave_id = infNFe.attrib.get('Id', '')
+                    if chave_id:
+                        # Remove prefixo NFe/CTe da chave
+                        chave = chave_id.replace('NFe', '').replace('CTe', '')[-44:]
+            elif tipo_doc == "ResNFe":
+                ns = '{http://www.portalfiscal.inf.br/nfe}'
+                chave = root.findtext(f'{ns}chNFe')
+            elif tipo_doc == "Evento":
+                ns = '{http://www.portalfiscal.inf.br/nfe}'
+                chave = root.findtext(f'.//{ns}chNFe')
+            
+            if chave and len(chave) == 44:
+                # Importa DatabaseManager para registrar
+                from pathlib import Path
+                db_path = Path(__file__).parent.parent / 'notas_test.db'
+                if db_path.exists():
+                    import sqlite3
+                    with sqlite3.connect(str(db_path)) as conn:
+                        # Registra ou atualiza o caminho
+                        conn.execute('''
+                            INSERT OR REPLACE INTO xmls_baixados 
+                            (chave, cnpj_cpf, caminho_arquivo, baixado_em)
+                            VALUES (?, ?, ?, datetime('now'))
+                        ''', (chave, cnpj_cpf, os.path.abspath(caminho_xml)))
+                        conn.commit()
+                        print(f"[REGISTRADO no banco] Chave: {chave[:25]}... → {caminho_xml}")
+        except Exception as db_err:
+            print(f"[AVISO] Erro ao registrar no banco: {db_err}")
+        
         # Gerar PDF automaticamente (apenas para NFe/CTe completas)
         if tipo_doc in ["NFe", "CTe"]:
             try:
