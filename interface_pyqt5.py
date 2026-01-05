@@ -5062,26 +5062,10 @@ class MainWindow(QMainWindow):
                             shutil.copy2(pdf_origem, pdf_destino)
                             sucesso_pdf = True
                         else:
-                            print(f"  ⚠️ PDF não encontrado, tentando gerar...")
-                            # Tenta gerar PDF se não existe
-                            if opcoes['exportar_xml'] and sucesso_xml:
-                                xml_path = pasta_destino / f"{nome_base}.xml"
-                                if xml_path.exists():
-                                    try:
-                                        from modules.pdf_generator import gerar_pdf_nota
-                                        pdf_destino = pasta_destino / f"{nome_base}.pdf"
-                                        print(f"  🔧 Gerando PDF: {pdf_destino}")
-                                        gerar_pdf_nota(str(xml_path), str(pdf_destino))
-                                        sucesso_pdf = True
-                                        print(f"  ✅ PDF gerado com sucesso")
-                                    except Exception as e:
-                                        erro_msg = f"Erro ao gerar PDF: {chave} - {e}"
-                                        print(f"  ❌ {erro_msg}")
-                                        erros.append(erro_msg)
-                            else:
-                                erro_msg = f"PDF não encontrado: {chave}"
-                                print(f"  ❌ {erro_msg}")
-                                erros.append(erro_msg)
+                            erro_msg = f"PDF não encontrado: {chave}"
+                            print(f"  ❌ {erro_msg}")
+                            erros.append(erro_msg)
+                            # Nota: Geração automática de PDF desabilitada (módulo vazio)
                     
                     if sucesso_xml or sucesso_pdf:
                         exportados += 1
@@ -5127,10 +5111,10 @@ class MainWindow(QMainWindow):
         """Encontra o arquivo XML de uma chave de acesso."""
         print(f"    🔍 Procurando XML para chave: {chave}")
         
-        # Tenta diversos diretórios
+        # Tenta diversos diretórios (ordem de prioridade)
         diretorios = [
             BASE_DIR / 'xmls_chave',
-            BASE_DIR / 'xml_extraidos',
+            BASE_DIR / 'xml_extraidos', 
             BASE_DIR / 'xml_NFs',
             BASE_DIR / 'xmls',
         ]
@@ -5140,6 +5124,12 @@ class MainWindow(QMainWindow):
                 print(f"    📂 Verificando diretório: {diretorio}")
                 # Procura recursivamente
                 for xml_file in diretorio.rglob(f"*{chave}*.xml"):
+                    # FILTRO: Ignora arquivos de debug/protocolo
+                    nome_arquivo = xml_file.name.lower()
+                    if any(x in nome_arquivo for x in ['debug', 'protocolo', 'request', 'response']):
+                        print(f"    ⚠️ Arquivo ignorado (debug/protocolo): {xml_file.name}")
+                        continue
+                    
                     print(f"    ✅ Arquivo encontrado: {xml_file}")
                     return xml_file
             else:
