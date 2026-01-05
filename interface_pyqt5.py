@@ -5111,18 +5111,43 @@ class MainWindow(QMainWindow):
         """Encontra o arquivo XML de uma chave de acesso."""
         print(f"    🔍 Procurando XML para chave: {chave}")
         
-        # Tenta diversos diretórios (ordem de prioridade)
+        # PRIORIDADE 1: Consulta o banco de dados onde o caminho está registrado
+        try:
+            with self.db._connect() as conn:
+                cursor = conn.execute(
+                    "SELECT caminho_arquivo FROM xmls_baixados WHERE chave = ?",
+                    (chave,)
+                )
+                row = cursor.fetchone()
+                if row and row[0]:
+                    xml_path = Path(row[0])
+                    if xml_path.exists():
+                        print(f"    ✅ XML encontrado no banco: {xml_path}")
+                        return xml_path
+                    else:
+                        print(f"    ⚠️ Caminho do banco não existe: {xml_path}")
+        except Exception as e:
+            print(f"    ⚠️ Erro ao consultar banco: {e}")
+        
+        # PRIORIDADE 2: Busca em diretórios estruturados por informante
+        # Formato: DATA_DIR/xmls/{informante}/{tipo}/{ano-mes}/{chave}.xml
+        xmls_dir = DATA_DIR / 'xmls'
+        if xmls_dir.exists():
+            print(f"    📂 Buscando em estrutura: {xmls_dir}")
+            for xml_file in xmls_dir.rglob(f"{chave}.xml"):
+                print(f"    ✅ Arquivo encontrado: {xml_file}")
+                return xml_file
+        
+        # PRIORIDADE 3: Busca em diretórios legados
         diretorios = [
             BASE_DIR / 'xmls_chave',
             BASE_DIR / 'xml_extraidos', 
             BASE_DIR / 'xml_NFs',
-            BASE_DIR / 'xmls',
         ]
         
         for diretorio in diretorios:
             if diretorio.exists():
-                print(f"    📂 Verificando diretório: {diretorio}")
-                # Procura recursivamente
+                print(f"    📂 Verificando diretório legado: {diretorio}")
                 for xml_file in diretorio.rglob(f"*{chave}*.xml"):
                     # FILTRO: Ignora arquivos de debug/protocolo
                     nome_arquivo = xml_file.name.lower()
@@ -5132,35 +5157,56 @@ class MainWindow(QMainWindow):
                     
                     print(f"    ✅ Arquivo encontrado: {xml_file}")
                     return xml_file
-            else:
-                print(f"    ⚠️ Diretório não existe: {diretorio}")
         
-        print(f"    ❌ XML não encontrado em nenhum diretório")
+        print(f"    ❌ XML não encontrado em nenhum local")
         return None
     
     def _encontrar_arquivo_pdf(self, chave):
         """Encontra o arquivo PDF de uma chave de acesso."""
         print(f"    🔍 Procurando PDF para chave: {chave}")
         
-        # Tenta diversos diretórios
+        # PRIORIDADE 1: PDF ao lado do XML registrado no banco
+        try:
+            with self.db._connect() as conn:
+                cursor = conn.execute(
+                    "SELECT caminho_arquivo FROM xmls_baixados WHERE chave = ?",
+                    (chave,)
+                )
+                row = cursor.fetchone()
+                if row and row[0]:
+                    xml_path = Path(row[0])
+                    pdf_path = xml_path.with_suffix('.pdf')
+                    if pdf_path.exists():
+                        print(f"    ✅ PDF encontrado ao lado do XML: {pdf_path}")
+                        return pdf_path
+                    else:
+                        print(f"    ⚠️ PDF não existe ao lado do XML: {pdf_path}")
+        except Exception as e:
+            print(f"    ⚠️ Erro ao consultar banco: {e}")
+        
+        # PRIORIDADE 2: Busca em estrutura por informante  
+        xmls_dir = DATA_DIR / 'xmls'
+        if xmls_dir.exists():
+            print(f"    📂 Buscando em estrutura: {xmls_dir}")
+            for pdf_file in xmls_dir.rglob(f"{chave}.pdf"):
+                print(f"    ✅ Arquivo encontrado: {pdf_file}")
+                return pdf_file
+        
+        # PRIORIDADE 3: Busca em diretórios legados
         diretorios = [
             BASE_DIR / 'xmls_chave',
             BASE_DIR / 'xml_extraidos',
             BASE_DIR / 'xml_NFs',
-            BASE_DIR / 'xmls',
         ]
         
         for diretorio in diretorios:
             if diretorio.exists():
-                print(f"    📂 Verificando diretório: {diretorio}")
-                # Procura recursivamente
+                print(f"    📂 Verificando diretório legado: {diretorio}")
                 for pdf_file in diretorio.rglob(f"*{chave}*.pdf"):
                     print(f"    ✅ Arquivo encontrado: {pdf_file}")
                     return pdf_file
-            else:
-                print(f"    ⚠️ Diretório não existe: {diretorio}")
         
-        print(f"    ❌ PDF não encontrado em nenhum diretório")
+        print(f"    ❌ PDF não encontrado em nenhum local")
         return None
 
     def do_busca_completa(self):
