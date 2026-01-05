@@ -1668,11 +1668,34 @@ class XMLProcessor:
 class NFeService:
     def __init__(self, cert_path, senha, informante, cuf):
         logger.debug(f"Inicializando serviço para informante={informante}, cUF={cuf}")
+        
+        # Imports necessários
+        import ssl
+        import urllib3
+        import requests
+        from requests_pkcs12 import Pkcs12Adapter
+        
+        # Desabilita warnings de SSL
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+        
+        # Configura sessão com certificado PKCS12
         sess = requests.Session()
         sess.verify = False  # Desabilita verificação SSL
-        sess.mount('https://', requests_pkcs12.Pkcs12Adapter(
+        
+        # Corrige conflito SSL em Python 3.10+
+        # Cria adapter personalizado com contexto SSL corrigido
+        class CustomPkcs12Adapter(Pkcs12Adapter):
+            def init_poolmanager(self, *args, **kwargs):
+                ctx = ssl.create_default_context()
+                ctx.check_hostname = False
+                ctx.verify_mode = ssl.CERT_NONE
+                kwargs['ssl_context'] = ctx
+                return super().init_poolmanager(*args, **kwargs)
+        
+        sess.mount('https://', CustomPkcs12Adapter(
             pkcs12_filename=cert_path, pkcs12_password=senha
         ))
+        
         trans = Transport(session=sess)
         self.dist_client = Client(wsdl=URL_DISTRIBUICAO, transport=trans)
         wsdl = CONSULTA_WSDL.get(str(cuf), URL_CONSULTA_FALLBACK)
@@ -1864,6 +1887,123 @@ class NFeService:
         logger.debug(f"Resposta Protocolo (raw):\n{resp_xml}")
         return resp_xml
     
+    def fetch_prot_cte(self, chave):
+        """
+        Consulta o protocolo do CT-e pela chave, validando o XML de envio e resposta.
+        """
+        if not self.cons_client:
+            logger.debug("Cliente de protocolo não disponível")
+            return None
+
+        logger.debug(f"Chamando protocolo CT-e para chave={chave}")
+        
+        # Define URL do serviço baseado no cUF (extrai da chave)
+        # Chave CTe: posições 0-1 = cUF
+        cuf_from_chave = chave[:2] if len(chave) == 44 else str(self.cuf)
+        
+        # URLs OFICIAIS dos serviços de consulta CT-e (versão 4.00)
+        # Fonte: https://dfe-portal.svrs.rs.gov.br/Cte/Servicos
+        url_map = {
+            '51': 'https://cte.sefaz.mt.gov.br/ctews/services/CTeConsultaV4',  # MT
+            '50': 'https://producao.cte.ms.gov.br/ws/CTeConsultaV4',  # MS (sem .asmx!)
+            '31': 'https://cte.fazenda.mg.gov.br/cte/services/CTeConsultaV4',  # MG
+            '41': 'https://cte.fazenda.pr.gov.br/cte/CTeConsultaV4?wsdl',  # PR
+            '43': 'https://cte.svrs.rs.gov.br/ws/CTeConsultaV4/CTeConsultaV4.asmx',  # RS (SVRS)
+            '35': 'https://nfe.fazenda.sp.gov.br/cteWEB/services/cteConsultaV4.asmx',  # SP
+            # SVRS (usado por GO=52, DF=53, RJ=33, AC, AL, AP, ES, PA, PB, PI, RN, RO, RR, SC, SE, TO)
+            '52': 'https://cte.svrs.rs.gov.br/ws/CTeConsultaV4/CTeConsultaV4.asmx',  # GO (SVRS)
+            '53': 'https://cte.svrs.rs.gov.br/ws/CTeConsultaV4/CTeConsultaV4.asmx',  # DF (SVRS)
+            '33': 'https://cte.svrs.rs.gov.br/ws/CTeConsultaV4/CTeConsultaV4.asmx',  # RJ (SVRS)
+        }
+        url = url_map.get(cuf_from_chave, 'https://cte.svrs.rs.gov.br/ws/CTeConsultaV4/CTeConsultaV4.asmx')  # Default: SVRS
+        
+        # Monta XML de consulta CT-e (versão 4.00)
+        xml_consulta = f'''<consSitCTe xmlns="http://www.portalfiscal.inf.br/cte" versao="4.00"><tpAmb>1</tpAmb><xServ>CONSULTAR</xServ><chCTe>{chave}</chCTe></consSitCTe>'''
+        
+        logger.debug(f"XML de consulta CT-e:\n{xml_consulta}")
+        logger.debug(f"URL do serviço (cUF={cuf_from_chave}): {url}")
+
+        # Envia requisição SOAP manualmente
+        try:
+            # Monta envelope SOAP 1.2 (IMPORTANTE: namespace case-sensitive - CTeConsultaV4 com T maiúsculo!)
+            soap_envelope = f'''<?xml version="1.0" encoding="utf-8"?>
+<soap12:Envelope xmlns:soap12="http://www.w3.org/2003/05/soap-envelope" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema">
+  <soap12:Body>
+    <cteDadosMsg xmlns="http://www.portalfiscal.inf.br/cte/wsdl/CTeConsultaV4">{xml_consulta}</cteDadosMsg>
+  </soap12:Body>
+</soap12:Envelope>'''
+            
+            # 🔍 DEBUG: Salva SOAP request completo
+            save_debug_soap(self.informante, "request", soap_envelope, prefixo=f"protocolo_cte_{chave}")
+            
+            logger.debug(f"Envelope SOAP CT-e:\n{soap_envelope[:500]}")
+            
+            headers = {
+                'Content-Type': 'application/soap+xml; charset=utf-8',
+            }
+            
+            # 🌐 DEBUG HTTP: Informações da requisição
+            logger.info(f"🌐 [{self.informante}] HTTP REQUEST Protocolo CT-e:")
+            logger.info(f"   📍 URL: {url}")
+            logger.info(f"   🔑 Chave: {chave}")
+            logger.info(f"   📦 Método: POST")
+            logger.info(f"   📋 Headers: {headers}")
+            logger.info(f"   📏 Tamanho SOAP: {len(soap_envelope)} bytes")
+            logger.info(f"   🔐 Certificado: PKCS12 via sessão requests")
+            
+            # Usa a sessão que já tem o certificado configurado
+            resp = self.dist_client.transport.session.post(url, data=soap_envelope.encode('utf-8'), headers=headers)
+            
+            # 🌐 DEBUG HTTP: Informações da resposta
+            logger.info(f"✅ [{self.informante}] HTTP RESPONSE Protocolo CT-e:")
+            logger.info(f"   📊 Status Code: {resp.status_code}")
+            logger.info(f"   📋 Headers: {dict(resp.headers)}")
+            logger.info(f"   📏 Tamanho: {len(resp.content)} bytes")
+            logger.info(f"   ⏱️ Tempo resposta: {resp.elapsed.total_seconds():.2f}s")
+            
+            resp.raise_for_status()
+            
+            # 🔍 DEBUG: Salva SOAP response completo (raw)
+            save_debug_soap(self.informante, "response_raw", resp.content.decode('utf-8'), prefixo=f"protocolo_cte_{chave}")
+            
+            # Extrai corpo da resposta SOAP
+            resp_tree = etree.fromstring(resp.content)
+            body = resp_tree.find('.//{http://www.w3.org/2003/05/soap-envelope}Body')
+            if body is not None and len(body) > 0:
+                resp = body[0]
+            else:
+                logger.error("Resposta SOAP CT-e sem corpo")
+                return None
+                
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Erro na requisição HTTP CT-e: {e}")
+            return None
+        except Exception as e:
+            logger.error(f"Erro ao montar/enviar requisição SOAP CT-e: {e}")
+            return None
+
+        # Converte resposta para string XML
+        try:
+            if isinstance(resp, etree._Element):
+                resp_xml = etree.tostring(resp, encoding="utf-8").decode()
+            elif hasattr(resp, 'decode'):
+                resp_xml = resp.decode()
+            elif isinstance(resp, str):
+                resp_xml = resp
+            else:
+                resp_xml = etree.tostring(resp, encoding="utf-8").decode()
+        except Exception as e:
+            logger.error(f"Erro ao converter resposta SOAP CT-e em XML: {e}")
+            return None
+
+        # Protege contra respostas inválidas
+        if not resp_xml or resp_xml.strip().startswith('<html') or resp_xml.strip() == '':
+            logger.warning("Resposta inválida da SEFAZ CT-e (não é XML): %s", resp_xml)
+            return None
+
+        logger.debug(f"Resposta Protocolo CT-e (raw):\n{resp_xml}")
+        return resp_xml
+    
     def consultar_eventos_chave(self, chave):
         """
         Consulta eventos de uma chave específica na SEFAZ.
@@ -1879,41 +2019,79 @@ class NFeService:
         # Define URL do serviço baseado no cUF (extrai da chave)
         cuf_from_chave = chave[:2] if len(chave) == 44 else str(self.cuf)
         
-        # URLs dos serviços de consulta de eventos (NFeConsultaProtocolo4 retorna eventos junto)
-        url_map = {
-            '31': 'https://nfe.fazenda.mg.gov.br/nfe2/services/NFeConsultaProtocolo4',  # MG
-            '50': 'https://nfe.sefaz.ms.gov.br/ws/NFeConsultaProtocolo4',  # MS
-            '51': 'https://www.sefazvirtual.fazenda.gov.br/NFeConsultaProtocolo4/NFeConsultaProtocolo4.asmx',  # SVRS
-            '52': 'https://www.sefazvirtual.fazenda.gov.br/NFeConsultaProtocolo4/NFeConsultaProtocolo4.asmx',  # GO
-            '35': 'https://nfe.fazenda.sp.gov.br/ws/nfeconsultaprotocolo4.asmx',  # SP
-            '33': 'https://nfe.fazenda.rj.gov.br/ws/NFeConsultaProtocolo4',  # RJ
-            '41': 'https://nfe.sefa.pr.gov.br/nfe/NFeConsultaProtocolo4',  # PR
-            '53': 'https://nfe.sefaz.df.gov.br/ws/NFeConsultaProtocolo4',  # DF
-        }
-        url = url_map.get(cuf_from_chave, 'https://www.sefazvirtual.fazenda.gov.br/NFeConsultaProtocolo4/NFeConsultaProtocolo4.asmx')
+        # Detecta se é NFe ou CTe pela posição 20 (modelo: 55=NFe, 57=CTe)
+        modelo = chave[20:22] if len(chave) == 44 else '55'
+        is_cte = modelo == '57'
         
-        # Monta XML de consulta (mesmo serviço que retorna protocolo também retorna eventos)
-        xml_consulta = f'''<consSitNFe xmlns="http://www.portalfiscal.inf.br/nfe" versao="4.00"><tpAmb>1</tpAmb><xServ>CONSULTAR</xServ><chNFe>{chave}</chNFe></consSitNFe>'''
-        
-        logger.debug(f"XML consulta eventos:\n{xml_consulta}")
-        logger.debug(f"URL do serviço (cUF={cuf_from_chave}): {url}")
-        
-        # Envia requisição SOAP
-        try:
+        if is_cte:
+            # URLs dos serviços de consulta de CT-e (versão 4.00) - Fonte: https://dfe-portal.svrs.rs.gov.br/Cte/Servicos
+            # SVRS (Sefaz Virtual RS) atende: AC, AL, AP, DF, ES, GO, MS, MT, PA, PB, PI, RJ, RN, RO, RR, SC, SE, TO
+            url_map = {
+                '31': 'https://cte.fazenda.mg.gov.br/cte/services/CTeConsultaV4',  # MG
+                '35': 'https://nfe.fazenda.sp.gov.br/CTeWS/WS/CTeConsultaV4.asmx',  # SP
+                '41': 'https://cte.fazenda.pr.gov.br/cte4/CTeConsultaV4',  # PR
+                '50': 'https://producao.cte.ms.gov.br/ws/CTeConsultaV4',  # MS
+                '51': 'https://cte.sefaz.mt.gov.br/ctews2/services/CTeConsultaV4',  # MT
+                # SVRS (usado por GO=52, DF=53, RJ=33, RS=43, AC, AL, AP, ES, PA, PB, PI, RN, RO, RR, SC, SE, TO)
+                '52': 'https://cte.svrs.rs.gov.br/ws/CTeConsultaV4/CTeConsultaV4.asmx',  # GO (SVRS)
+                '53': 'https://cte.svrs.rs.gov.br/ws/CTeConsultaV4/CTeConsultaV4.asmx',  # DF (SVRS)
+                '33': 'https://cte.svrs.rs.gov.br/ws/CTeConsultaV4/CTeConsultaV4.asmx',  # RJ (SVRS)
+                '43': 'https://cte.svrs.rs.gov.br/ws/CTeConsultaV4/CTeConsultaV4.asmx',  # RS (SVRS)
+            }
+            url = url_map.get(cuf_from_chave, 'https://cte.svrs.rs.gov.br/ws/CTeConsultaV4/CTeConsultaV4.asmx')  # Default: SVRS
+            
+            # XML de consulta CT-e (versão 4.00)
+            xml_consulta = f'''<consSitCTe xmlns="http://www.portalfiscal.inf.br/cte" versao="4.00"><tpAmb>1</tpAmb><xServ>CONSULTAR</xServ><chCTe>{chave}</chCTe></consSitCTe>'''
+            
+            # IMPORTANTE: namespace case-sensitive - CTeConsultaV4 com T maiúsculo!
+            soap_envelope = f'''<?xml version="1.0" encoding="utf-8"?>
+<soap12:Envelope xmlns:soap12="http://www.w3.org/2003/05/soap-envelope" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema">
+  <soap12:Body>
+    <cteDadosMsg xmlns="http://www.portalfiscal.inf.br/cte/wsdl/CTeConsultaV4">{xml_consulta}</cteDadosMsg>
+  </soap12:Body>
+</soap12:Envelope>'''
+        else:
+            # URLs dos serviços de consulta de NF-e
+            # SVRS (Sefaz Virtual RS) atende: AC, AL, AP, DF, ES, GO, MA, PA, PB, PI, RJ, RN, RO, RR, SC, SE, TO
+            url_map = {
+                '31': 'https://nfe.fazenda.mg.gov.br/nfe2/services/NFeConsultaProtocolo4',  # MG
+                '50': 'https://nfe.sefaz.ms.gov.br/ws/NFeConsultaProtocolo4',  # MS
+                '51': 'https://nfe.sefaz.mt.gov.br/nfews/v2/services/NfeConsulta4',  # MT
+                '35': 'https://nfe.fazenda.sp.gov.br/ws/nfeconsultaprotocolo4.asmx',  # SP
+                '41': 'https://nfe.sefa.pr.gov.br/nfe/NFeConsultaProtocolo4',  # PR
+                '29': 'https://nfe.sefaz.ba.gov.br/webservices/NFeConsultaProtocolo4/NFeConsultaProtocolo4.asmx',  # BA
+                # SVRS para estados sem servidor próprio
+                '32': 'https://www.sefazvirtual.fazenda.gov.br/NFeConsultaProtocolo4/NFeConsultaProtocolo4.asmx',  # ES (SVRS)
+                '33': 'https://www.sefazvirtual.fazenda.gov.br/NFeConsultaProtocolo4/NFeConsultaProtocolo4.asmx',  # RJ (SVRS)
+                '52': 'https://www.sefazvirtual.fazenda.gov.br/NFeConsultaProtocolo4/NFeConsultaProtocolo4.asmx',  # GO (SVRS)
+                '53': 'https://www.sefazvirtual.fazenda.gov.br/NFeConsultaProtocolo4/NFeConsultaProtocolo4.asmx',  # DF (SVRS)
+            }
+            url = url_map.get(cuf_from_chave, 'https://www.sefazvirtual.fazenda.gov.br/NFeConsultaProtocolo4/NFeConsultaProtocolo4.asmx')
+            
+            # XML de consulta NF-e
+            xml_consulta = f'''<consSitNFe xmlns="http://www.portalfiscal.inf.br/nfe" versao="4.00"><tpAmb>1</tpAmb><xServ>CONSULTAR</xServ><chNFe>{chave}</chNFe></consSitNFe>'''
+            
             soap_envelope = f'''<?xml version="1.0" encoding="utf-8"?>
 <soap12:Envelope xmlns:soap12="http://www.w3.org/2003/05/soap-envelope" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema">
   <soap12:Body>
     <nfeDadosMsg xmlns="http://www.portalfiscal.inf.br/nfe/wsdl/NFeConsultaProtocolo4">{xml_consulta}</nfeDadosMsg>
   </soap12:Body>
 </soap12:Envelope>'''
-            
+        
+        logger.debug(f"XML consulta eventos ({('CTe' if is_cte else 'NFe')}):\n{xml_consulta}")
+        logger.debug(f"URL do serviço (cUF={cuf_from_chave}): {url}")
+        logger.debug(f"XML consulta eventos ({('CTe' if is_cte else 'NFe')}):\n{xml_consulta}")
+        logger.debug(f"URL do serviço (cUF={cuf_from_chave}): {url}")
+        
+        # Envia requisição SOAP
+        try:
             save_debug_soap(self.informante, "request_eventos", soap_envelope, prefixo=f"eventos_{chave[:10]}")
             
             headers = {
                 'Content-Type': 'application/soap+xml; charset=utf-8',
             }
             
-            logger.info(f"🔍 Consultando eventos da chave: {chave}")
+            logger.info(f"🔍 Consultando eventos da chave {'CTe' if is_cte else 'NFe'}: {chave}")
             
             resp = self.dist_client.transport.session.post(url, data=soap_envelope.encode('utf-8'), headers=headers)
             resp.raise_for_status()
@@ -2069,6 +2247,21 @@ def processar_cte(db, cert_data):
                         nota_cte['xml_status'] = 'RESUMO'
                     elif root_tag in ['procEventoCTe', 'eventoCTe']:
                         nota_cte['xml_status'] = 'EVENTO'
+                        
+                        # 🆕 Processa evento para atualizar status da nota relacionada
+                        try:
+                            # Extrai chave do CT-e relacionado ao evento
+                            ch_cte_evento = root.findtext('.//{http://www.portalfiscal.inf.br/cte}chCTe')
+                            tp_evento = root.findtext('.//{http://www.portalfiscal.inf.br/cte}tpEvento')
+                            c_stat = root.findtext('.//{http://www.portalfiscal.inf.br/cte}cStat')
+                            
+                            if ch_cte_evento and tp_evento == '110111' and c_stat == '135':
+                                # Cancelamento de CT-e homologado
+                                novo_status = "Cancelamento de CT-e homologado"
+                                db.atualizar_status_por_evento(ch_cte_evento, novo_status)
+                                logger.info(f"🚫 [{inf}] CT-e {ch_cte_evento} → {novo_status}")
+                        except Exception as e:
+                            logger.warning(f"⚠️ Erro ao processar evento de CT-e: {e}")
                     else:
                         nota_cte['xml_status'] = 'RESUMO'
                     
@@ -2499,6 +2692,182 @@ UF: {cuf}
     except Exception as e:
         logger.exception(f"Erro durante ciclo de busca: {e}")
         raise
+
+
+def atualizar_status_notas_lote(db, certificados, chaves_list, progress_callback=None, max_workers=5):
+    """
+    Atualiza o status de múltiplas notas consultando eventos na SEFAZ (com paralelização).
+    
+    Args:
+        db: Instância do DatabaseManager
+        certificados: Lista de certificados disponíveis
+        chaves_list: Lista de chaves de acesso para consultar
+        progress_callback: Função callback(current, total, chave) para reportar progresso
+        max_workers: Número máximo de consultas simultâneas (padrão: 5)
+        
+    Returns:
+        Dict com estatísticas: {'consultadas': int, 'canceladas': int, 'erros': int}
+    """
+    import threading
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    
+    stats = {'consultadas': 0, 'canceladas': 0, 'erros': 0, 'atualizadas': 0}
+    stats_lock = threading.Lock()  # Lock para atualizar stats de forma thread-safe
+    
+    if not certificados:
+        logger.error("Nenhum certificado disponível para consulta")
+        return stats
+    
+    # Agrupa chaves por UF (cUF) para usar certificado correto
+    chaves_por_uf = {}
+    for chave in chaves_list:
+        if len(chave) != 44:
+            continue
+        cuf = chave[:2]  # Primeiros 2 dígitos = cUF
+        if cuf not in chaves_por_uf:
+            chaves_por_uf[cuf] = []
+        chaves_por_uf[cuf].append(chave)
+    
+    total_chaves = len(chaves_list)
+    processadas = [0]  # Lista para ser mutável em closure
+    processadas_lock = threading.Lock()
+    
+    def consultar_chave(chave, svc, cuf):
+        """Consulta uma chave individualmente (executado em thread separada)."""
+        nonlocal processadas
+        
+        try:
+            # Consulta eventos da chave
+            xml_resposta = svc.consultar_eventos_chave(chave)
+            
+            with stats_lock:
+                stats['consultadas'] += 1
+            
+            if not xml_resposta:
+                logger.debug(f"Sem eventos para chave {chave}")
+                return None
+            
+            # Processa resposta para detectar cancelamento
+            from lxml import etree
+            root = etree.fromstring(xml_resposta.encode('utf-8') if isinstance(xml_resposta, str) else xml_resposta)
+            
+            # Detecta se é NFe ou CTe pela chave
+            modelo = chave[20:22] if len(chave) == 44 else '55'
+            is_cte = modelo == '57'
+            
+            # Define namespace baseado no tipo
+            if is_cte:
+                ns_uri = 'http://www.portalfiscal.inf.br/cte'
+                tipo_doc = 'CT-e'
+            else:
+                ns_uri = 'http://www.portalfiscal.inf.br/nfe'
+                tipo_doc = 'NF-e'
+            
+            # Procura evento de cancelamento
+            # NFe: tpEvento = 110111 (cancelamento)
+            # CTe: tpEvento = 110111 (cancelamento)
+            eventos = root.findall(f'.//{{{ns_uri}}}infEvento')
+            
+            for evento in eventos:
+                tp_evento = evento.findtext(f'{{{ns_uri}}}tpEvento')
+                c_stat = evento.findtext(f'.//{{{ns_uri}}}cStat')
+                
+                if tp_evento == '110111' and c_stat == '135':  # Cancelamento autorizado
+                    novo_status = f"Cancelamento de {tipo_doc} homologado"
+                    db.atualizar_status_por_evento(chave, novo_status)
+                    
+                    # Salva XML do evento
+                    try:
+                        evento_xml = etree.tostring(evento, encoding='utf-8', pretty_print=True).decode()
+                        informante = evento.findtext(f'{{{ns_uri}}}CNPJ') or 'desconhecido'
+                        ano_mes = chave[2:6]  # AAMM da chave
+                        ano = '20' + ano_mes[:2]
+                        mes = ano_mes[2:4]
+                        
+                        from pathlib import Path
+                        eventos_dir = Path('xmls') / informante / f"{ano}-{mes}" / "Eventos"
+                        eventos_dir.mkdir(parents=True, exist_ok=True)
+                        
+                        evento_file = eventos_dir / f"{chave}.xml"
+                        evento_file.write_text(evento_xml, encoding='utf-8')
+                        logger.info(f"[SALVO Evento] {evento_file}")
+                    except Exception as e:
+                        logger.warning(f"Não foi possível salvar evento de {chave}: {e}")
+                    
+                    with stats_lock:
+                        stats['canceladas'] += 1
+                        stats['atualizadas'] += 1
+                    
+                    logger.info(f"✅ Status atualizado: {chave} → {novo_status}")
+                    return 'cancelada'
+                    
+                elif tp_evento == '110110' and c_stat == '135':  # Carta de correção
+                    novo_status = "Carta de Correção registrada"
+                    db.atualizar_status_por_evento(chave, novo_status)
+                    
+                    with stats_lock:
+                        stats['atualizadas'] += 1
+                    
+                    logger.info(f"✅ Status atualizado: {chave} → {novo_status}")
+                    return 'correcao'
+            
+            return None
+            
+        except Exception as e:
+            logger.error(f"Erro ao consultar chave {chave}: {e}")
+            with stats_lock:
+                stats['erros'] += 1
+            return 'erro'
+        finally:
+            # Atualiza progresso
+            with processadas_lock:
+                processadas[0] += 1
+                if progress_callback:
+                    try:
+                        progress_callback(processadas[0], total_chaves, chave)
+                    except:
+                        pass  # Ignora erros no callback
+    
+    # Processa cada UF
+    for cuf, chaves in chaves_por_uf.items():
+        # Tenta encontrar certificado da mesma UF ou usa o primeiro disponível
+        cert = certificados[0]  # Fallback para primeiro certificado
+        for c in certificados:
+            if c.get('cUF_autor') == cuf:
+                cert = c
+                break
+        
+        # Cria serviço NFe
+        try:
+            svc = NFeService(
+                cert.get('caminho'),
+                cert.get('senha'),
+                cert.get('cnpj_cpf'),
+                cert.get('cUF_autor')
+            )
+        except Exception as e:
+            logger.error(f"Erro ao criar serviço NFe para UF {cuf}: {e}")
+            with stats_lock:
+                stats['erros'] += len(chaves)
+            continue
+        
+        # Paraleliza consultas com ThreadPoolExecutor
+        logger.info(f"🚀 Consultando {len(chaves)} chaves da UF {cuf} com {max_workers} workers paralelos")
+        
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # Submete todas as consultas
+            futures = {executor.submit(consultar_chave, chave, svc, cuf): chave for chave in chaves}
+            
+            # Aguarda conclusão
+            for future in as_completed(futures):
+                chave = futures[future]
+                try:
+                    resultado = future.result()
+                except Exception as e:
+                    logger.error(f"Exceção não tratada ao consultar {chave}: {e}")
+    
+    logger.info(f"📊 Atualização concluída: {stats}")
+    return stats
 
 
 if __name__ == "__main__":

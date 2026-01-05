@@ -356,10 +356,12 @@ class MainWindow(QMainWindow):
         self._trabalhos_ativos = []
         self._sync_worker = None
         self._sync_thread = None
+        self._sync_cancelada_pelo_usuario = False  # Flag para não reativar auto-sync
         self._ultimo_evento_usuario = datetime.now()
         self._inatividade_timer = QTimer()
         self._inatividade_timer.timeout.connect(self._check_inatividade)
         self._inatividade_timer.start(10000)  # Verifica a cada 10 segundos
+        self._auto_update_executado = False  # Flag para não repetir auto-update
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -647,10 +649,9 @@ class MainWindow(QMainWindow):
         self._statusbar.addPermanentWidget(self.search_progress)
 
         # Menus (Central de Tarefas)
-        try:
-            self._setup_tasks_menu()
-        except Exception:
-            pass
+        print("DEBUG: Iniciando criação do menu Configurações...")
+        self._setup_tasks_menu()
+        print("DEBUG: Menu Configurações criado com sucesso!")
 
         # Data cache
         self.notes = []
@@ -691,6 +692,12 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(500, self._gerar_pdfs_faltantes)
         # Verifica se há sincronização pendente
         QTimer.singleShot(1500, self._verificar_sync_pendente)
+        # ⛔ DESABILITADO: Consulta automática de status ao iniciar
+        # A consulta de eventos só deve ocorrer:
+        # 1. Após busca na SEFAZ (distribuição DFe)
+        # 2. Ao clicar no botão "🔄 Atualizar Status"
+        # 3. Ao clicar no botão "Sincronizar Agora"
+        # QTimer.singleShot(3000, self._atualizar_status_background)
         # Auto-start search removido - usuário deve clicar em "Buscar na SEFAZ"
         # QTimer.singleShot(2000, self._auto_start_search)
         self._apply_theme()
@@ -711,7 +718,12 @@ class MainWindow(QMainWindow):
                 print("[VERIFICAÇÃO] Procurando XMLs sem PDF...")
                 count = 0
                 for xml_file in xmls_dir.rglob("*.xml"):
-                    # Pula eventos (não gera PDF para eventos)
+                    # ⛔ PULA EVENTOS - Eventos NUNCA devem gerar PDF!
+                    # Verifica pelo caminho (pasta "Eventos") OU pelo nome do arquivo
+                    if "Eventos" in str(xml_file.parent) or "\\Eventos\\" in str(xml_file):
+                        continue
+                    
+                    # Pula também por palavras-chave no nome
                     nome_arquivo = xml_file.stem.upper()
                     if any(keyword in nome_arquivo for keyword in ['EVENTO', 'CIENCIA', '-CANCELAMENTO', '-CORRECAO', 'RESUMO']):
                         continue
@@ -856,8 +868,262 @@ class MainWindow(QMainWindow):
                 else:
                     print("[SYNC] Usuário optou por não retomar. Limpando estado...")
                     self.db.clear_sync_state()
+                    self._sync_cancelada_pelo_usuario = True  # Marca que usuário cancelou
         except Exception as e:
             print(f"[SYNC] Erro ao verificar sincronização pendente: {e}")
+    
+    def _atualizar_status_background(self):
+        """Atualiza status das notas silenciosamente em background na inicialização."""
+        try:
+            # Verifica se já foi executado (evita loop infinito)
+            if self._auto_update_executado:
+                print("[AUTO-UPDATE] Atualização automática já foi executada, pulando...")
+                return
+            
+            self._auto_update_executado = True  # Marca como executado
+            
+            print("[AUTO-UPDATE] Iniciando atualização automática de status...")
+            
+            # Verifica se já há uma atualização em andamento
+            if hasattr(self, '_auto_update_worker') and self._auto_update_worker and self._auto_update_worker.isRunning():
+                print("[AUTO-UPDATE] Atualização já está em andamento, pulando...")
+                return
+            
+            # Obtém certificados
+            certs = self.db.load_certificates()
+            if not certs:
+                print("[AUTO-UPDATE] Nenhum certificado configurado")
+                return
+            
+            # Obtém lista de chaves (apenas notas com status "Autorizado" para otimizar)
+            chaves = []
+            for nota in self.notes:
+                status = (nota.get('status') or '').lower()  # CORRIGIDO: era 'status_nota'
+                chave = nota.get('chave')
+                # Consulta apenas notas "autorizadas" (não consulta já canceladas)
+                if chave and len(chave) == 44 and 'autoriza' in status:
+                    chaves.append(chave)
+            
+            if not chaves:
+                print("[AUTO-UPDATE] Nenhuma nota autorizada para atualizar")
+                return
+            
+            print(f"[AUTO-UPDATE] {len(chaves)} notas serão verificadas")
+            
+            # Atualiza status na barra (silencioso, sem diálogo)
+            self.set_status(f"🔄 Atualizando status de {len(chaves)} notas...")
+            
+            # Executa em thread
+            from PyQt5.QtCore import QThread, pyqtSignal
+            
+            class UpdateStatusWorker(QThread):
+                finished = pyqtSignal(dict)
+                error = pyqtSignal(str)
+                
+                def __init__(self, db, certs, chaves):
+                    super().__init__()
+                    self.db = db
+                    self.certs = certs
+                    self.chaves = chaves
+                
+                def run(self):
+                    try:
+                        from nfe_search import atualizar_status_notas_lote
+                        stats = atualizar_status_notas_lote(
+                            self.db,
+                            self.certs,
+                            self.chaves,
+                            None  # Sem callback de progresso para ser silencioso
+                        )
+                        self.finished.emit(stats)
+                    except Exception as e:
+                        self.error.emit(str(e))
+            
+            def on_finished(stats):
+                msg = f"✅ Status atualizado: {stats.get('atualizadas', 0)} alterações"
+                if stats.get('canceladas', 0) > 0:
+                    msg += f" ({stats.get('canceladas', 0)} canceladas)"
+                
+                print(f"[AUTO-UPDATE] {msg}")
+                self.set_status(msg, 5000)
+                
+                # Limpa referência ao worker ANTES de recarregar (evita loop)
+                self._auto_update_worker = None
+                
+                # FORÇA recarregar dados do banco antes de atualizar tabela
+                print("[AUTO-UPDATE] Recarregando dados do banco...")
+                old_count = len(self.notes)
+                self.notes = self.db.load_notes(limit=5000)  # Aumenta limite para 5000
+                print(f"[AUTO-UPDATE] {len(self.notes)} notas carregadas (antes: {old_count})")
+                
+                # Verifica quantas estão canceladas
+                canceladas_count = sum(1 for n in self.notes if 'cancel' in (n.get('status') or '').lower())
+                print(f"[AUTO-UPDATE] {canceladas_count} notas canceladas detectadas nos dados")
+                
+                # Atualiza interface SEM chamar refresh_all (evita loop)
+                try:
+                    self._refresh_table_only()  # Usa método específico que não recarrega dados
+                except:
+                    pass  # Fallback silencioso
+            
+            def on_error(error_msg):
+                print(f"[AUTO-UPDATE] Erro: {error_msg}")
+                self.set_status("Status atualizado com erros", 3000)
+                
+                # Limpa referência ao worker
+                self._auto_update_worker = None
+            
+            worker = UpdateStatusWorker(self.db, certs, chaves)
+            worker.finished.connect(on_finished)
+            worker.error.connect(on_error)
+            worker.start()
+            
+            # Mantém referência ao worker
+            self._auto_update_worker = worker
+            
+        except Exception as e:
+            print(f"[AUTO-UPDATE] Erro ao iniciar atualização: {e}")
+    
+    def _atualizar_status_apos_busca(self):
+        """Atualiza status das notas e CT-es após busca na SEFAZ (somente documentos recentes)."""
+        try:
+            print("[PÓS-BUSCA] Verificando documentos recentes para consulta de eventos...")
+            
+            # Verifica se já há uma atualização em andamento
+            if hasattr(self, '_auto_update_worker') and self._auto_update_worker and self._auto_update_worker.isRunning():
+                print("[PÓS-BUSCA] Atualização já está em andamento, pulando...")
+                return
+            
+            # Obtém certificados
+            certs = self.db.load_certificates()
+            if not certs:
+                print("[PÓS-BUSCA] Nenhum certificado configurado")
+                return
+            
+            # Obtém apenas documentos dos ÚLTIMOS 7 DIAS (otimização)
+            from datetime import datetime, timedelta
+            data_limite = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
+            
+            chaves_nfe = []
+            chaves_cte = []
+            
+            for nota in self.notes:
+                status = (nota.get('status') or '').lower()
+                chave = nota.get('chave')
+                data_emissao = (nota.get('data_emissao') or '')[:10]
+                tipo = (nota.get('tipo') or '').upper()
+                
+                # Consulta apenas documentos RECENTES e AUTORIZADOS
+                if (chave and len(chave) == 44 and 
+                    'autoriza' in status and 
+                    data_emissao >= data_limite):
+                    
+                    # Separa por tipo
+                    if tipo == 'CTE':
+                        chaves_cte.append(chave)
+                    else:
+                        chaves_nfe.append(chave)
+            
+            total_docs = len(chaves_nfe) + len(chaves_cte)
+            
+            if total_docs == 0:
+                print("[PÓS-BUSCA] Nenhum documento recente para atualizar")
+                return
+            
+            print(f"[PÓS-BUSCA] {len(chaves_nfe)} NF-es e {len(chaves_cte)} CT-es recentes serão verificados")
+            self.set_status(f"🔄 Verificando eventos de {total_docs} documentos recentes (NF-e: {len(chaves_nfe)}, CT-e: {len(chaves_cte)})...")
+            
+            # Executa em thread
+            from PyQt5.QtCore import QThread, pyqtSignal
+            
+            class UpdateStatusWorker(QThread):
+                finished = pyqtSignal(dict)
+                error = pyqtSignal(str)
+                
+                def __init__(self, db, certs, chaves_nfe, chaves_cte):
+                    super().__init__()
+                    self.db = db
+                    self.certs = certs
+                    self.chaves_nfe = chaves_nfe
+                    self.chaves_cte = chaves_cte
+                
+                def run(self):
+                    try:
+                        from nfe_search import atualizar_status_notas_lote
+                        
+                        # Primeiro: NF-es
+                        stats_nfe = {'consultadas': 0, 'canceladas': 0, 'atualizadas': 0}
+                        if self.chaves_nfe:
+                            print(f"[PÓS-BUSCA] Consultando eventos de {len(self.chaves_nfe)} NF-es...")
+                            stats_nfe = atualizar_status_notas_lote(
+                                self.db,
+                                self.certs,
+                                self.chaves_nfe,
+                                None  # Sem callback de progresso
+                            )
+                        
+                        # Segundo: CT-es
+                        stats_cte = {'consultadas': 0, 'canceladas': 0, 'atualizadas': 0}
+                        if self.chaves_cte:
+                            print(f"[PÓS-BUSCA] Consultando eventos de {len(self.chaves_cte)} CT-es...")
+                            stats_cte = atualizar_status_notas_lote(
+                                self.db,
+                                self.certs,
+                                self.chaves_cte,
+                                None  # Sem callback de progresso
+                            )
+                        
+                        # Combina estatísticas
+                        stats = {
+                            'consultadas': stats_nfe.get('consultadas', 0) + stats_cte.get('consultadas', 0),
+                            'canceladas': stats_nfe.get('canceladas', 0) + stats_cte.get('canceladas', 0),
+                            'atualizadas': stats_nfe.get('atualizadas', 0) + stats_cte.get('atualizadas', 0),
+                            'nfes': len(self.chaves_nfe),
+                            'ctes': len(self.chaves_cte),
+                            'canceladas_nfe': stats_nfe.get('canceladas', 0),
+                            'canceladas_cte': stats_cte.get('canceladas', 0)
+                        }
+                        
+                        self.finished.emit(stats)
+                    except Exception as e:
+                        self.error.emit(str(e))
+            
+            def on_finished(stats):
+                nfes = stats.get('nfes', 0)
+                ctes = stats.get('ctes', 0)
+                canceladas_nfe = stats.get('canceladas_nfe', 0)
+                canceladas_cte = stats.get('canceladas_cte', 0)
+                total_canceladas = stats.get('canceladas', 0)
+                
+                msg = f"✅ Eventos verificados: NF-e ({nfes}, {canceladas_nfe} canceladas) | CT-e ({ctes}, {canceladas_cte} canceladas)"
+                print(f"[PÓS-BUSCA] {msg}")
+                self.set_status(msg, 5000)
+                
+                # Limpa worker
+                self._auto_update_worker = None
+                
+                # Recarrega dados se houver alterações
+                if stats.get('atualizadas', 0) > 0:
+                    print("[PÓS-BUSCA] Recarregando dados...")
+                    self.notes = self.db.load_notes(limit=5000)
+                    self._refresh_table_only()
+            
+            def on_error(error_msg):
+                print(f"[PÓS-BUSCA] Erro: {error_msg}")
+                self._auto_update_worker = None
+            
+            worker = UpdateStatusWorker(self.db, certs, chaves_nfe, chaves_cte)
+            worker.finished.connect(on_finished)
+            worker.error.connect(on_error)
+            worker.start()
+            
+            # Mantém referência
+            self._auto_update_worker = worker
+            
+        except Exception as e:
+            print(f"[PÓS-BUSCA] Erro geral: {e}")
+            import traceback
+            traceback.print_exc()
     
     def set_status(self, msg: str, timeout_ms: int = 0):
         self.status_label.setText(msg)
@@ -1053,9 +1319,12 @@ class MainWindow(QMainWindow):
             traceback.print_exc()
 
     def _setup_tasks_menu(self):
+        print("DEBUG: Dentro de _setup_tasks_menu()")
         # Cria um menu 'Configurações' no menu bar com as ações principais
+        from PyQt5.QtWidgets import QActionGroup
         menubar = self.menuBar()
         tarefas = menubar.addMenu("Configurações")
+        print(f"DEBUG: Menu 'Configurações' criado: {tarefas}")
 
         # Helper para criar ações com ícone opcional (QStyle ou arquivo)
         def add_action(menu: QMenu, text: str, slot, shortcut: Optional[str] = None, icon_name: Optional[str] = None, qstyle_icon=None):
@@ -1086,18 +1355,70 @@ class MainWindow(QMainWindow):
         add_action(tarefas, "Atualizar", self.refresh_all, "F5", qstyle_icon=QStyle.SP_BrowserReload)
         add_action(tarefas, "🔄 Sincronizar XMLs", self.sincronizar_xmls_interface, "Ctrl+Shift+S", qstyle_icon=QStyle.SP_FileDialogDetailedView)
         add_action(tarefas, "📥 Baixar XMLs Faltantes", self.baixar_xmls_faltantes_por_chave, "Ctrl+Shift+D", qstyle_icon=QStyle.SP_ArrowDown)
+        # Removido temporariamente: add_action(tarefas, "🔄 Atualizar Status das Notas", self._atualizar_status_lote, "Ctrl+Shift+R", qstyle_icon=QStyle.SP_BrowserReload)
         tarefas.addSeparator()
         add_action(tarefas, "Buscar na SEFAZ", self.do_search, "Ctrl+B", qstyle_icon=QStyle.SP_FileDialogContentsView)
         add_action(tarefas, "Busca Completa", self.do_busca_completa, "Ctrl+Shift+B", qstyle_icon=QStyle.SP_FileDialogDetailedView)
-        add_action(tarefas, "PDFs em lote…", self.do_batch_pdf, "Ctrl+P", qstyle_icon=QStyle.SP_FileIcon)
+        # Removido: PDFs em lote (função não existe)
         tarefas.addSeparator()
         add_action(tarefas, "Busca por chave", self.buscar_por_chave, "Ctrl+K", qstyle_icon=QStyle.SP_FileDialogListView)
+        add_action(tarefas, "📤 Exportar", self.abrir_exportacao, "Ctrl+E", qstyle_icon=QStyle.SP_DialogSaveButton)
         add_action(tarefas, "Certificados…", self.open_certificates, "Ctrl+Shift+C", qstyle_icon=QStyle.SP_DialogApplyButton)
         add_action(tarefas, "📁 Importar XMLs", self.importar_xmls_pasta, "Ctrl+I", qstyle_icon=QStyle.SP_DialogOpenButton)
         tarefas.addSeparator()
         add_action(tarefas, "⚙️ Gerenciador de Trabalhos", self._abrir_gerenciador_trabalhos, "Ctrl+Shift+G", qstyle_icon=QStyle.SP_ComputerIcon)
         tarefas.addSeparator()
         add_action(tarefas, "💾 Armazenamento…", self.open_storage_config, "Ctrl+Shift+A", qstyle_icon=QStyle.SP_DriveFDIcon)
+        tarefas.addSeparator()
+        
+        # Submenu: Intervalo de Busca Automática
+        print("DEBUG: Criando submenu Intervalo de Busca Automática...")
+        intervalo_submenu = tarefas.addMenu("⏱️ Intervalo de Busca Automática")
+        try:
+            intervalo_submenu.setIcon(self.style().standardIcon(QStyle.SP_DialogResetButton))
+        except Exception as e:
+            print(f"DEBUG: Erro ao definir ícone do submenu: {e}")
+        
+        # Cria ações para cada intervalo (1 a 23 horas)
+        print("DEBUG: Criando grupo de ações...")
+        intervalo_group = QActionGroup(self)
+        intervalo_group.setExclusive(True)
+        intervalo_atual = self._load_intervalo_config()
+        print(f"DEBUG: Intervalo atual: {intervalo_atual} horas")
+        
+        for horas in [1, 2, 3, 4, 6, 8, 12, 16, 20, 23]:
+            act_intervalo = QAction(f"{horas} {'hora' if horas == 1 else 'horas'}", self)
+            act_intervalo.setCheckable(True)
+            if horas == intervalo_atual:
+                act_intervalo.setChecked(True)
+                print(f"DEBUG: Marcando {horas} horas como selecionado")
+            act_intervalo.triggered.connect(lambda checked, h=horas: self._set_intervalo_from_menu(h))
+            intervalo_group.addAction(act_intervalo)
+            intervalo_submenu.addAction(act_intervalo)
+        
+        print(f"DEBUG: Submenu criado com {len(intervalo_submenu.actions())} ações")
+        
+        # Checkbox: Consultar Status na SEFAZ
+        print("DEBUG: Criando checkbox Consultar Status...")
+        self._act_consultar_status = QAction("✅ Consultar Status na SEFAZ", self)
+        self._act_consultar_status.setCheckable(True)
+        self._act_consultar_status.setChecked(self._load_consultar_status_config())
+        self._act_consultar_status.setToolTip(
+            "Se habilitado, consulta o status de notas sem status após buscar documentos.\n"
+            "DICA: Desabilite se a consulta estiver travando a busca de novos documentos."
+        )
+        def _toggle_consultar_status(checked: bool):
+            try:
+                self._save_consultar_status_config(2 if checked else 0)  # Qt.Checked = 2
+                if hasattr(self, 'check_consultar_status'):
+                    self.check_consultar_status.setChecked(checked)
+            except Exception:
+                pass
+            self.set_status("Consultar status: " + ("ativado" if checked else "desativado"), 2500)
+        self._act_consultar_status.toggled.connect(_toggle_consultar_status)
+        tarefas.addAction(self._act_consultar_status)
+        print("DEBUG: Checkbox adicionado ao menu")
+        
         tarefas.addSeparator()
         add_action(tarefas, "🔄 Atualizações", self.check_updates, "Ctrl+U", qstyle_icon=QStyle.SP_BrowserReload)
         tarefas.addSeparator()
@@ -1122,8 +1443,20 @@ class MainWindow(QMainWindow):
             self._act_pdf_simples.toggled.connect(_toggle_pdf_simple)
             tarefas.addSeparator()
             tarefas.addAction(self._act_pdf_simples)
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"DEBUG: Erro ao adicionar PDF simples: {e}")
+        
+        # Contar ações no menu
+        total_acoes = len(tarefas.actions())
+        print(f"DEBUG: Total de ações no menu 'Configurações': {total_acoes}")
+        print("DEBUG: Listando todas as ações:")
+        for i, action in enumerate(tarefas.actions(), 1):
+            if action.isSeparator():
+                print(f"  {i}. [SEPARADOR]")
+            elif action.menu():
+                print(f"  {i}. {action.text()} [SUBMENU com {len(action.menu().actions())} itens]")
+            else:
+                print(f"  {i}. {action.text()}")
 
     def sincronizar_xmls_interface(self):
         """Sincroniza dados da interface com XMLs físicos.
@@ -1572,6 +1905,16 @@ class MainWindow(QMainWindow):
         self._load_worker.finished.connect(on_thread_finished)
         self._load_worker.start()
     
+    def _refresh_table_only(self):
+        """Atualiza apenas a visualização da tabela sem recarregar dados do banco"""
+        try:
+            print("[REFRESH] Atualizando visualização da tabela (sem recarregar dados)...")
+            self.refresh_table()
+            self.refresh_emitidos_table()
+            print("[REFRESH] Tabelas atualizadas")
+        except Exception as e:
+            print(f"[REFRESH] Erro ao atualizar tabelas: {e}")
+    
     def _clear_date_filters(self):
         """Limpa os filtros de data (volta ao padrão)"""
         try:
@@ -1712,6 +2055,9 @@ class MainWindow(QMainWindow):
         st = (self.status_dd.currentText() or "Todos").lower()
         tp = (self.tipo_dd.currentText() or "Todos").lower().replace('-', '')
         
+        print(f"\n[FILTERED_EMITIDOS] Iniciando filtro...")
+        print(f"[FILTERED_EMITIDOS] Certificado selecionado: {selected_cert if selected_cert else 'TODOS'}")
+        
         # Filtro de data
         date_inicio_filter = None
         date_fim_filter = None
@@ -1799,8 +2145,11 @@ class MainWindow(QMainWindow):
                 
                 # Filtro por certificado selecionado
                 if selected_cert:
+                    print(f"[DEBUG] Aplicando filtro por certificado selecionado: {selected_cert}")
                     where_clauses.append("REPLACE(REPLACE(REPLACE(cnpj_emitente, '.', ''), '/', ''), '-', '') = ?")
                     params.append(normalizar_cnpj(str(selected_cert)))
+                else:
+                    print(f"[DEBUG] Nenhum certificado selecionado - mostrando TODAS as empresas")
                 
                 # Filtro por status
                 if st != "todos":
@@ -1939,11 +2288,17 @@ class MainWindow(QMainWindow):
             
             # Só atualiza se a seleção mudou
             if new_selection != self._selected_cert_cnpj:
+                print(f"\n[CERTIFICADO] Seleção mudou de '{self._selected_cert_cnpj}' para '{new_selection}'")
                 self._selected_cert_cnpj = new_selection
                 self.search_edit.clear()
+                # Atualiza AMBAS as abas
+                print(f"[CERTIFICADO] Atualizando tabela 'Emitidos por terceiros'...")
                 self.refresh_table()
-        except Exception:
-            pass
+                print(f"[CERTIFICADO] Atualizando tabela 'Emitidos pela empresa'...")
+                self.refresh_emitidos_table()
+                print(f"[CERTIFICADO] Ambas as tabelas atualizadas!")
+        except Exception as e:
+            print(f"[CERTIFICADO] Erro ao mudar seleção: {e}")
 
     def _format_date_br(self, date_str: str) -> str:
         """Converte data de AAAA-MM-DD para DD/MM/AAAA."""
@@ -2046,6 +2401,7 @@ class MainWindow(QMainWindow):
             notas_resumo = [
                 nota for nota in self.notes 
                 if (nota.get('xml_status') or '').upper() == 'RESUMO' 
+                and (nota.get('tipo') or '').upper() not in ['CTE', 'CT-E']  # ⛔ Pula CTes (já vêm completos)
                 and not db_nfe.nota_ja_verificada(nota.get('chave'))
             ]
             
@@ -2074,7 +2430,7 @@ class MainWindow(QMainWindow):
             print(f"[AUTO-VERIFICAÇÃO] Buscando XML completo para chave: {chave}")
             
             # Usa a mesma lógica de _buscar_xml_completo mas sem diálogos
-            from modules.sandbox_task import run_task as sandbox_run_task
+            from modules.sandbox_worker import run_task as sandbox_run_task
             from nfe_search import DatabaseManager
             
             db_nfe = DatabaseManager(str(DB_PATH))
@@ -2241,24 +2597,34 @@ class MainWindow(QMainWindow):
         def cell(c: Any) -> QTableWidgetItem:
             return QTableWidgetItem(str(c or ""))
         
+        def limpar_status(status: str) -> str:
+            """Remove código '100 - ' do status para deixar mais limpo"""
+            if status and status.startswith("100 - "):
+                return status[6:]  # Remove '100 - '
+            return status
+        
         xml_status = (it.get("xml_status") or "RESUMO").upper()
         status_nota = (it.get("status") or "").lower()
         
-        # Verifica se a nota está cancelada
-        is_cancelada = 'cancel' in status_nota
+        # Verifica se a nota está cancelada (NF-e ou CT-e)
+        is_cancelada = 'cancelamento' in status_nota or 'cancel' in status_nota
         
         # Define texto e cores baseado no tipo (eventos não aparecem aqui pois são filtrados)
-        if xml_status == "COMPLETO":
-            if is_cancelada:
-                status_text = ""  # Apenas ícone, sem texto
-                bg_color = QColor(255, 220, 220)  # Vermelho claro
-                tooltip_text = "❌ XML Completo - Nota Cancelada"
-                icon_name = 'cancelado.png'
+        # Prioriza status de cancelamento
+        if is_cancelada:
+            status_text = ""  # Apenas ícone, sem texto
+            bg_color = QColor(255, 220, 220)  # Vermelho claro
+            icon_name = 'cancelado.png'
+            # Tooltip diferente se tem XML completo ou só resumo
+            if xml_status == "COMPLETO":
+                tooltip_text = "❌ Nota Cancelada - XML Completo disponível"
             else:
-                status_text = ""  # Apenas ícone, sem texto
-                bg_color = QColor(214, 245, 224)  # Verde claro
-                tooltip_text = "✅ XML Completo disponível"
-                icon_name = 'xml.png'
+                tooltip_text = "❌ Nota Cancelada - Apenas Resumo"
+        elif xml_status == "COMPLETO":
+            status_text = ""  # Apenas ícone, sem texto
+            bg_color = QColor(214, 245, 224)  # Verde claro
+            tooltip_text = "✅ XML Completo disponível"
+            icon_name = 'xml.png'
         else:  # RESUMO
             status_text = ""  # Apenas ícone, sem texto
             bg_color = QColor(235, 235, 235)  # Cinza claro
@@ -2341,8 +2707,10 @@ class MainWindow(QMainWindow):
         c_icms.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
         self.table.setItem(r, 11, c_icms)
         
-        # Coluna Status
-        self.table.setItem(r, 12, cell(it.get("status")))
+        # Coluna Status - remove código "100 - " para deixar mais limpo
+        status_original = it.get("status") or ""
+        status_limpo = limpar_status(status_original)
+        self.table.setItem(r, 12, cell(status_limpo))
         
         self.table.setItem(r, 13, cell(it.get("cfop")))
         self.table.setItem(r, 14, cell(it.get("ncm")))
@@ -2354,32 +2722,49 @@ class MainWindow(QMainWindow):
         def cell(c: Any) -> QTableWidgetItem:
             return QTableWidgetItem(str(c or ""))
         
+        def limpar_status(status: str) -> str:
+            """Remove código '100 - ' do status para deixar mais limpo"""
+            if status and status.startswith("100 - "):
+                return status[6:]  # Remove '100 - '
+            return status
+        
+        # DEBUG: Log SEMPRE no início para confirmar que está sendo chamada
+        numero_nota = str(it.get('numero') or '')
+        if numero_nota in ['29511', '5629031']:
+            print(f"\n[DEBUG ICONE] ========== _populate_emitidos_row CHAMADA para nota {numero_nota} ==========")
+        
         xml_status = (it.get("xml_status") or "RESUMO").upper()
         status_nota = (it.get("status") or "").lower()
         
-        # Verifica se a nota está cancelada
-        is_cancelada = 'cancel' in status_nota
+        # Verifica se a nota está cancelada (NF-e ou CT-e)
+        is_cancelada = 'cancelamento' in status_nota or 'cancel' in status_nota
         
-        # DEBUG: Log quando for a nota 29511
-        if it.get('numero') == '29511':
-            print(f"[DEBUG ICONE] Populando nota 29511:")
+        # DEBUG: Log quando for a nota 29511 ou 5629031
+        if numero_nota in ['29511', '5629031']:
+            print(f"[DEBUG ICONE] Populando nota {numero_nota}:")
             print(f"  xml_status: {xml_status}")
-            print(f"  status_nota (raw): {it.get('status')}")
-            print(f"  status_nota (lower): {status_nota}")
+            print(f"  status_nota (raw): '{it.get('status')}'")
+            print(f"  status_nota (lower): '{status_nota}'")
+            print(f"  'cancelamento' in status_nota: {'cancelamento' in status_nota}")
+            print(f"  'cancel' in status_nota: {'cancel' in status_nota}")
             print(f"  is_cancelada: {is_cancelada}")
         
         # Define texto e cores baseado no tipo
-        if xml_status == "COMPLETO":
-            if is_cancelada:
-                status_text = ""
-                bg_color = QColor(255, 220, 220)  # Vermelho claro
-                tooltip_text = "❌ XML Completo - Nota Cancelada"
-                icon_name = 'cancelado.png'
+        # Prioriza status de cancelamento sobre xml_status
+        if is_cancelada:
+            status_text = ""
+            bg_color = QColor(255, 220, 220)  # Vermelho claro
+            icon_name = 'cancelado.png'
+            # Tooltip diferente se tem XML completo ou só resumo
+            if xml_status == "COMPLETO":
+                tooltip_text = "❌ Nota Cancelada - XML Completo disponível"
             else:
-                status_text = ""
-                bg_color = QColor(214, 245, 224)  # Verde claro
-                tooltip_text = "✅ XML Completo disponível"
-                icon_name = 'xml.png'
+                tooltip_text = "❌ Nota Cancelada - Apenas Resumo"
+        elif xml_status == "COMPLETO":
+            status_text = ""
+            bg_color = QColor(214, 245, 224)  # Verde claro
+            tooltip_text = "✅ XML Completo disponível"
+            icon_name = 'xml.png'
         else:
             status_text = ""
             bg_color = QColor(235, 235, 235)
@@ -2387,9 +2772,10 @@ class MainWindow(QMainWindow):
             icon_name = 'xml.png'
         
         # DEBUG: Log do ícone escolhido
-        if it.get('numero') == '29511':
+        if numero_nota in ['29511', '5629031']:
             print(f"  icon_name escolhido: {icon_name}")
             print(f"  bg_color: {bg_color.name()}")
+            print(f"  tooltip: {tooltip_text}")
         
         c0 = cell(status_text)
         c0.setBackground(QBrush(bg_color))
@@ -2397,13 +2783,22 @@ class MainWindow(QMainWindow):
         c0.setToolTip(tooltip_text)
         try:
             icon_path = BASE_DIR / 'Icone' / icon_name
+            if numero_nota in ['29511', '5629031']:
+                print(f"  icon_path: {icon_path}")
+                print(f"  icon_path.exists(): {icon_path.exists()}")
             if icon_path.exists():
                 icon = QIcon(str(icon_path))
                 c0.setIcon(icon)
+                if numero_nota in ['29511', '5629031']:
+                    print(f"  Ícone setado com sucesso!")
                 # Define tamanho do ícone para melhor centralização
                 self.table_emitidos.setIconSize(QSize(20, 20))
-        except Exception:
-            pass
+            else:
+                if numero_nota in ['29511', '5629031']:
+                    print(f"  ERRO: Arquivo de ícone não existe!")
+        except Exception as e:
+            if numero_nota in ['29511', '5629031']:
+                print(f"  ERRO ao setar ícone: {e}")
         self.table_emitidos.setItem(r, 0, c0)
         
         # Coluna Número - ordenação numérica
@@ -2475,8 +2870,10 @@ class MainWindow(QMainWindow):
         c_icms.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
         self.table_emitidos.setItem(r, 11, c_icms)
         
-        # Coluna Status
-        self.table_emitidos.setItem(r, 12, cell(it.get("status")))
+        # Coluna Status - remove código "100 - " para deixar mais limpo
+        status_original = it.get("status") or ""
+        status_limpo = limpar_status(status_original)
+        self.table_emitidos.setItem(r, 12, cell(status_limpo))
         
         self.table_emitidos.setItem(r, 13, cell(it.get("cfop")))
         self.table_emitidos.setItem(r, 14, cell(it.get("ncm")))
@@ -2641,6 +3038,16 @@ class MainWindow(QMainWindow):
             self.set_status(f"Consulta de status {status_text}", 3000)
         except Exception as e:
             QMessageBox.warning(self, "Erro", f"Não foi possível salvar configuração: {e}")
+    
+    def _set_intervalo_from_menu(self, horas: int):
+        """Define intervalo de busca a partir do menu (sincroniza com SpinBox)."""
+        try:
+            self._save_intervalo_config(horas)
+            if hasattr(self, 'spin_intervalo'):
+                self.spin_intervalo.setValue(horas)
+        except Exception as e:
+            print(f"Erro ao definir intervalo do menu: {e}")
+
 
     def _apply_theme(self):
         # Global stylesheet for a clean modern look
@@ -3499,22 +3906,39 @@ class MainWindow(QMainWindow):
         start_time = time.time()
         print(f"\n[DEBUG PDF] ========== DUPLO CLIQUE ===========")
         print(f"[DEBUG PDF] Linha: {row}, Coluna: {col}")
+        print(f"[DEBUG PDF] Aba ativa: {self.tabs.currentIndex()} (0=Recebidas, 1=Emitidas)")
         
-        # Obtém o item pela linha clicada da lista filtrada
-        flt = self.filtered()
-        item = flt[row] if 0 <= row < len(flt) else None
-        if not item:
-            print(f"[DEBUG PDF] ❌ Item não encontrado")
+        # CORREÇÃO: Pega a chave diretamente da célula da tabela (coluna 16 = "Chave")
+        chave_item = self.table.item(row, 16)
+        if not chave_item:
+            print(f"[DEBUG PDF] ❌ Célula de chave vazia na linha {row}")
             return
         
-        chave = item.get('chave', '')
+        chave = chave_item.text().strip()
         if not chave:
             print(f"[DEBUG PDF] ❌ Chave vazia")
             return
         
-        print(f"[DEBUG PDF] Chave: {chave}")
+        print(f"[DEBUG PDF] Chave da célula: {chave}")
+        
+        # Busca o item correto em self.notes usando a chave
+        item = None
+        for note in self.notes:
+            if note.get('chave') == chave:
+                item = note
+                break
+        
+        if not item:
+            print(f"[DEBUG PDF] ❌ Documento não encontrado no banco com chave: {chave}")
+            return
+        
         print(f"[DEBUG PDF] Informante: {item.get('informante', 'N/A')}")
         print(f"[DEBUG PDF] Tipo: {item.get('tipo', 'N/A')}")
+        # NFe usa nNF/xNome, CTe usa nCT/xNome (remetente)
+        numero = item.get('nNF') or item.get('nCT') or 'N/A'
+        emitente = item.get('xNome') or 'N/A'
+        print(f"[DEBUG PDF] Número: {numero}")
+        print(f"[DEBUG PDF] Emitente: {emitente}")
         
         # OTIMIZAÇÃO 1: Verifica cache primeiro (INSTANTÂNEO)
         print(f"[DEBUG PDF] Etapa 1: Verificando cache...")
@@ -3566,7 +3990,8 @@ class MainWindow(QMainWindow):
                 print(f"[DEBUG PDF] Ano-mês extraído: {year_month}")
                 if year_month:
                     # Busca direta na pasta específica do mês (SEM recursão)
-                    specific_path = DATA_DIR / "xmls" / informante / tipo / year_month / f"{chave}.pdf"
+                    # ESTRUTURA CORRETA: xmls/{CNPJ}/{ANO-MES}/{TIPO}/{CHAVE}.pdf
+                    specific_path = DATA_DIR / "xmls" / informante / year_month / tipo / f"{chave}.pdf"
                     print(f"[DEBUG PDF] Buscando em: {specific_path}")
                     if specific_path.exists():
                         print(f"[DEBUG PDF] ✅ Encontrado na busca direta!")
@@ -3669,7 +4094,6 @@ class MainWindow(QMainWindow):
                                 xml_found = xml_file
                                 print(f"[DEBUG PDF] ✅ XML encontrado por chave no nome: {xml_file}")
                                 break
-                                    break
                     
                     # Busca 4: ÚLTIMO RECURSO - Lê conteúdo dos XMLs (LENTO - só se não achou por nome)
                     if not xml_found and not pdf_found:
@@ -3766,20 +4190,33 @@ class MainWindow(QMainWindow):
         start_time = time.time()
         
         print(f"\n[DEBUG PDF EMITIDOS] ========== DUPLO CLIQUE ===========")
+        print(f"[DEBUG PDF EMITIDOS] Linha: {row}, Coluna: {col}")
         
-        # Obtém o item pela linha clicada da lista filtrada de emitidos
-        flt = self.filtered_emitidos()
-        item = flt[row] if 0 <= row < len(flt) else None
-        if not item:
-            print(f"[DEBUG PDF EMITIDOS] ❌ Item não encontrado na linha {row}")
+        # CORREÇÃO: Pega a chave diretamente da célula da tabela (coluna 16 = "Chave")
+        chave_item = self.table_emitidos.item(row, 16)
+        if not chave_item:
+            print(f"[DEBUG PDF EMITIDOS] ❌ Célula de chave vazia na linha {row}")
             return
         
-        chave = item.get('chave', '')
+        chave = chave_item.text().strip()
         if not chave:
-            print(f"[DEBUG PDF EMITIDOS] ❌ Chave não encontrada no item")
+            print(f"[DEBUG PDF EMITIDOS] ❌ Chave vazia")
             return
         
-        print(f"[DEBUG PDF EMITIDOS] Chave: {chave}")
+        print(f"[DEBUG PDF EMITIDOS] Chave da célula: {chave}")
+        
+        # Busca o item correto na lista de emitidos usando a chave
+        flt = self.filtered_emitidos()
+        item = None
+        for note in flt:
+            if note.get('chave') == chave:
+                item = note
+                break
+        
+        if not item:
+            print(f"[DEBUG PDF EMITIDOS] ❌ Documento não encontrado com chave: {chave}")
+            return
+        
         print(f"[DEBUG PDF EMITIDOS] Informante: {item.get('informante', 'N/A')}")
         print(f"[DEBUG PDF EMITIDOS] Tipo: {item.get('tipo', 'N/A')}")
         
@@ -4288,6 +4725,32 @@ class MainWindow(QMainWindow):
             self._search_in_progress = False
             self.set_status(f"Erro ao iniciar busca automática: {e}", 5000)
     
+    def _executar_busca_agendada(self):
+        """Executa busca agendada diretamente (já passou o intervalo configurado)."""
+        from datetime import datetime
+        
+        try:
+            print("[AUTO-SEARCH] Executando busca agendada")
+            
+            # Marca busca em andamento
+            self._search_in_progress = True
+            
+            # Registra o horário da busca
+            self.db.set_last_search_time(datetime.now().isoformat())
+            
+            # Atualiza status
+            self.set_status("Iniciando busca automática...", 3000)
+            
+            # Inicia a busca
+            QTimer.singleShot(500, self.do_search)
+            
+        except Exception as e:
+            print(f"[DEBUG] Erro em _executar_busca_agendada: {e}")
+            import traceback
+            traceback.print_exc()
+            self._search_in_progress = False
+            self.set_status(f"Erro ao executar busca agendada: {e}", 5000)
+    
     def do_search(self):
         from datetime import datetime, timedelta
         
@@ -4382,9 +4845,9 @@ class MainWindow(QMainWindow):
                 else:
                     self.set_status(f"Próxima busca em {intervalo_horas} horas", 0)
                 
-                # Agenda a próxima busca automaticamente
+                # Agenda a próxima busca automaticamente (executa diretamente sem verificação)
                 delay_ms = int(intervalo_minutos * 60 * 1000)
-                QTimer.singleShot(delay_ms, self._auto_start_search)
+                QTimer.singleShot(delay_ms, self._executar_busca_agendada)
                 
                 return
             
@@ -4421,6 +4884,11 @@ class MainWindow(QMainWindow):
                 # Gera PDFs dos novos XMLs em background
                 print("[INFO] Iniciando geração de PDFs dos novos XMLs...")
                 QTimer.singleShot(1000, self._gerar_pdfs_faltantes)
+                
+                # 🆕 CONSULTA DE EVENTOS após busca SEFAZ (se busca foi bem-sucedida)
+                if res.get("ok"):
+                    print("[PÓS-BUSCA] Iniciando consulta de eventos dos documentos baixados...")
+                    QTimer.singleShot(3000, lambda: self._atualizar_status_apos_busca())
             except Exception as e:
                 import traceback
                 error_msg = f"Erro em on_finished: {str(e)}\n{traceback.format_exc()}"
@@ -4554,8 +5022,12 @@ class MainWindow(QMainWindow):
         # Índice do certificado que teve sucesso (para priorizar nos próximos)
         ultimo_cert_sucesso = 0
         
+        print(f"\n[BUSCA POR CHAVE] Iniciando busca de {len(chaves)} chaves")
+        print(f"[BUSCA POR CHAVE] Certificados disponíveis: {len(certificados)}")
+        
         for idx, chave in enumerate(chaves):
             if progress.wasCanceled():
+                print(f"[BUSCA POR CHAVE] Busca cancelada pelo usuário na chave {idx+1}")
                 break
             
             print(f"\n{'='*80}")
@@ -4568,6 +5040,13 @@ class MainWindow(QMainWindow):
             
             resp_xml = None
             cert_encontrado = None
+            
+            # Detecta tipo do documento pela chave (posição 20-21: modelo)
+            # Modelo 55 = NF-e, Modelo 57 = CT-e
+            modelo = chave[20:22] if len(chave) >= 22 else '55'
+            is_cte = modelo == '57'
+            tipo_doc = 'CT-e' if is_cte else 'NF-e'
+            print(f"[DEBUG] Tipo detectado: {tipo_doc} (modelo={modelo})")
             
             # Extrai UF da chave (primeiros 2 dígitos)
             uf_chave = chave[:2] if len(chave) >= 2 else None
@@ -4599,9 +5078,13 @@ class MainWindow(QMainWindow):
                     
                     svc = NFeService(path, senha, cnpj, cuf)
                     
-                    # Busca o XML da nota
-                    print(f"[DEBUG] Chamando fetch_prot_nfe para chave: {chave}")
-                    resp_xml = svc.fetch_prot_nfe(chave)
+                    # Busca o XML do documento (NF-e ou CT-e)
+                    if is_cte:
+                        print(f"[DEBUG] Chamando fetch_prot_cte para chave: {chave}")
+                        resp_xml = svc.fetch_prot_cte(chave)
+                    else:
+                        print(f"[DEBUG] Chamando fetch_prot_nfe para chave: {chave}")
+                        resp_xml = svc.fetch_prot_nfe(chave)
                     print(f"[DEBUG] Resposta recebida: {resp_xml[:200] if resp_xml else 'None'}...")
                     
                     if resp_xml:
@@ -4647,40 +5130,132 @@ class MainWindow(QMainWindow):
                         tree = etree.fromstring(resp_xml.encode('utf-8') if isinstance(resp_xml, str) else resp_xml)
                         print(f"[DEBUG] XML parseado com sucesso")
                         
-                        # Extrai informações do protocolo
-                        NS = {'nfe': 'http://www.portalfiscal.inf.br/nfe'}
-                        prot = tree.find('.//nfe:protNFe', namespaces=NS)
-                        print(f"[DEBUG] protNFe encontrado: {prot is not None}")
-                        
-                        if prot is not None:
-                            ch = prot.findtext('nfe:infProt/nfe:chNFe', namespaces=NS) or ''
-                            cStat = prot.findtext('nfe:infProt/nfe:cStat', namespaces=NS) or ''
-                            xMotivo = prot.findtext('nfe:infProt/nfe:xMotivo', namespaces=NS) or ''
-                            print(f"[DEBUG] Protocolo: chave={ch}, cStat={cStat}, xMotivo={xMotivo}")
+                        # Extrai informações do protocolo (NF-e ou CT-e)
+                        if is_cte:
+                            # Namespace CT-e
+                            NS = {'cte': 'http://www.portalfiscal.inf.br/cte'}
+                            prot = tree.find('.//cte:protCTe', namespaces=NS)
+                            print(f"[DEBUG] protCTe encontrado: {prot is not None}")
                             
-                            # Salva status
-                            if ch and cStat:
-                                db.set_nf_status(ch, cStat, xMotivo)
-                                print(f"[DEBUG] Status salvo no banco")
-                            
-                            # Se autorizada
-                            if cStat in ['100', '101', '110', '150', '301', '302']:
-                                # Registra no banco usando informante do certificado correto
-                                _, _, _, inf_correto, _ = cert_encontrado
-                                db.registrar_xml(chave, inf_correto)
-                                encontradas += 1
-                                print(f"[SUCCESS] Nota autorizada e registrada com certificado {inf_correto}!")
+                            if prot is not None:
+                                ch = prot.findtext('cte:infProt/cte:chCTe', namespaces=NS) or ''
+                                cStat = prot.findtext('cte:infProt/cte:cStat', namespaces=NS) or ''
+                                xMotivo = prot.findtext('cte:infProt/cte:xMotivo', namespaces=NS) or ''
+                                print(f"[DEBUG] Protocolo CT-e: chave={ch}, cStat={cStat}, xMotivo={xMotivo}")
+                                
+                                # Salva status
+                                if ch and cStat:
+                                    db.set_nf_status(ch, cStat, xMotivo)
+                                    print(f"[DEBUG] Status CT-e salvo no banco")
+                                
+                                # Se autorizado (código 100 = Autorizado)
+                                if cStat in ['100', '101', '110', '150', '301', '302']:
+                                    # Registra no banco usando informante do certificado correto
+                                    cnpj_cert, _, _, inf_correto, _ = cert_encontrado
+                                    db.registrar_xml(chave, inf_correto)
+                                    encontradas += 1
+                                    print(f"[SUCCESS] CT-e autorizado e registrado com certificado {inf_correto}!")
+                                    
+                                    # Salva XML completo do CT-e
+                                    xml_completo = etree.tostring(tree, encoding='utf-8').decode('utf-8')
+                                    salvar_xml_por_certificado(xml_completo, cnpj_cert)
+                                    
+                                    # Processa e salva dados detalhados do CT-e
+                                    try:
+                                        extrair_nota_detalhada(xml_completo, parser, db, chave, inf_correto)
+                                        print(f"[DEBUG] Dados detalhados do CT-e salvos no banco")
+                                    except Exception as e_extract:
+                                        print(f"[AVISO] Erro ao extrair dados detalhados do CT-e: {e_extract}")
+                                else:
+                                    nao_encontradas += 1
+                                    erros.append(f"{chave}: {cStat} - {xMotivo}")
+                                    print(f"[ERRO] CT-e não autorizado: {cStat} - {xMotivo}")
                             else:
+                                # Tenta extrair erro da consulta
+                                cStat = tree.findtext('.//cte:cStat', namespaces=NS) or ''
+                                xMotivo = tree.findtext('.//cte:xMotivo', namespaces=NS) or 'Protocolo CT-e não encontrado'
+                                print(f"[ERRO] protCTe não encontrado. cStat={cStat}, xMotivo={xMotivo}")
                                 nao_encontradas += 1
                                 erros.append(f"{chave}: {cStat} - {xMotivo}")
-                                print(f"[ERRO] Nota não autorizada: {cStat} - {xMotivo}")
                         else:
-                            # Tenta extrair erro da consulta
-                            cStat = tree.findtext('.//nfe:cStat', namespaces=NS) or ''
-                            xMotivo = tree.findtext('.//nfe:xMotivo', namespaces=NS) or 'Protocolo não encontrado'
-                            print(f"[ERRO] protNFe não encontrado. cStat={cStat}, xMotivo={xMotivo}")
-                            nao_encontradas += 1
-                            erros.append(f"{chave}: {cStat} - {xMotivo}")
+                            # Namespace NF-e
+                            NS = {'nfe': 'http://www.portalfiscal.inf.br/nfe'}
+                            prot = tree.find('.//nfe:protNFe', namespaces=NS)
+                            print(f"[DEBUG] protNFe encontrado: {prot is not None}")
+                            
+                            if prot is not None:
+                                ch = prot.findtext('nfe:infProt/nfe:chNFe', namespaces=NS) or ''
+                                cStat = prot.findtext('nfe:infProt/nfe:cStat', namespaces=NS) or ''
+                                xMotivo = prot.findtext('nfe:infProt/nfe:xMotivo', namespaces=NS) or ''
+                                print(f"[DEBUG] Protocolo: chave={ch}, cStat={cStat}, xMotivo={xMotivo}")
+                                
+                                # Salva status
+                                if ch and cStat:
+                                    db.set_nf_status(ch, cStat, xMotivo)
+                                    print(f"[DEBUG] Status salvo no banco")
+                                
+                                # Se autorizada
+                                if cStat in ['100', '101', '110', '150', '301', '302']:
+                                    # Registra no banco usando informante do certificado correto
+                                    cnpj_cert, _, _, inf_correto, _ = cert_encontrado
+                                    db.registrar_xml(chave, inf_correto)
+                                    encontradas += 1
+                                    print(f"[SUCCESS] Nota autorizada e registrada com certificado {inf_correto}!")
+                                    
+                                    # Salva XML de protocolo
+                                    xml_completo = etree.tostring(tree, encoding='utf-8').decode('utf-8')
+                                    
+                                    # Tenta extrair dados básicos da chave (44 dígitos contém informações)
+                                    try:
+                                        # Chave: UF(2) + AAMM(4) + CNPJ(14) + Modelo(2) + Série(3) + Número(9) + Código(9) + DV(1)
+                                        uf_cod = chave[:2]
+                                        ano_mes = chave[2:6]
+                                        cnpj_emit = chave[6:20]
+                                        modelo = chave[20:22]
+                                        serie = chave[22:25]
+                                        numero = chave[25:34]
+                                        
+                                        # Formata CNPJ
+                                        cnpj_formatado = f"{cnpj_emit[:2]}.{cnpj_emit[2:5]}.{cnpj_emit[5:8]}/{cnpj_emit[8:12]}-{cnpj_emit[12:14]}"
+                                        
+                                        # Converte número para int
+                                        numero_int = int(numero)
+                                        
+                                        # Mapa de códigos UF
+                                        uf_map = {'11':'RO','12':'AC','13':'AM','14':'RR','15':'PA','16':'AP','17':'TO',
+                                                 '21':'MA','22':'PI','23':'CE','24':'RN','25':'PB','26':'PE','27':'AL','28':'SE','29':'BA',
+                                                 '31':'MG','32':'ES','33':'RJ','35':'SP','41':'PR','42':'SC','43':'RS',
+                                                 '50':'MS','51':'MT','52':'GO','53':'DF'}
+                                        uf_sigla = uf_map.get(uf_cod, uf_cod)
+                                        
+                                        tipo_doc = 'NFe' if modelo == '55' else 'CTe' if modelo == '57' else 'NFS-e'
+                                        
+                                        print(f"[DEBUG] Extraindo dados da chave: CNPJ={cnpj_emit}, Num={numero_int}, UF={uf_sigla}, Tipo={tipo_doc}")
+                                        
+                                        # Insere/atualiza registro básico em notas_detalhadas
+                                        with db._connect() as conn:
+                                            conn.execute("""
+                                                INSERT OR REPLACE INTO notas_detalhadas 
+                                                (chave, numero, cnpj_emitente, tipo, cuf, informante, xml_status, status)
+                                                VALUES (?, ?, ?, ?, ?, ?, 'RESUMO', ?)
+                                            """, (chave, numero_int, cnpj_emit, tipo_doc, uf_sigla, inf_correto, xMotivo))
+                                            conn.commit()
+                                        
+                                        print(f"[DEBUG] Dados básicos salvos no banco (RESUMO)")
+                                        
+                                    except Exception as e_extract:
+                                        print(f"[AVISO] Erro ao extrair dados básicos da chave: {e_extract}")
+                                else:
+                                    nao_encontradas += 1
+                                    erros.append(f"{chave}: {cStat} - {xMotivo}")
+                                    print(f"[ERRO] Nota não autorizada: {cStat} - {xMotivo}")
+                            else:
+                                # Tenta extrair erro da consulta
+                                cStat = tree.findtext('.//nfe:cStat', namespaces=NS) or ''
+                                xMotivo = tree.findtext('.//nfe:xMotivo', namespaces=NS) or 'Protocolo não encontrado'
+                                print(f"[ERRO] protNFe não encontrado. cStat={cStat}, xMotivo={xMotivo}")
+                                nao_encontradas += 1
+                                erros.append(f"{chave}: {cStat} - {xMotivo}")
                     
                     except Exception as e:
                         print(f"[EXCEPTION] Erro ao processar XML: {e}")
@@ -4696,6 +5271,10 @@ class MainWindow(QMainWindow):
                 nao_encontradas += 1
                 erros.append(f"{chave}: {str(e)}")
         
+        print(f"\n[BUSCA POR CHAVE] Loop finalizado")
+        print(f"[BUSCA POR CHAVE] Encontradas: {encontradas}, Não encontradas: {nao_encontradas}")
+        print(f"[BUSCA POR CHAVE] Total processado: {encontradas + nao_encontradas} de {len(chaves)}")
+        
         progress.setValue(len(chaves))
         
         # Atualiza tabela
@@ -4704,7 +5283,8 @@ class MainWindow(QMainWindow):
         # Mostra resultado
         mensagem = f"Busca concluída!\n\n"
         mensagem += f"✅ Encontradas e salvas: {encontradas}\n"
-        mensagem += f"❌ Não encontradas/erro: {nao_encontradas}"
+        mensagem += f"❌ Não encontradas/erro: {nao_encontradas}\n"
+        mensagem += f"📊 Total processado: {encontradas + nao_encontradas} de {len(chaves)} chaves"
         
         if erros and len(erros) <= 10:
             mensagem += "\n\nErros:\n" + "\n".join(erros[:10])
@@ -5536,62 +6116,18 @@ class MainWindow(QMainWindow):
                     )
                     self.set_status("✅ Busca completa finalizada", 3000)
                     
-                # Atualiza interface
-                self.refresh_all()
-                self._search_worker = None
+                    # Atualiza a interface com os novos dados
+                    self.refresh_all()
+                    
+                    # 🆕 CONSULTA DE EVENTOS após Busca Completa
+                    print("[PÓS-BUSCA COMPLETA] Iniciando consulta de eventos dos documentos baixados...")
+                    QTimer.singleShot(3000, lambda: self._atualizar_status_apos_busca())
             
-            # Conecta sinais
+            # Conecta sinais e inicia worker
             self._search_worker = SearchWorker()
             self._search_worker.progress_line.connect(on_progress)
             self._search_worker.finished_search.connect(on_finished)
             self._search_worker.start()
-            
-        except Exception as e:
-            QMessageBox.critical(self, "Busca Completa", f"Erro: {e}")
-
-    def do_batch_pdf(self):
-        try:
-            root = QFileDialog.getExistingDirectory(self, "Selecionar pasta com XMLs")
-            if not root:
-                return
-            root_path = Path(root)
-            files = list(root_path.rglob('*.xml'))
-            if not files:
-                QMessageBox.information(self, "PDFs em lote", "Nenhum XML encontrado.")
-                return
-            # Sem SearchDialog - usando barra de status
-            total = len(files)
-            self.set_status(f"📄 Gerando PDFs: 0/{total}", 0)
-            
-            erros = 0
-            for idx, f in enumerate(files, start=1):
-                try:
-                    self.set_status(f"📄 Gerando PDFs: {idx}/{total} ({int(idx/total*100)}%)", 0)
-                    QApplication.processEvents()
-                    
-                    xml = f.read_text(encoding='utf-8', errors='ignore')
-                    # detectar tipo simples
-                    low = xml.lower()
-                    if '<infcte' in low:
-                        tipo = 'CTe'
-                    elif '<nfse' in low:
-                        tipo = 'NFS-e'
-                    else:
-                        tipo = 'NFe'
-                    out_path = str(f.with_suffix('.pdf'))
-                    payload: Dict[str, Any] = {"xml": xml, "tipo": tipo, "out_path": out_path, "force_simple_fallback": True}
-                    res = sandbox.run_task("generate_pdf", payload, timeout=240)
-                    if not res.get('ok'):
-                        erros += 1
-                except Exception:
-                    erros += 1
-                    continue
-            
-            msg = f"✅ PDFs gerados: {total - erros}/{total}"
-            if erros > 0:
-                msg += f" ({erros} erros)"
-            self.set_status(msg, 5000)
-            QMessageBox.information(self, "PDFs em lote", msg)
         except Exception as e:
             QMessageBox.critical(self, "PDFs em lote", f"Erro: {e}")
 
@@ -5841,7 +6377,18 @@ class MainWindow(QMainWindow):
     def _check_inatividade(self):
         """Verifica inatividade e inicia sincronização automática"""
         try:
+            # ⛔ DESABILITADO: Consulta de eventos não deve ser automática
+            # A consulta de eventos só deve ocorrer:
+            # 1. Após busca na SEFAZ (distribuição DFe)
+            # 2. Ao clicar no botão "🔄 Atualizar Status"
+            # 3. Ao clicar no botão "Sincronizar Agora"
+            return
+            
             if not hasattr(self, '_ultimo_evento_usuario') or not hasattr(self, '_sync_worker'):
+                return
+            
+            # Se usuário cancelou a sincronização, não inicia automaticamente
+            if self._sync_cancelada_pelo_usuario:
                 return
             
             tempo_inativo = (datetime.now() - self._ultimo_evento_usuario).total_seconds()
@@ -5854,17 +6401,23 @@ class MainWindow(QMainWindow):
     
     def _iniciar_sync_background(self):
         """Inicia sincronização de eventos em background"""
+        print("[SYNC BACKGROUND] Função _iniciar_sync_background() chamada")
         if self._sync_worker:
+            print("[SYNC BACKGROUND] Worker já existe, abortando")
             return
         
         try:
             from PyQt5.QtCore import QThread, pyqtSignal, QObject
         except ImportError:
+            print("[SYNC BACKGROUND] ERRO: Não foi possível importar PyQt5")
             return
         
+        # Usa TODOS os documentos do banco, não apenas os filtrados
         try:
-            docs = self.filtered() if self.tabs.currentIndex() == 0 else self.filtered_emitidos()
+            docs = self.notes  # TODOS os documentos, não apenas os visíveis
+            print(f"[SYNC BACKGROUND] Total de documentos carregados: {len(docs)}")
             if not docs:
+                print("[SYNC BACKGROUND] Nenhum documento encontrado, abortando")
                 return
         except Exception:
             return
@@ -5891,92 +6444,98 @@ class MainWindow(QMainWindow):
             
             def run(self):
                 try:
-                    docs = self.parent.filtered() if self.parent.tabs.currentIndex() == 0 else self.parent.filtered_emitidos()
+                    # Usa TODOS os documentos do banco
+                    docs = self.parent.notes
                     if not docs:
                         self.finished.emit()
                         return
                     
+                    print(f"[SYNC] Total de documentos no banco: {len(docs)}")
+                    
                     total = len(docs)
-                    self.progress.emit(f"Iniciando {total} docs...", 0, total)
+                    self.progress.emit(f"Iniciando sincronização de {total} documentos...", 0, total)
                     
                     # Salva estado inicial
                     primeira_chave = docs[0].get('chave', '') if docs else ''
                     self.parent.db.save_sync_state(primeira_chave, total, 0)
                     
-                    for idx, item in enumerate(docs):
+                    # Extrai chaves dos documentos (pula eventos e já cancelados)
+                    chaves_para_consultar = []
+                    eventos_pulados = 0
+                    cancelados_pulados = 0
+                    
+                    for item in docs:
+                        chave = item.get('chave', '')
+                        xml_status = (item.get('xml_status') or '').upper()
+                        
+                        # Debug: conta eventos
+                        if xml_status == 'EVENTO':
+                            eventos_pulados += 1
+                            continue
+                        
+                        # Pula eventos e documentos já cancelados
+                        if chave and len(chave) == 44:
+                            if self.parent.db.is_chave_cancelada(chave):
+                                cancelados_pulados += 1
+                            else:
+                                chaves_para_consultar.append(chave)
+                    
+                    print(f"[SYNC] Eventos pulados: {eventos_pulados}")
+                    print(f"[SYNC] Já cancelados pulados: {cancelados_pulados}")
+                    print(f"[SYNC] Chaves para consultar: {len(chaves_para_consultar)}")
+                    
+                    if not chaves_para_consultar:
+                        self.progress.emit("Nenhum documento para sincronizar", total, total)
+                        self.finished.emit()
+                        return
+                    
+                    self.progress.emit(f"Sincronizando {len(chaves_para_consultar)} documentos em paralelo...", 0, len(chaves_para_consultar))
+                    
+                    # Usa função paralela otimizada
+                    def progress_callback(atual, total_chaves, chave):
                         if self._cancelado:
-                            break
+                            raise Exception("Cancelado pelo usuário")
                         
                         while self._pausado and not self._cancelado:
                             import time
                             time.sleep(0.5)
                         
-                        if self._cancelado:
-                            break
-                        
-                        chave = item.get('chave', '')
-                        numero = item.get('numero', chave[:10])
-                        
-                        # Pula documentos cancelados
-                        if chave and self.parent.db.is_chave_cancelada(chave):
-                            self.progress.emit(f"Doc {numero} (cancelado - pulado)", idx+1, total)
-                            continue
-                        
-                        self.progress.emit(f"Doc {numero}", idx+1, total)
-                        
-                        try:
-                            informante = item.get('informante', '')
-                            certs = self.parent.db.load_certificates()
-                            cert_uf = next((c for c in certs if c.get('informante') == informante), certs[0] if certs else None)
-                            
-                            if cert_uf and chave and len(chave) == 44:
-                                from nfe_search import NFeService, salvar_xml_por_certificado
-                                from lxml import etree
-                                
-                                service = NFeService(
-                                    cert_path=cert_uf.get('caminho', ''),
-                                    senha=cert_uf.get('senha', ''),
-                                    informante=cert_uf.get('informante', ''),
-                                    cuf=cert_uf.get('cUF_autor', '50')
-                                )
-                                
-                                resposta_xml = service.consultar_eventos_chave(chave)
-                                if resposta_xml:
-                                    root = etree.fromstring(resposta_xml.encode('utf-8'))
-                                    eventos = root.findall('.//{http://www.portalfiscal.inf.br/nfe}retEvento')
-                                    
-                                    for evento in eventos:
-                                        tp_evento = evento.findtext('.//{http://www.portalfiscal.inf.br/nfe}tpEvento')
-                                        cstat = evento.findtext('.//{http://www.portalfiscal.inf.br/nfe}cStat')
-                                        
-                                        if cstat in ['135', '136'] and tp_evento:
-                                            evento_xml_str = etree.tostring(evento, encoding='utf-8').decode('utf-8')
-                                            salvar_xml_por_certificado(evento_xml_str, cert_uf.get('informante'))
-                                            
-                                            # Marca como cancelado para não buscar mais
-                                            if tp_evento == '110111' and cstat == '135':
-                                                self.parent.db.marcar_chave_cancelada(chave, 'Cancelamento de NF-e')
-                                                print(f"[SYNC] Chave {chave[:10]}... marcada como cancelada")
-                                            
-                                            if tp_evento in ['210200', '210210', '210220', '210240']:
-                                                self.parent.db.register_manifestacao(
-                                                    chave, tp_evento, cert_uf.get('informante'),
-                                                    datetime.now().isoformat()
-                                                )
-                        except Exception as e:
-                            print(f"[SYNC] Erro: {e}")
+                        numero = chave[:10]
+                        self.progress.emit(f"Doc {numero}...", atual, total_chaves)
                         
                         # Salva progresso a cada 5 documentos
-                        if (idx + 1) % 5 == 0:
-                            self.parent.db.save_sync_state(chave, total, idx + 1)
-                        
-                        import time
-                        time.sleep(1.5)
+                        if atual % 5 == 0:
+                            self.parent.db.save_sync_state(chave, total_chaves, atual)
+                    
+                    # Chama função otimizada com paralelização (5 workers)
+                    from nfe_search import atualizar_status_notas_lote
+                    certs = self.parent.db.load_certificates()
+                    
+                    stats = atualizar_status_notas_lote(
+                        self.parent.db,
+                        certs,
+                        chaves_para_consultar,
+                        progress_callback,
+                        max_workers=5  # 5 consultas simultâneas
+                    )
                     
                     # Limpa estado ao concluir
                     self.parent.db.clear_sync_state()
+                    
+                    # Mensagem final com estatísticas detalhadas
+                    consultadas = stats.get('consultadas', 0)
+                    canceladas = stats.get('canceladas', 0)
+                    
+                    # Conta quantos documentos de cada tipo foram consultados
+                    nfes_count = sum(1 for ch in chaves_para_consultar if len(ch) == 44 and ch[20:22] == '55')
+                    ctes_count = sum(1 for ch in chaves_para_consultar if len(ch) == 44 and ch[20:22] == '57')
+                    
+                    msg = f"✅ Sincronização concluída! Consultadas: {consultadas} (NF-e: {nfes_count}, CT-e: {ctes_count}) | Canceladas: {canceladas}"
+                    self.progress.emit(msg, len(chaves_para_consultar), len(chaves_para_consultar))
+                    
                     self.finished.emit()
                 except Exception as e:
+                    print(f"[SYNC] Erro: {e}")
                     self.error.emit(str(e))
         
         self._sync_thread = QThread()
@@ -6023,7 +6582,16 @@ class MainWindow(QMainWindow):
             self._sync_worker = None
             self._sync_thread = None
             self._trabalhos_ativos = [t for t in self._trabalhos_ativos if t.get('tipo') != 'sync_eventos']
-            self.statusBar().showMessage("Sincronização concluída!", 5000)
+            
+            # FORÇA recarregar dados do banco
+            print("[SYNC] Recarregando dados do banco...")
+            self.notes = self.db.load_notes(limit=5000)
+            print(f"[SYNC] {len(self.notes)} notas carregadas")
+            
+            # Atualiza tabela para mostrar status atualizados (SEM recarregar dados)
+            self._refresh_table_only()
+            
+            self.statusBar().showMessage("✅ Sincronização concluída!", 5000)
         except Exception:
             pass
     
@@ -6392,8 +6960,8 @@ class GerenciadorTrabalhosDialog(QDialog):
         btn_atualizar.clicked.connect(self._atualizar_lista)
         toolbar_layout.addWidget(btn_atualizar)
         
-        btn_sync = QPushButton("⚡ Sincronizar Agora")
-        btn_sync.setStyleSheet("""
+        self.btn_sync = QPushButton("⚡ Sincronizar Agora")
+        self.btn_sync.setStyleSheet("""
             QPushButton {
                 background-color: #16c60c;
                 color: white;
@@ -6410,8 +6978,30 @@ class GerenciadorTrabalhosDialog(QDialog):
                 background-color: #0e7c0a;
             }
         """)
-        btn_sync.clicked.connect(self._iniciar_sync_manual)
-        toolbar_layout.addWidget(btn_sync)
+        self.btn_sync.clicked.connect(self._iniciar_sync_manual)
+        toolbar_layout.addWidget(self.btn_sync)
+        
+        # Botão Atualizar Status
+        btn_atualizar_status = QPushButton("🔄 Atualizar Status")
+        btn_atualizar_status.setStyleSheet("""
+            QPushButton {
+                background-color: #ff8c00;
+                color: white;
+                border: none;
+                padding: 8px 20px;
+                border-radius: 4px;
+                font-weight: bold;
+                font-size: 11px;
+            }
+            QPushButton:hover {
+                background-color: #ff7400;
+            }
+            QPushButton:pressed {
+                background-color: #e56a00;
+            }
+        """)
+        btn_atualizar_status.clicked.connect(self._atualizar_status_lote)
+        toolbar_layout.addWidget(btn_atualizar_status)
         
         toolbar_layout.addStretch()
         
@@ -6545,9 +7135,146 @@ class GerenciadorTrabalhosDialog(QDialog):
         # Atualização inicial
         self._atualizar_lista()
     
+    def _atualizar_status_lote(self):
+        """Atualiza status de todas as notas consultando eventos na SEFAZ"""
+        # Verifica se já há atualização em andamento
+        if hasattr(self, '_update_worker') and self._update_worker and self._update_worker.isRunning():
+            QMessageBox.warning(self, "Aviso", "Já há uma atualização de status em andamento!")
+            return
+        
+        # Confirma ação
+        reply = QMessageBox.question(
+            self,
+            "Atualizar Status",
+            "Deseja consultar o status atual de TODAS as notas na SEFAZ?\n\n"
+            "⚠️ Esta operação pode demorar alguns minutos dependendo da quantidade de notas.\n\n"
+            "Isso irá detectar:\n"
+            "• Notas canceladas\n"
+            "• Cartas de correção\n"
+            "• Outros eventos",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No
+        )
+        
+        if reply == QMessageBox.No:
+            return
+        
+        # Obtém certificados
+        certs = self.parent_window.db.load_certificates() if self.parent_window else []
+        if not certs:
+            QMessageBox.warning(self, "Erro", "Nenhum certificado configurado!")
+            return
+        
+        # Obtém lista de chaves (apenas notas com status "Autorizado" para otimizar)
+        notas = self.parent_window.notes if self.parent_window else []
+        chaves = []
+        for nota in notas:
+            status = (nota.get('status') or '').lower()  # CORRIGIDO: campo é 'status'
+            chave = nota.get('chave')
+            # Consulta apenas notas "autorizadas" (não consulta já canceladas)
+            if chave and len(chave) == 44 and 'autoriza' in status:
+                chaves.append(chave)
+        
+        if not chaves:
+            QMessageBox.information(self, "Info", "Nenhuma nota autorizada para atualizar.")
+            return
+        
+        # Cria diálogo de progresso
+        progress = QProgressDialog("Consultando status das notas...", "Cancelar", 0, len(chaves), self)
+        progress.setWindowTitle("Atualizando Status")
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setValue(0)
+        
+        # Função de callback para atualizar progresso
+        def progress_callback(current, total, chave):
+            if progress.wasCanceled():
+                raise Exception("Cancelado pelo usuário")
+            progress.setLabelText(f"Consultando {current}/{total}...\nChave: {chave[:15]}...")
+            progress.setValue(current)
+            QApplication.processEvents()
+        
+        # Executa atualização em thread
+        from PyQt5.QtCore import QThread, pyqtSignal
+        
+        class UpdateStatusWorker(QThread):
+            finished = pyqtSignal(dict)
+            error = pyqtSignal(str)
+            
+            def __init__(self, db, certs, chaves, callback):
+                super().__init__()
+                self.db = db
+                self.certs = certs
+                self.chaves = chaves
+                self.callback = callback
+            
+            def run(self):
+                try:
+                    from nfe_search import atualizar_status_notas_lote
+                    stats = atualizar_status_notas_lote(
+                        self.db,
+                        self.certs,
+                        self.chaves,
+                        self.callback
+                    )
+                    self.finished.emit(stats)
+                except Exception as e:
+                    self.error.emit(str(e))
+        
+        def on_finished(stats):
+            progress.close()
+            
+            msg = f"✅ Atualização concluída!\n\n"
+            msg += f"📊 Estatísticas:\n"
+            msg += f"• Notas consultadas: {stats.get('consultadas', 0)}\n"
+            msg += f"• Notas canceladas encontradas: {stats.get('canceladas', 0)}\n"
+            msg += f"• Status atualizados: {stats.get('atualizadas', 0)}\n"
+            msg += f"• Erros: {stats.get('erros', 0)}\n\n"
+            msg += f"A tabela será atualizada automaticamente."
+            
+            QMessageBox.information(self, "Concluído", msg)
+            
+            # Limpa referência ao worker
+            self._update_worker = None
+            
+            # FORÇA recarregar dados do banco
+            if self.parent_window:
+                print("[UPDATE-STATUS] Recarregando dados do banco...")
+                self.parent_window.notes = self.parent_window.db.load_notes(limit=5000)
+                print(f"[UPDATE-STATUS] {len(self.parent_window.notes)} notas carregadas")
+                
+                # Atualiza visualização (SEM recarregar dados novamente)
+                self.parent_window._refresh_table_only()
+        
+        def on_error(error_msg):
+            progress.close()
+            
+            # Limpa referência ao worker
+            self._update_worker = None
+            
+            if "Cancelado" not in error_msg:
+                QMessageBox.warning(self, "Erro", f"Erro ao atualizar status:\n{error_msg}")
+        
+        worker = UpdateStatusWorker(
+            self.parent_window.db,
+            certs,
+            chaves,
+            progress_callback
+        )
+        worker.finished.connect(on_finished)
+        worker.error.connect(on_error)
+        worker.start()
+        
+        # Mantém referência ao worker
+        self._update_worker = worker
+    
     def _iniciar_sync_manual(self):
         """Inicia sincronização manual"""
+        print("[SYNC MANUAL] Botão Sincronizar Agora clicado")
         if self.parent_window and hasattr(self.parent_window, '_iniciar_sync_background'):
+            print("[SYNC MANUAL] Chamando _iniciar_sync_background()")
+            # Reabilita auto-sync quando usuário inicia manualmente
+            self.parent_window._sync_cancelada_pelo_usuario = False
             self.parent_window._iniciar_sync_background()
             QMessageBox.information(
                 self,
@@ -6555,6 +7282,8 @@ class GerenciadorTrabalhosDialog(QDialog):
                 "A sincronização de eventos foi iniciada em segundo plano.\n\n"
                 "Você pode acompanhar o progresso nesta janela."
             )
+        else:
+            print("[SYNC MANUAL] ERRO: parent_window ou _iniciar_sync_background não disponível")
     
     def _atualizar_lista(self):
         """Atualiza a lista de trabalhos"""
@@ -6563,6 +7292,46 @@ class GerenciadorTrabalhosDialog(QDialog):
         
         trabalhos = self.parent_window._trabalhos_ativos
         self.table.setRowCount(len(trabalhos))
+        
+        # Controla visibilidade do botão "Sincronizar Agora"
+        # Esconde se houver sincronização em andamento, mostra caso contrário
+        tem_sync_ativa = any(t.get('tipo') == 'sync_eventos' and t.get('status') == 'Em execução' 
+                             for t in trabalhos)
+        
+        if hasattr(self, 'btn_sync'):
+            self.btn_sync.setEnabled(not tem_sync_ativa)
+            if tem_sync_ativa:
+                self.btn_sync.setStyleSheet("""
+                    QPushButton {
+                        background-color: #cccccc;
+                        color: #666666;
+                        border: none;
+                        padding: 8px 20px;
+                        border-radius: 4px;
+                        font-weight: bold;
+                        font-size: 11px;
+                    }
+                """)
+                self.btn_sync.setText("⚡ Sincronizando...")
+            else:
+                self.btn_sync.setStyleSheet("""
+                    QPushButton {
+                        background-color: #16c60c;
+                        color: white;
+                        border: none;
+                        padding: 8px 20px;
+                        border-radius: 4px;
+                        font-weight: bold;
+                        font-size: 11px;
+                    }
+                    QPushButton:hover {
+                        background-color: #13a10e;
+                    }
+                    QPushButton:pressed {
+                        background-color: #0e7c0a;
+                    }
+                """)
+                self.btn_sync.setText("⚡ Sincronizar Agora")
         
         # Configura altura das linhas
         for i in range(len(trabalhos)):
