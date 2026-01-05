@@ -5112,6 +5112,7 @@ class MainWindow(QMainWindow):
         print(f"    🔍 Procurando XML para chave: {chave}")
         
         # PRIORIDADE 1: Consulta o banco de dados onde o caminho está registrado
+        print(f"    💾 Consultando banco de dados...")
         try:
             with self.db._connect() as conn:
                 cursor = conn.execute(
@@ -5121,22 +5122,32 @@ class MainWindow(QMainWindow):
                 row = cursor.fetchone()
                 if row and row[0]:
                     xml_path = Path(row[0])
+                    print(f"    💾 Caminho encontrado no banco: {xml_path}")
                     if xml_path.exists():
                         print(f"    ✅ XML encontrado no banco: {xml_path}")
                         return xml_path
                     else:
-                        print(f"    ⚠️ Caminho do banco não existe: {xml_path}")
+                        print(f"    ⚠️ Caminho do banco não existe mais: {xml_path}")
+                else:
+                    print(f"    ⚠️ Chave não encontrada no banco de xmls_baixados")
         except Exception as e:
-            print(f"    ⚠️ Erro ao consultar banco: {e}")
+            print(f"    ❌ Erro ao consultar banco: {e}")
+            import traceback
+            traceback.print_exc()
         
         # PRIORIDADE 2: Busca em diretórios estruturados por informante
         # Formato: DATA_DIR/xmls/{informante}/{tipo}/{ano-mes}/{chave}.xml
+        print(f"    📂 DATA_DIR: {DATA_DIR}")
         xmls_dir = DATA_DIR / 'xmls'
         if xmls_dir.exists():
             print(f"    📂 Buscando em estrutura: {xmls_dir}")
+            print(f"    📂 Procurando arquivo: {chave}.xml")
             for xml_file in xmls_dir.rglob(f"{chave}.xml"):
                 print(f"    ✅ Arquivo encontrado: {xml_file}")
                 return xml_file
+            print(f"    ⚠️ Arquivo {chave}.xml não encontrado em {xmls_dir}")
+        else:
+            print(f"    ⚠️ Diretório não existe: {xmls_dir}")
         
         # PRIORIDADE 3: Busca em diretórios legados
         diretorios = [
