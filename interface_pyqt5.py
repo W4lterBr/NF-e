@@ -4992,7 +4992,8 @@ class MainWindow(QMainWindow):
                     break
                 
                 row = row_index.row()
-                chave = self.table.item(row, 1).text() if self.table.item(row, 1) else None
+                # CORREÇÃO: Coluna 15 é "Chave", não coluna 1 (que é "Num")
+                chave = self.table.item(row, 15).text() if self.table.item(row, 15) else None
                 
                 if not chave:
                     print(f"⚠️ Linha {row}: Chave não encontrada na tabela")
