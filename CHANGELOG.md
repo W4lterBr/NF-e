@@ -1,5 +1,56 @@
 # Changelog - BOT Busca NFE
 
+## [1.0.89] - 2026-01-05
+
+### 🐛 Correções de Interface
+
+#### ✅ Ícones de Cancelamento
+- **Corrigido**: Ícone de cancelamento agora aparece corretamente para notas canceladas
+- **Detecção aprimorada**: Verifica `'cancelamento' in status` e `'cancel' in status`
+- **CT-e cancelado**: Agora detecta "Cancelamento de CT-e homologado"
+- **Priorização**: Status cancelado tem prioridade sobre xml_status (COMPLETO/RESUMO)
+
+#### 📝 Tooltips Melhorados
+- **Cancelado + Completo**: "❌ Nota Cancelada - XML Completo disponível"
+- **Cancelado + Resumo**: "❌ Nota Cancelada - Apenas Resumo"
+- **Normal + Completo**: "✅ XML Completo disponível"
+- **Normal + Resumo**: "⚠️ Apenas Resumo - clique para baixar XML completo"
+
+#### 🎨 Status Limpo
+- **Antes**: `100 - Autorizado o uso da NF-e`
+- **Depois**: `Autorizado o uso da NF-e`
+- **Função**: `limpar_status()` remove prefixo "100 - "
+- **Aplicado**: Ambas as tabelas (Emitidos por Terceiros e Emitidos pela Empresa)
+
+### 🔧 Busca por Chave Melhorada
+
+#### ✅ Extração de Dados Básicos da Chave
+- **Problema resolvido**: Notas buscadas por chave não apareciam em "Emitidos pela Empresa"
+- **Solução**: Extrai informações dos 44 dígitos da chave:
+  - CNPJ Emitente (posições 6-20)
+  - Número da nota (posições 25-34)
+  - UF (posições 0-2)
+  - Tipo de documento (55=NF-e, 57=CT-e)
+- **Salva**: Dados básicos em `notas_detalhadas` com `xml_status='RESUMO'`
+- **Benefício**: Notas aparecem na interface mesmo sem XML completo
+
+#### 📊 Estatísticas Aprimoradas
+- **Mensagem final**: Mostra `📊 Total processado: X de Y chaves`
+- **Logs detalhados**: Cada etapa do processo registrada
+
+### 🔄 Sincronização de Certificados
+
+#### ✅ Tabela "Emitidos pela Empresa" Atualiza ao Trocar Certificado
+- **Corrigido**: Ao clicar em certificado, atualiza ambas as tabelas
+- **Função**: `_on_tree_cert_clicked()` agora chama `refresh_emitidos_table()`
+- **Logs**: Mostra quando certificado é trocado e tabelas atualizadas
+
+### 📋 Logs Detalhados
+- `[FILTERED_EMITIDOS]`: Mostra qual certificado está selecionado
+- `[CERTIFICADO]`: Registra troca de seleção e atualização de tabelas
+- `[DEBUG ICONE]`: Detalhes sobre escolha de ícone para cada nota
+- `[BUSCA POR CHAVE]`: Estatísticas de processamento
+
 ## [1.0.86] - 2026-01-05
 
 ### ⚠️ BREAKING CHANGE - Novo Padrão de Arquivamento
