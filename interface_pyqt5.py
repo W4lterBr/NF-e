@@ -450,6 +450,7 @@ class MainWindow(QMainWindow):
         btn_busca = QPushButton("Buscar na SEFAZ"); btn_busca.clicked.connect(self.do_search)
         btn_busca_completa = QPushButton("Busca Completa"); btn_busca_completa.clicked.connect(self.do_busca_completa)
         btn_busca_chave = QPushButton("Busca por chave"); btn_busca_chave.clicked.connect(self.buscar_por_chave)
+        btn_exportar = QPushButton("📤 Exportar"); btn_exportar.clicked.connect(self.abrir_exportacao)
         
         # Seletor de intervalo entre buscas
         from PyQt5.QtWidgets import QSpinBox
@@ -487,6 +488,7 @@ class MainWindow(QMainWindow):
             self.btn_refresh.setIcon(_icon('refresh.png', QStyle.SP_BrowserReload))
             btn_busca.setIcon(_icon('search.png', QStyle.SP_FileDialogContentsView))
             btn_busca_completa.setIcon(_icon('search.png', QStyle.SP_FileDialogContentsView))
+            btn_exportar.setIcon(self.style().standardIcon(QStyle.SP_DialogSaveButton))
         except Exception:
             pass
         t.addWidget(self.search_edit)
@@ -507,6 +509,7 @@ class MainWindow(QMainWindow):
         t.addWidget(btn_busca)
         t.addWidget(btn_busca_completa)
         t.addWidget(btn_busca_chave)
+        t.addWidget(btn_exportar)
         v.addLayout(t)
 
         # Tabs: create a tab widget to host different views (emitidos por terceiros / pela empresa)
@@ -4921,6 +4924,181 @@ class MainWindow(QMainWindow):
             import traceback
             traceback.print_exc()
 
+    def abrir_exportacao(self):
+        """Abre o diálogo de exportação de arquivos."""
+        try:
+            # Verifica se há documentos selecionados na tabela
+            selected_rows = self.table.selectionModel().selectedRows()
+            
+            if not selected_rows:
+                QMessageBox.warning(
+                    self,
+                    "Exportar",
+                    "Selecione pelo menos um documento na tabela para exportar!"
+                )
+                return
+            
+            # Abre diálogo de exportação
+            dialog = ExportDialog(self)
+            if dialog.exec_() == QDialog.Accepted:
+                self._executar_exportacao(dialog.get_opcoes())
+                
+        except Exception as e:
+            QMessageBox.critical(self, "Erro", f"Erro ao abrir exportação: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    def _executar_exportacao(self, opcoes):
+        """Executa a exportação com as opções selecionadas."""
+        from datetime import datetime
+        import shutil
+        
+        try:
+            # Seleciona pasta de destino
+            pasta_destino = QFileDialog.getExistingDirectory(
+                self,
+                "Selecionar pasta de destino para exportação"
+            )
+            
+            if not pasta_destino:
+                return
+            
+            pasta_destino = Path(pasta_destino)
+            
+            # Obtém documentos selecionados
+            selected_rows = self.table.selectionModel().selectedRows()
+            total = len(selected_rows)
+            
+            # Progress dialog
+            progress = QProgressDialog("Exportando arquivos...", "Cancelar", 0, total, self)
+            progress.setWindowTitle("Exportar")
+            progress.setWindowModality(Qt.WindowModal)
+            progress.show()
+            
+            exportados = 0
+            erros = []
+            
+            for idx, row_index in enumerate(selected_rows):
+                if progress.wasCanceled():
+                    break
+                
+                row = row_index.row()
+                chave = self.table.item(row, 1).text() if self.table.item(row, 1) else None
+                
+                if not chave:
+                    continue
+                
+                progress.setLabelText(f"Exportando {idx+1}/{total}...")
+                progress.setValue(idx)
+                
+                try:
+                    # Busca informações do documento no banco
+                    doc = self.db.get_documento_por_chave(chave)
+                    if not doc:
+                        erros.append(f"Documento não encontrado: {chave}")
+                        continue
+                    
+                    # Define nome do arquivo
+                    if opcoes['nome_personalizado']:
+                        # Usa número e nome do documento
+                        numero = doc.get('numero', 'SN')
+                        nome_emit = doc.get('nome_emit', 'Desconhecido')
+                        # Remove caracteres inválidos do nome
+                        nome_emit_limpo = "".join(c for c in nome_emit if c.isalnum() or c in (' ', '-', '_')).strip()
+                        nome_base = f"{numero}_{nome_emit_limpo}"
+                    else:
+                        # Nome padrão (chave de acesso)
+                        nome_base = chave
+                    
+                    # Exporta XML
+                    if opcoes['exportar_xml']:
+                        xml_origem = self._encontrar_arquivo_xml(chave)
+                        if xml_origem and xml_origem.exists():
+                            xml_destino = pasta_destino / f"{nome_base}.xml"
+                            shutil.copy2(xml_origem, xml_destino)
+                        else:
+                            erros.append(f"XML não encontrado: {chave}")
+                    
+                    # Exporta PDF
+                    if opcoes['exportar_pdf']:
+                        pdf_origem = self._encontrar_arquivo_pdf(chave)
+                        if pdf_origem and pdf_origem.exists():
+                            pdf_destino = pasta_destino / f"{nome_base}.pdf"
+                            shutil.copy2(pdf_origem, pdf_destino)
+                        else:
+                            # Tenta gerar PDF se não existe
+                            if opcoes['exportar_xml']:
+                                xml_path = pasta_destino / f"{nome_base}.xml"
+                                if xml_path.exists():
+                                    try:
+                                        from modules.pdf_generator import gerar_pdf_nota
+                                        pdf_destino = pasta_destino / f"{nome_base}.pdf"
+                                        gerar_pdf_nota(str(xml_path), str(pdf_destino))
+                                    except:
+                                        erros.append(f"Erro ao gerar PDF: {chave}")
+                            else:
+                                erros.append(f"PDF não encontrado: {chave}")
+                    
+                    exportados += 1
+                    
+                except Exception as e:
+                    erros.append(f"{chave}: {str(e)}")
+            
+            progress.setValue(total)
+            
+            # Resultado
+            mensagem = f"Exportação concluída!\n\n"
+            mensagem += f"✅ Arquivos exportados: {exportados}\n"
+            mensagem += f"📁 Destino: {pasta_destino}\n"
+            
+            if erros:
+                mensagem += f"\n❌ Erros: {len(erros)}"
+                if len(erros) <= 5:
+                    mensagem += "\n\n" + "\n".join(erros[:5])
+            
+            QMessageBox.information(self, "Exportar", mensagem)
+            
+        except Exception as e:
+            QMessageBox.critical(self, "Erro", f"Erro na exportação: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    def _encontrar_arquivo_xml(self, chave):
+        """Encontra o arquivo XML de uma chave de acesso."""
+        # Tenta diversos diretórios
+        diretorios = [
+            BASE_DIR / 'xmls_chave',
+            BASE_DIR / 'xml_extraidos',
+            BASE_DIR / 'xml_NFs',
+            BASE_DIR / 'xmls',
+        ]
+        
+        for diretorio in diretorios:
+            if diretorio.exists():
+                # Procura recursivamente
+                for xml_file in diretorio.rglob(f"*{chave}*.xml"):
+                    return xml_file
+        
+        return None
+    
+    def _encontrar_arquivo_pdf(self, chave):
+        """Encontra o arquivo PDF de uma chave de acesso."""
+        # Tenta diversos diretórios
+        diretorios = [
+            BASE_DIR / 'xmls_chave',
+            BASE_DIR / 'xml_extraidos',
+            BASE_DIR / 'xml_NFs',
+            BASE_DIR / 'xmls',
+        ]
+        
+        for diretorio in diretorios:
+            if diretorio.exists():
+                # Procura recursivamente
+                for pdf_file in diretorio.rglob(f"*{chave}*.pdf"):
+                    return pdf_file
+        
+        return None
+
     def do_busca_completa(self):
         """Busca completa: reseta NSU para 0 e busca todos os XMLs da SEFAZ."""
         from datetime import datetime, timedelta
@@ -8181,6 +8359,144 @@ class AutofillWorker(QThread):
                 self._emit(f"[Autofill] Erro: {e}")
             except Exception:
                 pass
+
+
+class ExportDialog(QDialog):
+    """Diálogo para configurar opções de exportação de arquivos"""
+    
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("📤 Exportar Arquivos")
+        self.resize(500, 400)
+        
+        # Estilo moderno
+        self.setStyleSheet("""
+            QDialog {
+                background-color: #f8f9fa;
+            }
+            QGroupBox {
+                font-weight: bold;
+                border: 2px solid #ddd;
+                border-radius: 8px;
+                margin-top: 12px;
+                padding-top: 15px;
+                background-color: white;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 15px;
+                padding: 0 8px;
+                color: #2196F3;
+                font-size: 13px;
+            }
+            QLabel {
+                font-size: 11px;
+            }
+            QRadioButton, QCheckBox {
+                font-size: 11px;
+                padding: 5px;
+            }
+            QPushButton {
+                padding: 10px 20px;
+                border: none;
+                border-radius: 5px;
+                font-weight: bold;
+                font-size: 12px;
+            }
+            QPushButton#btn_exportar {
+                background-color: #4CAF50;
+                color: white;
+            }
+            QPushButton#btn_exportar:hover {
+                background-color: #45a049;
+            }
+            QPushButton#btn_cancelar {
+                background-color: #f44336;
+                color: white;
+            }
+            QPushButton#btn_cancelar:hover {
+                background-color: #da190b;
+            }
+        """)
+        
+        layout = QVBoxLayout()
+        layout.setSpacing(15)
+        layout.setContentsMargins(20, 20, 20, 20)
+        
+        # Título
+        titulo = QLabel("Selecione as opções de exportação:")
+        titulo.setStyleSheet("font-size: 14px; font-weight: bold; color: #333; margin-bottom: 10px;")
+        layout.addWidget(titulo)
+        
+        # Grupo: Tipo de arquivo
+        grupo_tipo = QGroupBox("📁 Tipo de Arquivo")
+        layout_tipo = QVBoxLayout()
+        
+        self.radio_xml = QRadioButton("Exportar apenas XML")
+        self.radio_pdf = QRadioButton("Exportar apenas PDF")
+        self.radio_ambos = QRadioButton("Exportar PDF e XML")
+        self.radio_ambos.setChecked(True)  # Padrão
+        
+        layout_tipo.addWidget(self.radio_xml)
+        layout_tipo.addWidget(self.radio_pdf)
+        layout_tipo.addWidget(self.radio_ambos)
+        grupo_tipo.setLayout(layout_tipo)
+        layout.addWidget(grupo_tipo)
+        
+        # Grupo: Nomenclatura
+        grupo_nome = QGroupBox("📝 Nomenclatura dos Arquivos")
+        layout_nome = QVBoxLayout()
+        
+        self.radio_nome_padrao = QRadioButton("Padrão (Chave de Acesso)")
+        self.radio_nome_personalizado = QRadioButton("Personalizado (Número + Nome do Documento)")
+        self.radio_nome_padrao.setChecked(True)  # Padrão
+        
+        # Explicação
+        label_explicacao = QLabel(
+            "• Padrão: Arquivo será salvo com a chave de acesso completa\n"
+            "  Exemplo: 35210112345678000190550010000123451234567890.xml\n\n"
+            "• Personalizado: Arquivo será salvo com número e nome\n"
+            "  Exemplo: 123456_Nome_da_Empresa.xml"
+        )
+        label_explicacao.setStyleSheet("font-size: 10px; color: #666; padding: 10px; background: #f0f0f0; border-radius: 5px;")
+        label_explicacao.setWordWrap(True)
+        
+        layout_nome.addWidget(self.radio_nome_padrao)
+        layout_nome.addWidget(self.radio_nome_personalizado)
+        layout_nome.addWidget(label_explicacao)
+        grupo_nome.setLayout(layout_nome)
+        layout.addWidget(grupo_nome)
+        
+        # Espaçador
+        layout.addStretch()
+        
+        # Botões
+        btn_layout = QHBoxLayout()
+        btn_layout.addStretch()
+        
+        btn_exportar = QPushButton("✅ Exportar")
+        btn_exportar.setObjectName("btn_exportar")
+        btn_exportar.clicked.connect(self.accept)
+        btn_exportar.setMinimumWidth(120)
+        
+        btn_cancelar = QPushButton("❌ Cancelar")
+        btn_cancelar.setObjectName("btn_cancelar")
+        btn_cancelar.clicked.connect(self.reject)
+        btn_cancelar.setMinimumWidth(120)
+        
+        btn_layout.addWidget(btn_exportar)
+        btn_layout.addWidget(btn_cancelar)
+        layout.addLayout(btn_layout)
+        
+        self.setLayout(layout)
+    
+    def get_opcoes(self):
+        """Retorna as opções selecionadas pelo usuário"""
+        return {
+            'exportar_xml': self.radio_xml.isChecked() or self.radio_ambos.isChecked(),
+            'exportar_pdf': self.radio_pdf.isChecked() or self.radio_ambos.isChecked(),
+            'nome_personalizado': self.radio_nome_personalizado.isChecked()
+        }
 
 
 class StorageConfigDialog(QDialog):

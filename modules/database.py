@@ -437,6 +437,22 @@ class DatabaseManager:
         except Exception:
             return False
     
+    def get_documento_por_chave(self, chave: str) -> Optional[Dict[str, Any]]:
+        """Busca documento completo por chave de acesso."""
+        try:
+            with self._connect() as conn:
+                conn.row_factory = sqlite3.Row
+                cursor = conn.execute(
+                    "SELECT * FROM notas_detalhadas WHERE chave = ?",
+                    (chave,)
+                )
+                row = cursor.fetchone()
+                if row:
+                    return dict(row)
+                return None
+        except Exception:
+            return None
+    
     def register_xml_download(self, chave: str, caminho: str, cnpj_cpf: str = "") -> bool:
         """Register downloaded XML in xmls_baixados table."""
         try:
