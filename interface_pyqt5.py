@@ -4954,6 +4954,11 @@ class MainWindow(QMainWindow):
         import shutil
         
         try:
+            print("\n" + "="*60)
+            print("🔍 INICIANDO EXPORTAÇÃO - DEBUG")
+            print("="*60)
+            print(f"Opções selecionadas: {opcoes}")
+            
             # Seleciona pasta de destino
             pasta_destino = QFileDialog.getExistingDirectory(
                 self,
@@ -4961,13 +4966,16 @@ class MainWindow(QMainWindow):
             )
             
             if not pasta_destino:
+                print("❌ Usuário cancelou seleção de pasta")
                 return
             
             pasta_destino = Path(pasta_destino)
+            print(f"📁 Pasta destino: {pasta_destino}")
             
             # Obtém documentos selecionados
             selected_rows = self.table.selectionModel().selectedRows()
             total = len(selected_rows)
+            print(f"📋 Total de documentos selecionados: {total}")
             
             # Progress dialog
             progress = QProgressDialog("Exportando arquivos...", "Cancelar", 0, total, self)
@@ -4980,71 +4988,119 @@ class MainWindow(QMainWindow):
             
             for idx, row_index in enumerate(selected_rows):
                 if progress.wasCanceled():
+                    print("⚠️ Exportação cancelada pelo usuário")
                     break
                 
                 row = row_index.row()
                 chave = self.table.item(row, 1).text() if self.table.item(row, 1) else None
                 
                 if not chave:
+                    print(f"⚠️ Linha {row}: Chave não encontrada na tabela")
                     continue
+                
+                print(f"\n📄 [{idx+1}/{total}] Processando chave: {chave}")
                 
                 progress.setLabelText(f"Exportando {idx+1}/{total}...")
                 progress.setValue(idx)
                 
                 try:
                     # Busca informações do documento no banco
+                    print(f"  🔍 Buscando documento no banco...")
                     doc = self.db.get_documento_por_chave(chave)
+                    
                     if not doc:
-                        erros.append(f"Documento não encontrado: {chave}")
+                        erro_msg = f"Documento não encontrado no banco: {chave}"
+                        print(f"  ❌ {erro_msg}")
+                        erros.append(erro_msg)
                         continue
+                    
+                    print(f"  ✅ Documento encontrado: Número={doc.get('numero')}, Emitente={doc.get('nome_emitente')}")
                     
                     # Define nome do arquivo
                     if opcoes['nome_personalizado']:
                         # Usa número e nome do documento
                         numero = doc.get('numero', 'SN')
-                        nome_emit = doc.get('nome_emit', 'Desconhecido')
+                        nome_emit = doc.get('nome_emitente', 'Desconhecido')
                         # Remove caracteres inválidos do nome
                         nome_emit_limpo = "".join(c for c in nome_emit if c.isalnum() or c in (' ', '-', '_')).strip()
                         nome_base = f"{numero}_{nome_emit_limpo}"
+                        print(f"  📝 Nome personalizado: {nome_base}")
                     else:
                         # Nome padrão (chave de acesso)
                         nome_base = chave
+                        print(f"  📝 Nome padrão (chave): {nome_base}")
+                    
+                    sucesso_xml = False
+                    sucesso_pdf = False
                     
                     # Exporta XML
                     if opcoes['exportar_xml']:
+                        print(f"  🔍 Procurando arquivo XML...")
                         xml_origem = self._encontrar_arquivo_xml(chave)
+                        
                         if xml_origem and xml_origem.exists():
                             xml_destino = pasta_destino / f"{nome_base}.xml"
+                            print(f"  ✅ XML encontrado: {xml_origem}")
+                            print(f"  📤 Copiando para: {xml_destino}")
                             shutil.copy2(xml_origem, xml_destino)
+                            sucesso_xml = True
                         else:
-                            erros.append(f"XML não encontrado: {chave}")
+                            erro_msg = f"XML não encontrado: {chave}"
+                            print(f"  ❌ {erro_msg}")
+                            erros.append(erro_msg)
                     
                     # Exporta PDF
                     if opcoes['exportar_pdf']:
+                        print(f"  🔍 Procurando arquivo PDF...")
                         pdf_origem = self._encontrar_arquivo_pdf(chave)
+                        
                         if pdf_origem and pdf_origem.exists():
                             pdf_destino = pasta_destino / f"{nome_base}.pdf"
+                            print(f"  ✅ PDF encontrado: {pdf_origem}")
+                            print(f"  📤 Copiando para: {pdf_destino}")
                             shutil.copy2(pdf_origem, pdf_destino)
+                            sucesso_pdf = True
                         else:
+                            print(f"  ⚠️ PDF não encontrado, tentando gerar...")
                             # Tenta gerar PDF se não existe
-                            if opcoes['exportar_xml']:
+                            if opcoes['exportar_xml'] and sucesso_xml:
                                 xml_path = pasta_destino / f"{nome_base}.xml"
                                 if xml_path.exists():
                                     try:
                                         from modules.pdf_generator import gerar_pdf_nota
                                         pdf_destino = pasta_destino / f"{nome_base}.pdf"
+                                        print(f"  🔧 Gerando PDF: {pdf_destino}")
                                         gerar_pdf_nota(str(xml_path), str(pdf_destino))
-                                    except:
-                                        erros.append(f"Erro ao gerar PDF: {chave}")
+                                        sucesso_pdf = True
+                                        print(f"  ✅ PDF gerado com sucesso")
+                                    except Exception as e:
+                                        erro_msg = f"Erro ao gerar PDF: {chave} - {e}"
+                                        print(f"  ❌ {erro_msg}")
+                                        erros.append(erro_msg)
                             else:
-                                erros.append(f"PDF não encontrado: {chave}")
+                                erro_msg = f"PDF não encontrado: {chave}"
+                                print(f"  ❌ {erro_msg}")
+                                erros.append(erro_msg)
                     
-                    exportados += 1
+                    if sucesso_xml or sucesso_pdf:
+                        exportados += 1
+                        print(f"  ✅ Exportado com sucesso!")
                     
                 except Exception as e:
-                    erros.append(f"{chave}: {str(e)}")
+                    erro_msg = f"{chave}: {str(e)}"
+                    print(f"  ❌ ERRO: {erro_msg}")
+                    import traceback
+                    traceback.print_exc()
+                    erros.append(erro_msg)
             
             progress.setValue(total)
+            
+            print("\n" + "="*60)
+            print("📊 RESUMO DA EXPORTAÇÃO")
+            print("="*60)
+            print(f"✅ Arquivos exportados: {exportados}")
+            print(f"❌ Erros: {len(erros)}")
+            print("="*60 + "\n")
             
             # Resultado
             mensagem = f"Exportação concluída!\n\n"
@@ -5055,6 +5111,9 @@ class MainWindow(QMainWindow):
                 mensagem += f"\n❌ Erros: {len(erros)}"
                 if len(erros) <= 5:
                     mensagem += "\n\n" + "\n".join(erros[:5])
+                else:
+                    mensagem += f"\n\nPrimeiros 5 erros:\n" + "\n".join(erros[:5])
+                    mensagem += f"\n\n(Veja o console para lista completa)"
             
             QMessageBox.information(self, "Exportar", mensagem)
             
@@ -5065,6 +5124,8 @@ class MainWindow(QMainWindow):
     
     def _encontrar_arquivo_xml(self, chave):
         """Encontra o arquivo XML de uma chave de acesso."""
+        print(f"    🔍 Procurando XML para chave: {chave}")
+        
         # Tenta diversos diretórios
         diretorios = [
             BASE_DIR / 'xmls_chave',
@@ -5075,14 +5136,21 @@ class MainWindow(QMainWindow):
         
         for diretorio in diretorios:
             if diretorio.exists():
+                print(f"    📂 Verificando diretório: {diretorio}")
                 # Procura recursivamente
                 for xml_file in diretorio.rglob(f"*{chave}*.xml"):
+                    print(f"    ✅ Arquivo encontrado: {xml_file}")
                     return xml_file
+            else:
+                print(f"    ⚠️ Diretório não existe: {diretorio}")
         
+        print(f"    ❌ XML não encontrado em nenhum diretório")
         return None
     
     def _encontrar_arquivo_pdf(self, chave):
         """Encontra o arquivo PDF de uma chave de acesso."""
+        print(f"    🔍 Procurando PDF para chave: {chave}")
+        
         # Tenta diversos diretórios
         diretorios = [
             BASE_DIR / 'xmls_chave',
@@ -5093,10 +5161,15 @@ class MainWindow(QMainWindow):
         
         for diretorio in diretorios:
             if diretorio.exists():
+                print(f"    📂 Verificando diretório: {diretorio}")
                 # Procura recursivamente
                 for pdf_file in diretorio.rglob(f"*{chave}*.pdf"):
+                    print(f"    ✅ Arquivo encontrado: {pdf_file}")
                     return pdf_file
+            else:
+                print(f"    ⚠️ Diretório não existe: {diretorio}")
         
+        print(f"    ❌ PDF não encontrado em nenhum diretório")
         return None
 
     def do_busca_completa(self):
