@@ -1224,6 +1224,12 @@ class DatabaseManager:
 
     def set_last_nsu_cte(self, informante, nsu):
         """Atualiza último NSU processado de CT-e para o informante"""
+        # ⚠️ VALIDAÇÃO DE SEGURANÇA: informante deve ser CNPJ/CPF (números), nunca senha!
+        if not informante or not str(informante).replace('.', '').replace('-', '').replace('/', '').isdigit():
+            logger.error(f"🚨 SEGURANÇA: Tentativa de salvar valor inválido como informante NSU CT-e: {informante[:20] if informante else 'None'}...")
+            logger.error(f"   NSU CT-e não será salvo para evitar corrupção do banco de dados!")
+            return
+        
         with self._connect() as conn:
             conn.execute(
                 "INSERT OR REPLACE INTO nsu_cte (informante,ult_nsu) VALUES (?,?)",

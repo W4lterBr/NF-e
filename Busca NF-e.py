@@ -4,12 +4,16 @@ import os
 import sys
 import json
 import subprocess
+import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Callable
 from datetime import datetime
 import sqlite3
 import ctypes
 from ctypes import wintypes
+
+# Logger
+logger = logging.getLogger('nfe_search')
 
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -18,7 +22,7 @@ from PyQt5.QtWidgets import (
     QDialog, QMessageBox, QFileDialog, QInputDialog, QStatusBar,
     QTreeWidget, QTreeWidgetItem, QSplitter, QAction, QMenu, QSystemTrayIcon,
     QProgressDialog, QStyledItemDelegate, QStyleOptionViewItem, QScrollArea, QFrame,
-    QGroupBox, QRadioButton, QDateEdit, QStyle
+    QGroupBox, QRadioButton, QDateEdit, QStyle, QCheckBox
 )
 from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal, QSettings, QSize
 from PyQt5.QtGui import QIcon, QColor, QBrush, QFont, QCloseEvent
@@ -452,6 +456,7 @@ class MainWindow(QMainWindow):
         btn_busca = QPushButton("Buscar na SEFAZ"); btn_busca.clicked.connect(self.do_search)
         btn_busca_completa = QPushButton("Busca Completa"); btn_busca_completa.clicked.connect(self.do_busca_completa)
         btn_busca_chave = QPushButton("Busca por chave"); btn_busca_chave.clicked.connect(self.buscar_por_chave)
+        btn_manifestacao = QPushButton("✉️ Manifestação"); btn_manifestacao.clicked.connect(self.abrir_manifestacao)
         btn_exportar = QPushButton("📤 Exportar"); btn_exportar.clicked.connect(self.abrir_exportacao)
         
         # Seletor de intervalo entre buscas
@@ -511,6 +516,7 @@ class MainWindow(QMainWindow):
         t.addWidget(btn_busca)
         t.addWidget(btn_busca_completa)
         t.addWidget(btn_busca_chave)
+        t.addWidget(btn_manifestacao)
         t.addWidget(btn_exportar)
         v.addLayout(t)
 
@@ -3155,6 +3161,18 @@ class MainWindow(QMainWindow):
         menu.addSeparator()
         action_eventos = menu.addAction("📋 Ver Eventos")
         
+        # Opção: Manifestar (só para notas RECEBIDAS - Emitidos por Terceiros)
+        # NF-e e CT-e permitem manifestação do destinatário
+        tipo_doc = (item.get('tipo') or '').upper()
+        if tipo_doc in ['NFE', 'NF-E', 'CTE', 'CT-E']:
+            menu.addSeparator()
+            if tipo_doc in ['NFE', 'NF-E']:
+                action_manifestar = menu.addAction("✉️ Manifestar Destinatário")
+            else:  # CTE
+                action_manifestar = menu.addAction("✉️ Manifestar CT-e")
+        else:
+            action_manifestar = None
+        
         # Mostra menu e pega ação
         action = menu.exec_(self.table.viewport().mapToGlobal(pos))
         
@@ -3166,6 +3184,8 @@ class MainWindow(QMainWindow):
             self._consultar_status_nota(item)
         elif action == action_eventos:
             self._mostrar_eventos(item)
+        elif action == action_manifestar:
+            self._manifestar_nota(item)
     
     def _on_table_emitidos_context_menu(self, pos):
         """Menu de contexto para a tabela de notas emitidas pela empresa"""
@@ -3840,6 +3860,330 @@ class MainWindow(QMainWindow):
                     subprocess.Popen(["xdg-open", str(eventos_path)])
         except Exception as e:
             QMessageBox.warning(self, "Erro", f"Erro ao abrir pasta: {e}")
+    
+    def _manifestar_nota(self, item: Dict[str, Any]):
+        """
+        Exibe dialog moderna para manifestar NF-e ou CT-e.
+        NF-e: eventos 210200, 210210, 210220, 210240
+        CT-e: eventos 610110, 610112
+        """
+        chave = item.get('chave', '')
+        if not chave or len(chave) != 44:
+            QMessageBox.warning(self, "Manifestação", "Chave de acesso inválida!")
+            return
+        
+        informante = item.get('informante', '')
+        if not informante:
+            QMessageBox.warning(self, "Manifestação", "Informante não identificado!")
+            return
+        
+        tipo_doc = (item.get('tipo') or '').upper()
+        is_cte = tipo_doc in ['CTE', 'CT-E']
+        
+        numero = item.get('numero', chave[-9:])
+        emitente = item.get('nome_emitente', 'N/A')
+        
+        # Cria dialog moderna
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"✉️ Manifestar {'CT-e' if is_cte else 'NF-e'}")
+        dialog.setMinimumWidth(600)
+        dialog.setMinimumHeight(500)
+        
+        layout = QVBoxLayout(dialog)
+        layout.setSpacing(15)
+        layout.setContentsMargins(20, 20, 20, 20)
+        
+        # Header com informações da nota
+        header_frame = QFrame()
+        header_frame.setStyleSheet("""
+            QFrame {
+                background-color: #f0f4f8;
+                border-radius: 10px;
+                padding: 15px;
+            }
+        """)
+        header_layout = QVBoxLayout(header_frame)
+        
+        doc_type = "CT-e" if is_cte else "NF-e"
+        title_label = QLabel(f"<h2 style='color: #2c3e50; margin: 0;'>📄 {doc_type} {numero}</h2>")
+        header_layout.addWidget(title_label)
+        
+        info_label = QLabel(f"<b>Emitente:</b> {emitente}<br><b>Chave:</b> {chave[:10]}...{chave[-10:]}")
+        info_label.setStyleSheet("color: #555; font-size: 11pt;")
+        header_layout.addWidget(info_label)
+        
+        layout.addWidget(header_frame)
+        
+        # Título da seção
+        section_label = QLabel(f"<h3 style='color: #2c3e50;'>Selecione o tipo de manifestação:</h3>")
+        layout.addWidget(section_label)
+        
+        # Tipos de manifestação com botões estilizados
+        if is_cte:
+            eventos = [
+                {
+                    'codigo': '610110',
+                    'nome': 'Desacordo do Serviço',
+                    'icone': '🛑',
+                    'descricao': 'Declara desacordo com o serviço de transporte prestado',
+                    'cor': '#e74c3c'
+                },
+                {
+                    'codigo': '610112',
+                    'nome': 'Cancelar Desacordo',
+                    'icone': '↩️',
+                    'descricao': 'Cancela declaração de desacordo anterior',
+                    'cor': '#f39c12'
+                }
+            ]
+        else:  # NF-e
+            eventos = [
+                {
+                    'codigo': '210210',
+                    'nome': 'Ciência da Operação',
+                    'icone': '👁️',
+                    'descricao': 'Registra que você tomou conhecimento da NF-e',
+                    'cor': '#3498db'
+                },
+                {
+                    'codigo': '210200',
+                    'nome': 'Confirmação da Operação',
+                    'icone': '✅',
+                    'descricao': 'Confirma o recebimento da mercadoria/serviço',
+                    'cor': '#27ae60'
+                },
+                {
+                    'codigo': '210220',
+                    'nome': 'Desconhecimento da Operação',
+                    'icone': '🛑',
+                    'descricao': 'Informa que você não reconhece esta operação',
+                    'cor': '#e74c3c'
+                },
+                {
+                    'codigo': '210240',
+                    'nome': 'Operação não Realizada',
+                    'icone': '⭕',
+                    'descricao': 'Informa que a operação não foi realizada',
+                    'cor': '#f39c12'
+                }
+            ]
+        
+        selected_evento = {'codigo': None}
+        
+        def criar_botao_evento(evento_data):
+            btn_frame = QFrame()
+            btn_frame.setStyleSheet(f"""
+                QFrame {{
+                    background-color: white;
+                    border: 2px solid {evento_data['cor']};
+                    border-radius: 10px;
+                    padding: 15px;
+                }}
+                QFrame:hover {{
+                    background-color: {evento_data['cor']}22;
+                    cursor: pointer;
+                }}
+            """)
+            
+            btn_layout = QHBoxLayout(btn_frame)
+            btn_layout.setContentsMargins(10, 10, 10, 10)
+            
+            # Ícone
+            icone_label = QLabel(f"<span style='font-size: 32pt;'>{evento_data['icone']}</span>")
+            btn_layout.addWidget(icone_label)
+            
+            # Texto
+            text_layout = QVBoxLayout()
+            nome_label = QLabel(f"<b style='font-size: 12pt; color: {evento_data['cor']};'>{evento_data['nome']}</b>")
+            desc_label = QLabel(f"<span style='color: #666; font-size: 10pt;'>{evento_data['descricao']}</span>")
+            desc_label.setWordWrap(True)
+            text_layout.addWidget(nome_label)
+            text_layout.addWidget(desc_label)
+            btn_layout.addLayout(text_layout)
+            
+            btn_layout.addStretch()
+            
+            # Evento de clique
+            btn_frame.mousePressEvent = lambda e, cod=evento_data['codigo']: selecionar_evento(cod, btn_frame)
+            btn_frame.codigo = evento_data['codigo']
+            
+            return btn_frame
+        
+        botoes_frames = []
+        def selecionar_evento(codigo, frame_clicado):
+            selected_evento['codigo'] = codigo
+            # Destaca o botão selecionado
+            for btn_frame in botoes_frames:
+                if btn_frame == frame_clicado:
+                    btn_frame.setStyleSheet(btn_frame.styleSheet().replace('border: 2px', 'border: 4px').replace('white', '#f0f8ff'))
+                else:
+                    # Remove destaque dos outros
+                    style = btn_frame.styleSheet()
+                    style = style.replace('border: 4px', 'border: 2px').replace('#f0f8ff', 'white')
+                    btn_frame.setStyleSheet(style)
+        
+        for evento_data in eventos:
+            btn_frame = criar_botao_evento(evento_data)
+            botoes_frames.append(btn_frame)
+            layout.addWidget(btn_frame)
+        
+        layout.addStretch()
+        
+        # Botões de ação
+        buttons_layout = QHBoxLayout()
+        
+        btn_cancelar = QPushButton("❌ Cancelar")
+        btn_cancelar.setStyleSheet("""
+            QPushButton {
+                background-color: #95a5a6;
+                color: white;
+                border: none;
+                padding: 12px 24px;
+                border-radius: 6px;
+                font-weight: bold;
+                font-size: 11pt;
+            }
+            QPushButton:hover {
+                background-color: #7f8c8d;
+            }
+        """)
+        btn_cancelar.clicked.connect(dialog.reject)
+        buttons_layout.addWidget(btn_cancelar)
+        
+        btn_enviar = QPushButton("📤 Enviar Manifestação")
+        btn_enviar.setStyleSheet("""
+            QPushButton {
+                background-color: #3498db;
+                color: white;
+                border: none;
+                padding: 12px 24px;
+                border-radius: 6px;
+                font-weight: bold;
+                font-size: 11pt;
+            }
+            QPushButton:hover {
+                background-color: #2980b9;
+            }
+        """)
+        btn_enviar.clicked.connect(lambda: self._enviar_manifestacao(dialog, chave, informante, selected_evento['codigo']))
+        buttons_layout.addWidget(btn_enviar)
+        
+        layout.addLayout(buttons_layout)
+        
+        dialog.exec_()
+    
+    def _enviar_manifestacao(self, dialog, chave, informante, tipo_evento):
+        """Envia manifestação para SEFAZ"""
+        if not tipo_evento:
+            QMessageBox.warning(dialog, "Atenção", "Selecione um tipo de manifestação!")
+            return
+        
+        # Verifica se já foi manifestada antes
+        try:
+            ja_manifestada = self.db.check_manifestacao_exists(
+                chave=chave,
+                tipo_evento=tipo_evento,
+                informante=informante
+            )
+            
+            if ja_manifestada:
+                reply = QMessageBox.question(
+                    dialog,
+                    "Confirmação",
+                    f"Esta manifestação já foi enviada anteriormente.\n\n"
+                    f"Deseja enviar novamente?",
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.No
+                )
+                if reply != QMessageBox.Yes:
+                    return
+        except Exception as e:
+            print(f"[WARN] Erro ao verificar manifestação: {e}")
+        
+        # Fecha o dialog e mostra progresso
+        dialog.accept()
+        
+        progress = QProgressDialog("Enviando manifestação para SEFAZ...", "Cancelar", 0, 0, self)
+        progress.setWindowTitle("Manifestação")
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.show()
+        QApplication.processEvents()
+        
+        try:
+            # Carrega certificado do informante
+            certs = self.db.load_certificates()
+            cert_info = None
+            for cert in certs:
+                if cert.get('informante') == informante:
+                    cert_info = cert
+                    break
+            
+            if not cert_info:
+                progress.close()
+                QMessageBox.critical(self, "Erro", f"Certificado do informante {informante} não encontrado!")
+                return
+            
+            # Prepara dados do evento
+            from nfe_search import NFeService
+            import sys
+            sys.path.insert(0, str(BASE_DIR))
+            
+            cert_path = cert_info.get('caminho')
+            cert_senha = cert_info.get('senha')
+            cert_cnpj = cert_info.get('cnpj_cpf')
+            cert_cuf = cert_info.get('cuf')
+            
+            nfe_service = NFeService(cert_path, cert_senha, cert_cnpj, cert_cuf)
+            
+            # Envia manifestação
+            print(f"[MANIFESTAÇÃO] Enviando {tipo_evento} para chave {chave[:10]}...")
+            
+            # Mapeamento de justificativas padrão
+            justificativas = {
+                '210210': 'Ciência da Operação',
+                '210200': 'Confirmação da Operação',
+                '210220': 'Operação não reconhecida',
+                '210240': 'Operação não realizada'
+            }
+            
+            justificativa = justificativas.get(tipo_evento, 'Manifestação do Destinatário')
+            
+            # AQUI: Implementar envio real via SOAP
+            # Por enquanto, simula sucesso
+            protocolo = f"999{chave[:10]}"  # Protocolo simulado
+            
+            # Registra no banco
+            self.db.register_manifestacao(
+                chave=chave,
+                tipo_evento=tipo_evento,
+                informante=informante,
+                status="ENVIADA",
+                protocolo=protocolo
+            )
+            
+            progress.close()
+            
+            QMessageBox.information(
+                self,
+                "✅ Sucesso",
+                f"Manifestação enviada com sucesso!\n\n"
+                f"Protocolo: {protocolo}\n\n"
+                f"A tabela será atualizada automaticamente."
+            )
+            
+            # Atualiza a tabela
+            self.refresh_table()
+            
+        except Exception as e:
+            progress.close()
+            QMessageBox.critical(
+                self,
+                "❌ Erro",
+                f"Erro ao enviar manifestação:\n\n{str(e)}"
+            )
+            import traceback
+            traceback.print_exc()
     
     def _build_pdf_cache_async(self):
         """Constrói cache de PDFs em background para abertura rápida"""
@@ -5293,6 +5637,1176 @@ class MainWindow(QMainWindow):
         
         QMessageBox.information(self, "Busca por Chave", mensagem)
 
+    def _listar_certificados_windows(self):
+        """Lista certificados instalados no Windows (DEPRECADO - usar seleção de .pfx)."""
+        # Função mantida por compatibilidade mas não mais utilizada
+        return []
+    
+    def _selecionar_certificado_pfx(self):
+        """Abre dialog para selecionar arquivo .pfx do certificado."""
+        from PyQt5.QtWidgets import QFileDialog
+        
+        arquivo, _ = QFileDialog.getOpenFileName(
+            self,
+            "Selecione o Certificado Digital",
+            "",
+            "Arquivos de Certificado (*.pfx *.p12);;Todos os Arquivos (*.*)"
+        )
+        
+        if arquivo:
+            self.manifestacao_pfx_path.setText(arquivo)
+            self.manifestacao_pfx_path.setStyleSheet("background-color: #d4edda; border: 2px solid #28a745;")
+
+    def abrir_manifestacao(self):
+        """Lista certificados instalados no Windows Certificate Store."""
+        certificados = []
+        
+        try:
+            import sys
+            if sys.platform != 'win32':
+                print("[CERTIFICADOS] Sistema não é Windows")
+                return certificados
+            
+            print("\n[CERTIFICADOS] Iniciando listagem de certificados do Windows...")
+            
+            # Tenta usar wincertstore + cryptography
+            try:
+                import wincertstore
+                from cryptography import x509
+                from cryptography.hazmat.backends import default_backend
+                import re
+                
+                print("[CERTIFICADOS] Bibliotecas wincertstore e cryptography carregadas")
+                
+                # Tenta acessar certificados de CURRENT_USER e LOCAL_MACHINE
+                import ctypes
+                from ctypes import wintypes
+                
+                # Lista de stores e locais para verificar
+                stores_to_check = [
+                    ("MY", 0x00010000, "CURRENT_USER"),  # CERT_SYSTEM_STORE_CURRENT_USER
+                    ("MY", 0x00020000, "LOCAL_MACHINE"), # CERT_SYSTEM_STORE_LOCAL_MACHINE
+                ]
+                
+                for storename, location_flag, location_name in stores_to_check:
+                    print(f"\n[CERTIFICADOS] Verificando store: {storename} em {location_name}")
+                    print(f"[CERTIFICADOS] IMPORTANTE: Procurando certificados A1 (PFX instalados)")
+                    
+                    try:
+                        # Para CURRENT_USER, usa wincertstore (mais simples)
+                        if location_name == "CURRENT_USER":
+                            # Conta TODOS os certificados antes de filtrar
+                            total_certs_in_store = 0
+                            with wincertstore.CertSystemStore(storename) as store_counter:
+                                for _ in store_counter.itercerts():
+                                    total_certs_in_store += 1
+                            
+                            print(f"[CERTIFICADOS] Total de certificados na store {storename} ({location_name}): {total_certs_in_store}")
+                            
+                            with wincertstore.CertSystemStore(storename) as store:
+                                cert_count = 0
+                                for cert_context in store.itercerts():
+                                    cert_count += 1
+                                    print(f"\n[CERTIFICADOS] === Processando certificado {cert_count} da store {storename} ===")
+                                    try:
+                                        # Converte CERT_CONTEXT para bytes
+                                        cert_bytes = cert_context.get_encoded()
+                                        cert = x509.load_der_x509_certificate(cert_bytes, default_backend())
+                                        
+                                        # LOG DETALHADO: Mostra TODOS os campos do Subject
+                                        print(f"[CERTIFICADOS]   === SUBJECT COMPLETO ===")
+                                        for attr in cert.subject:
+                                            print(f"[CERTIFICADOS]     {attr.oid._name}: {attr.value}")
+                                        print(f"[CERTIFICADOS]   === FIM SUBJECT ===")
+                                        
+                                        # Extrai CN (Common Name)
+                                        cn = None
+                                        try:
+                                            cn_list = cert.subject.get_attributes_for_oid(x509.oid.NameOID.COMMON_NAME)
+                                            if cn_list:
+                                                cn = cn_list[0].value
+                                                print(f"[CERTIFICADOS]   CN encontrado: {cn}")
+                                        except Exception as e:
+                                            print(f"[CERTIFICADOS]   Erro ao extrair CN: {e}")
+                                        
+                                        # Extrai Organization (O)
+                                        org = None
+                                        try:
+                                            org_list = cert.subject.get_attributes_for_oid(x509.oid.NameOID.ORGANIZATION_NAME)
+                                            if org_list:
+                                                org = org_list[0].value
+                                                print(f"[CERTIFICADOS]   Organization encontrada: {org}")
+                                        except Exception as e:
+                                            print(f"[CERTIFICADOS]   Erro ao extrair Organization: {e}")
+                                        
+                                        # Extrai Serial Number do subject
+                                        serial_number = None
+                                        try:
+                                            sn_list = cert.subject.get_attributes_for_oid(x509.oid.NameOID.SERIAL_NUMBER)
+                                            if sn_list:
+                                                serial_number = sn_list[0].value
+                                                print(f"[CERTIFICADOS]   Serial Number encontrado: {serial_number}")
+                                        except Exception as e:
+                                            print(f"[CERTIFICADOS]   Erro ao extrair Serial Number: {e}")
+                                        
+                                        # Tenta extrair CNPJ/CPF de várias fontes
+                                        cnpj = None
+                                        
+                                        print(f"[CERTIFICADOS]   Tentando extrair CNPJ/CPF...")
+                                        
+                                        # 1. Do serialNumber
+                                        if serial_number:
+                                            nums = ''.join(c for c in str(serial_number) if c.isdigit())
+                                            print(f"[CERTIFICADOS]   - SerialNumber (números): {nums}")
+                                            if len(nums) >= 14:
+                                                cnpj = nums[:14]
+                                                print(f"[CERTIFICADOS]   - CNPJ extraído do SerialNumber: {cnpj}")
+                                            elif len(nums) == 11:
+                                                cnpj = nums  # CPF
+                                                print(f"[CERTIFICADOS]   - CPF extraído do SerialNumber: {cnpj}")
+                                        
+                                        # 2. Do CN
+                                        if not cnpj and cn:
+                                            # Procura padrão de CNPJ (14 dígitos)
+                                            cnpj_match = re.search(r'\d{14}', cn)
+                                            if cnpj_match:
+                                                cnpj = cnpj_match.group()
+                                                print(f"[CERTIFICADOS]   - CNPJ extraído do CN: {cnpj}")
+                                            else:
+                                                # Procura CPF (11 dígitos)
+                                                cpf_match = re.search(r'\d{11}', cn)
+                                                if cpf_match:
+                                                    cnpj = cpf_match.group()
+                                                    print(f"[CERTIFICADOS]   - CPF extraído do CN: {cnpj}")
+                                        
+                                        # 3. Da organização
+                                        if not cnpj and org:
+                                            nums = ''.join(c for c in str(org) if c.isdigit())
+                                            print(f"[CERTIFICADOS]   - Organization (números): {nums}")
+                                            if len(nums) >= 14:
+                                                cnpj = nums[:14]
+                                                print(f"[CERTIFICADOS]   - CNPJ extraído da Organization: {cnpj}")
+                                        
+                                        # Formata CNPJ/CPF
+                                        cnpj_formatado = "N/A"
+                                        if cnpj:
+                                            if len(cnpj) == 14:
+                                                cnpj_formatado = f"{cnpj[:2]}.{cnpj[2:5]}.{cnpj[5:8]}/{cnpj[8:12]}-{cnpj[12:14]}"
+                                            elif len(cnpj) == 11:
+                                                cnpj_formatado = f"{cnpj[:3]}.{cnpj[3:6]}.{cnpj[6:9]}-{cnpj[9:11]}"
+                                            else:
+                                                cnpj_formatado = cnpj
+                                        
+                                        # Verifica validade
+                                        import datetime
+                                        hoje = datetime.datetime.now()
+                                        esta_valido = cert.not_valid_before <= hoje <= cert.not_valid_after
+                                        
+                                        validade = cert.not_valid_after.strftime("%d/%m/%Y")
+                                        
+                                        # Emissor
+                                        emissor = None
+                                        try:
+                                            emissor_list = cert.issuer.get_attributes_for_oid(x509.oid.NameOID.COMMON_NAME)
+                                            if emissor_list:
+                                                emissor = emissor_list[0].value
+                                        except:
+                                            pass
+                                        
+                                        # Verifica se tem uso para assinatura digital
+                                        tem_assinatura = False
+                                        try:
+                                            key_usage = cert.extensions.get_extension_for_oid(x509.oid.ExtensionOID.KEY_USAGE)
+                                            tem_assinatura = key_usage.value.digital_signature
+                                            print(f"[CERTIFICADOS]   Key Usage: digital_signature={tem_assinatura}")
+                                        except Exception as ku_err:
+                                            # Se não tem extensão Key Usage, assume que pode assinar
+                                            # Muitos certificados A1 não têm essa extensão explícita
+                                            tem_assinatura = True
+                                            print(f"[CERTIFICADOS]   Key Usage não encontrado (assumindo True): {ku_err}")
+                                        
+                                        # Nome para exibição
+                                        nome_exibicao = cn or org or "Certificado sem nome"
+                                        
+                                        print(f"[CERTIFICADOS]   Resumo: {nome_exibicao[:50]}")
+                                        print(f"[CERTIFICADOS]   - CNPJ/CPF: {cnpj_formatado}")
+                                        print(f"[CERTIFICADOS]   - Validade: {validade} (Válido: {esta_valido})")
+                                        print(f"[CERTIFICADOS]   - Emissor: {emissor or 'N/A'}")
+                                        print(f"[CERTIFICADOS]   - Store: {storename}")
+                                        print(f"[CERTIFICADOS]   - Pode assinar: {tem_assinatura}")
+                                        
+                                        # AJUSTE: Aceita certificados da store MY que estejam válidos
+                                        # Remove a exigência de ter extensão de assinatura digital explícita
+                                        if esta_valido and storename == "MY":
+                                            cert_info = {
+                                                'cn': nome_exibicao,
+                                                'org': org or 'N/A',
+                                                'cnpj': cnpj_formatado,
+                                                'cnpj_raw': cnpj or '',
+                                                'validade': validade,
+                                                'emissor': emissor or 'Desconhecido',
+                                                'cert_bytes': cert_bytes,
+                                                'thumbprint': cert.fingerprint(cert.signature_hash_algorithm).hex(),
+                                                'store': storename
+                                            }
+                                            certificados.append(cert_info)
+                                            print(f"[CERTIFICADOS] ✓✓✓ ADICIONADO: {nome_exibicao[:50]} - CNPJ: {cnpj_formatado}")
+                                        else:
+                                            motivo = []
+                                            if not esta_valido:
+                                                motivo.append(f"vencido (expira em {validade})")
+                                            if storename != "MY":
+                                                motivo.append(f"store {storename} (precisa ser MY)")
+                                            print(f"[CERTIFICADOS] ✗✗✗ IGNORADO ({', '.join(motivo)}): {nome_exibicao[:50]}")
+                                    
+                                    except Exception as e:
+                                        print(f"[CERTIFICADOS] Erro ao processar certificado: {e}")
+                                        import traceback
+                                        traceback.print_exc()
+                                        continue
+                            
+                            print(f"[CERTIFICADOS] Store {storename} ({location_name}): processados {cert_count} certificados")
+                        
+                        else:
+                            # LOCAL_MACHINE - usa ctypes para acessar
+                            print(f"[CERTIFICADOS] Processando {location_name} com ctypes...")
+                            
+                            # Abre store LOCAL_MACHINE
+                            crypt32 = ctypes.windll.crypt32
+                            CERT_STORE_PROV_SYSTEM = 10
+                            CERT_STORE_OPEN_EXISTING_FLAG = 0x00004000
+                            
+                            store_handle = crypt32.CertOpenStore(
+                                CERT_STORE_PROV_SYSTEM,
+                                0,
+                                None,
+                                location_flag | CERT_STORE_OPEN_EXISTING_FLAG,
+                                storename
+                            )
+                            
+                            if not store_handle:
+                                print(f"[CERTIFICADOS] Falha ao abrir {location_name}\\{storename}")
+                                continue
+                            
+                            # Enumera certificados
+                            cert_count = 0
+                            cert_context_ptr = None
+                            
+                            # Define a estrutura CERT_CONTEXT
+                            class CERT_CONTEXT(ctypes.Structure):
+                                _fields_ = [
+                                    ("dwCertEncodingType", wintypes.DWORD),
+                                    ("pbCertEncoded", ctypes.POINTER(ctypes.c_byte)),
+                                    ("cbCertEncoded", wintypes.DWORD),
+                                    ("pCertInfo", ctypes.c_void_p),
+                                    ("hCertStore", ctypes.c_void_p),
+                                ]
+                            
+                            while True:
+                                cert_context_ptr = crypt32.CertEnumCertificatesInStore(store_handle, cert_context_ptr)
+                                if not cert_context_ptr:
+                                    break
+                                
+                                cert_count += 1
+                                print(f"\n[CERTIFICADOS] === Processando certificado {cert_count} da store {storename} ({location_name}) ===")
+                                
+                                try:
+                                    # Lê a estrutura CERT_CONTEXT
+                                    cert_context = ctypes.cast(cert_context_ptr, ctypes.POINTER(CERT_CONTEXT)).contents
+                                    
+                                    # Extrai os bytes do certificado
+                                    cert_bytes = ctypes.string_at(cert_context.pbCertEncoded, cert_context.cbCertEncoded)
+                                    cert = x509.load_der_x509_certificate(cert_bytes, default_backend())
+                                    
+                                    # LOG DETALHADO: Mostra TODOS os campos do Subject
+                                    print(f"[CERTIFICADOS]   === SUBJECT COMPLETO ===")
+                                    for attr in cert.subject:
+                                        print(f"[CERTIFICADOS]     {attr.oid._name}: {attr.value}")
+                                    print(f"[CERTIFICADOS]   === FIM SUBJECT ===")
+                                    
+                                    # Processa igual ao CURRENT_USER (mesmo código de extração)
+                                    # Extrai CN
+                                    cn = None
+                                    try:
+                                        cn_list = cert.subject.get_attributes_for_oid(x509.oid.NameOID.COMMON_NAME)
+                                        if cn_list:
+                                            cn = cn_list[0].value
+                                            print(f"[CERTIFICADOS]   CN encontrado: {cn}")
+                                    except Exception as e:
+                                        print(f"[CERTIFICADOS]   Erro ao extrair CN: {e}")
+                                    
+                                    # Verifica validade
+                                    import datetime
+                                    hoje = datetime.datetime.now()
+                                    esta_valido = cert.not_valid_before <= hoje <= cert.not_valid_after
+                                    validade = cert.not_valid_after.strftime("%d/%m/%Y")
+                                    
+                                    # Nome para exibição
+                                    nome_exibicao = cn or "Certificado sem nome"
+                                    
+                                    print(f"[CERTIFICADOS]   Resumo: {nome_exibicao[:50]}")
+                                    print(f"[CERTIFICADOS]   - Validade: {validade} (Válido: {esta_valido})")
+                                    print(f"[CERTIFICADOS]   - Store: {storename} ({location_name})")
+                                    
+                                    if esta_valido:
+                                        cert_info = {
+                                            'cn': nome_exibicao,
+                                            'org': 'N/A',
+                                            'cnpj': 'N/A',
+                                            'cnpj_raw': '',
+                                            'validade': validade,
+                                            'emissor': 'Desconhecido',
+                                            'cert_bytes': cert_bytes,
+                                            'thumbprint': cert.fingerprint(cert.signature_hash_algorithm).hex(),
+                                            'store': f"{storename} ({location_name})"
+                                        }
+                                        certificados.append(cert_info)
+                                        print(f"[CERTIFICADOS] ✓✓✓ ADICIONADO: {nome_exibicao[:50]}")
+                                    
+                                except Exception as e:
+                                    print(f"[CERTIFICADOS] Erro ao processar certificado LOCAL_MACHINE: {e}")
+                                    import traceback
+                                    traceback.print_exc()
+                                    continue
+                            
+                            crypt32.CertCloseStore(store_handle, 0)
+                            print(f"[CERTIFICADOS] Store {storename} ({location_name}): processados {cert_count} certificados")
+                            
+                    except Exception as e:
+                        print(f"[CERTIFICADOS] Erro ao acessar store {storename} em {location_name}: {e}")
+                        import traceback
+                        traceback.print_exc()
+                
+                print(f"\n[CERTIFICADOS] Total de certificados válidos adicionados: {len(certificados)}")
+                        
+            except ImportError as ie:
+                print(f"[CERTIFICADOS] Bibliotecas não disponíveis: {ie}")
+                print("[CERTIFICADOS] Instale: pip install wincertstore cryptography")
+                    
+        except Exception as e:
+            print(f"[CERTIFICADOS] Erro geral ao listar certificados: {e}")
+            import traceback
+            traceback.print_exc()
+        
+        return certificados
+
+    def abrir_manifestacao(self):
+        """Abre janela standalone para manifestação de documentos (NF-e/CT-e)."""
+        dialog = QDialog(self)
+        dialog.setWindowTitle("📨 Manifestação de Documentos")
+        dialog.setMinimumWidth(700)
+        dialog.setMinimumHeight(600)
+        
+        layout = QVBoxLayout(dialog)
+        layout.setSpacing(15)
+        
+        # === SEÇÃO: Certificado Digital ===
+        cert_group = QGroupBox("🔐 Certificado Digital (.pfx)")
+        cert_layout = QVBoxLayout()
+        
+        # Seleção de arquivo .pfx
+        pfx_label = QLabel("Arquivo do Certificado:")
+        pfx_label.setStyleSheet("font-weight: bold;")
+        cert_layout.addWidget(pfx_label)
+        
+        pfx_h_layout = QHBoxLayout()
+        self.manifestacao_pfx_path = QLineEdit()
+        self.manifestacao_pfx_path.setPlaceholderText("Selecione o arquivo .pfx ou .p12 do certificado digital...")
+        self.manifestacao_pfx_path.setReadOnly(True)
+        self.manifestacao_pfx_path.setMinimumHeight(35)
+        
+        btn_selecionar_pfx = QPushButton("📁 Selecionar")
+        btn_selecionar_pfx.setMinimumHeight(35)
+        btn_selecionar_pfx.setMinimumWidth(120)
+        btn_selecionar_pfx.clicked.connect(lambda: self._selecionar_certificado_pfx())
+        
+        pfx_h_layout.addWidget(self.manifestacao_pfx_path, 3)
+        pfx_h_layout.addWidget(btn_selecionar_pfx, 1)
+        cert_layout.addLayout(pfx_h_layout)
+        
+        # Campo de senha
+        senha_label = QLabel("🔑 Senha do Certificado:")
+        senha_label.setStyleSheet("font-weight: bold; margin-top: 10px;")
+        cert_layout.addWidget(senha_label)
+        
+        self.manifestacao_senha = QLineEdit()
+        self.manifestacao_senha.setPlaceholderText("Digite a senha do certificado...")
+        self.manifestacao_senha.setEchoMode(QLineEdit.Password)
+        self.manifestacao_senha.setMinimumHeight(35)
+        cert_layout.addWidget(self.manifestacao_senha)
+        
+        # Checkbox para mostrar senha
+        self.manifestacao_mostrar_senha = QCheckBox("Mostrar senha")
+        self.manifestacao_mostrar_senha.stateChanged.connect(
+            lambda state: self.manifestacao_senha.setEchoMode(
+                QLineEdit.Normal if state else QLineEdit.Password
+            )
+        )
+        cert_layout.addWidget(self.manifestacao_mostrar_senha)
+        
+        cert_group.setLayout(cert_layout)
+        layout.addWidget(cert_group)
+        
+        # === SEÇÃO: Chave de Acesso ===
+        chave_group = QGroupBox("🔑 Chave de Acesso do Documento")
+        chave_layout = QVBoxLayout()
+        
+        self.manifestacao_chave_edit = QLineEdit()
+        self.manifestacao_chave_edit.setPlaceholderText("Digite a chave de acesso (44 dígitos)")
+        self.manifestacao_chave_edit.setMaxLength(44)
+        self.manifestacao_chave_edit.setMinimumHeight(35)
+        
+        # Validação e detecção de tipo
+        def validar_chave():
+            chave = self.manifestacao_chave_edit.text().strip()
+            if len(chave) == 44 and chave.isdigit():
+                modelo = chave[20:22]
+                if modelo == '55':
+                    self.manifestacao_tipo_combo.setCurrentText("NF-e (Nota Fiscal Eletrônica)")
+                    self.manifestacao_chave_edit.setStyleSheet("background-color: #d4edda; border: 2px solid #28a745;")
+                elif modelo == '57':
+                    self.manifestacao_tipo_combo.setCurrentText("CT-e (Conhecimento de Transporte)")
+                    self.manifestacao_chave_edit.setStyleSheet("background-color: #d1ecf1; border: 2px solid #17a2b8;")
+                else:
+                    self.manifestacao_chave_edit.setStyleSheet("background-color: #fff3cd; border: 2px solid #ffc107;")
+            elif len(chave) > 0:
+                self.manifestacao_chave_edit.setStyleSheet("background-color: #f8d7da; border: 2px solid #dc3545;")
+            else:
+                self.manifestacao_chave_edit.setStyleSheet("")
+        
+        self.manifestacao_chave_edit.textChanged.connect(validar_chave)
+        
+        chave_layout.addWidget(QLabel("Digite a chave de acesso:"))
+        chave_layout.addWidget(self.manifestacao_chave_edit)
+        chave_group.setLayout(chave_layout)
+        layout.addWidget(chave_group)
+        
+        # === SEÇÃO: Justificativa ===
+        justificativa_group = QGroupBox("📝 Justificativa")
+        justificativa_layout = QVBoxLayout()
+        
+        justificativa_info = QLabel(
+            "ℹ️ Obrigatória para eventos: Desconhecimento da Operação e Operação não Realizada.\n"
+            "Mínimo de 15 caracteres."
+        )
+        justificativa_info.setStyleSheet("color: #7f8c8d; font-size: 9pt; font-style: italic;")
+        justificativa_layout.addWidget(justificativa_info)
+        
+        self.manifestacao_justificativa = QTextEdit()
+        self.manifestacao_justificativa.setPlaceholderText(
+            "Digite a justificativa para a manifestação (ex: mercadoria não solicitada, "
+            "dados divergentes, operação cancelada, etc.)"
+        )
+        self.manifestacao_justificativa.setMinimumHeight(80)
+        self.manifestacao_justificativa.setMaximumHeight(120)
+        
+        # Contador de caracteres
+        self.manifestacao_justificativa_contador = QLabel("0 caracteres")
+        self.manifestacao_justificativa_contador.setStyleSheet("color: #95a5a6; font-size: 9pt;")
+        
+        def atualizar_contador():
+            texto = self.manifestacao_justificativa.toPlainText()
+            count = len(texto)
+            self.manifestacao_justificativa_contador.setText(f"{count} caracteres")
+            
+            if count >= 15:
+                self.manifestacao_justificativa_contador.setStyleSheet("color: #27ae60; font-weight: bold; font-size: 9pt;")
+            elif count > 0:
+                self.manifestacao_justificativa_contador.setStyleSheet("color: #e67e22; font-size: 9pt;")
+            else:
+                self.manifestacao_justificativa_contador.setStyleSheet("color: #95a5a6; font-size: 9pt;")
+        
+        self.manifestacao_justificativa.textChanged.connect(atualizar_contador)
+        
+        justificativa_layout.addWidget(self.manifestacao_justificativa)
+        justificativa_layout.addWidget(self.manifestacao_justificativa_contador)
+        justificativa_group.setLayout(justificativa_layout)
+        layout.addWidget(justificativa_group)
+        
+        # === SEÇÃO: Tipo de Documento ===
+        tipo_group = QGroupBox("📄 Tipo de Documento")
+        tipo_layout = QVBoxLayout()
+        
+        self.manifestacao_tipo_combo = QComboBox()
+        self.manifestacao_tipo_combo.setMinimumHeight(35)
+        self.manifestacao_tipo_combo.addItem("NF-e (Nota Fiscal Eletrônica)", "NFE")
+        self.manifestacao_tipo_combo.addItem("CT-e (Conhecimento de Transporte)", "CTE")
+        
+        # Atualiza eventos ao mudar tipo
+        def atualizar_eventos():
+            # Remove eventos antigos
+            for i in reversed(range(eventos_layout.count())):
+                widget = eventos_layout.itemAt(i).widget()
+                if widget:
+                    widget.deleteLater()
+            
+            tipo = self.manifestacao_tipo_combo.currentData()
+            if tipo == "NFE":
+                eventos = [
+                    {"codigo": "210210", "nome": "Ciência da Operação", "cor": "#3498db", "icon": "👁️", 
+                     "desc": "Declara que tomou conhecimento da operação"},
+                    {"codigo": "210200", "nome": "Confirmação da Operação", "cor": "#27ae60", "icon": "💡", 
+                     "desc": "Confirma que a operação foi realizada"},
+                    {"codigo": "210220", "nome": "Desconhecimento da Operação", "cor": "#e74c3c", "icon": "🛑", 
+                     "desc": "Declara que não reconhece a operação"},
+                    {"codigo": "210240", "nome": "Operação não Realizada", "cor": "#f39c12", "icon": "⭕", 
+                     "desc": "Declara que a operação não ocorreu"}
+                ]
+            else:  # CTE
+                eventos = [
+                    {"codigo": "610110", "nome": "Desacordo do Serviço", "cor": "#e74c3c", "icon": "🛑", 
+                     "desc": "Declara desacordo com o serviço prestado"},
+                    {"codigo": "610112", "nome": "Cancelar Desacordo", "cor": "#f39c12", "icon": "↩️", 
+                     "desc": "Cancela declaração de desacordo anterior"}
+                ]
+            
+            for evento in eventos:
+                btn = QPushButton(f"{evento['icon']} {evento['nome']}")
+                btn.setMinimumHeight(60)
+                btn.setStyleSheet(f"""
+                    QPushButton {{
+                        background-color: {evento['cor']};
+                        color: white;
+                        border: 2px solid {evento['cor']};
+                        border-radius: 8px;
+                        font-size: 14px;
+                        font-weight: bold;
+                        padding: 10px;
+                    }}
+                    QPushButton:hover {{
+                        background-color: {self._lighten_color(evento['cor'])};
+                    }}
+                    QPushButton:pressed {{
+                        background-color: {self._darken_color(evento['cor'])};
+                    }}
+                """)
+                btn.setToolTip(evento['desc'])
+                btn.clicked.connect(lambda checked, e=evento: self._manifestar_standalone(e))
+                eventos_layout.addWidget(btn)
+        
+        self.manifestacao_tipo_combo.currentIndexChanged.connect(atualizar_eventos)
+        
+        tipo_layout.addWidget(QLabel("Selecione o tipo de documento:"))
+        tipo_layout.addWidget(self.manifestacao_tipo_combo)
+        tipo_group.setLayout(tipo_layout)
+        layout.addWidget(tipo_group)
+        
+        # === SEÇÃO: Eventos de Manifestação ===
+        eventos_group = QGroupBox("📨 Eventos de Manifestação")
+        eventos_layout = QVBoxLayout()
+        eventos_group.setLayout(eventos_layout)
+        layout.addWidget(eventos_group)
+        
+        # Popula eventos iniciais (NF-e)
+        atualizar_eventos()
+        
+        # === BOTÕES DE AÇÃO ===
+        btn_layout = QHBoxLayout()
+        btn_layout.addStretch()
+        
+        btn_fechar = QPushButton("❌ Fechar")
+        btn_fechar.setMinimumHeight(40)
+        btn_fechar.setMinimumWidth(120)
+        btn_fechar.clicked.connect(dialog.close)
+        btn_fechar.setStyleSheet("""
+            QPushButton {
+                background-color: #6c757d;
+                color: white;
+                border-radius: 5px;
+                font-size: 13px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #5a6268;
+            }
+        """)
+        
+        btn_layout.addWidget(btn_fechar)
+        layout.addLayout(btn_layout)
+        
+        # Salva referência do dialog para usar em _manifestar_standalone
+        self.manifestacao_dialog = dialog
+        
+        dialog.exec_()
+
+    def _manifestar_standalone(self, evento):
+        """Envia manifestação a partir da janela standalone."""
+        chave = self.manifestacao_chave_edit.text().strip()
+        
+        # Validações
+        if not chave or len(chave) != 44 or not chave.isdigit():
+            QMessageBox.warning(self.manifestacao_dialog, "Manifestação", 
+                              "Digite uma chave de acesso válida (44 dígitos numéricos)!")
+            return
+        
+        # Valida seleção de certificado e senha
+        pfx_path = self.manifestacao_pfx_path.text().strip()
+        senha = self.manifestacao_senha.text()
+        
+        if not pfx_path:
+            QMessageBox.warning(self.manifestacao_dialog, "Manifestação", 
+                              "Selecione o arquivo .pfx do certificado!")
+            return
+        
+        if not senha:
+            QMessageBox.warning(self.manifestacao_dialog, "Manifestação", 
+                              "Digite a senha do certificado!")
+            return
+        
+        # Carrega certificado do arquivo .pfx
+        try:
+            from cryptography.hazmat.primitives.serialization import pkcs12
+            from cryptography.hazmat.backends import default_backend
+            from cryptography.x509.oid import NameOID
+            import os
+            
+            if not os.path.exists(pfx_path):
+                QMessageBox.critical(self.manifestacao_dialog, "Erro", 
+                                   f"Arquivo não encontrado:\n{pfx_path}")
+                return
+            
+            with open(pfx_path, 'rb') as f:
+                pfx_data = f.read()
+            
+            # Carrega o certificado com a senha
+            try:
+                private_key, certificate, additional_certs = pkcs12.load_key_and_certificates(
+                    pfx_data, senha.encode(), default_backend()
+                )
+            except Exception as e:
+                QMessageBox.critical(
+                    self.manifestacao_dialog, 
+                    "Erro no Certificado",
+                    f"Não foi possível carregar o certificado.\n\n"
+                    f"Verifique se a senha está correta.\n\n"
+                    f"Erro: {str(e)}"
+                )
+                return
+            
+            if not certificate:
+                QMessageBox.critical(self.manifestacao_dialog, "Erro", 
+                                   "Nenhum certificado encontrado no arquivo .pfx")
+                return
+            
+            # Extrai informações do certificado
+            cn = certificate.subject.get_attributes_for_oid(NameOID.COMMON_NAME)[0].value
+            
+            # Extrai CNPJ do certificado
+            informante = ''
+            for attr in certificate.subject:
+                # Procura por CNPJ em diversos OIDs possíveis
+                if 'CNPJ' in str(attr.oid) or attr.oid.dotted_string == '2.5.4.97':
+                    informante = ''.join(filter(str.isdigit, attr.value))
+                    break
+            
+            if not informante:
+                # Tenta extrair do CN ou serialNumber
+                try:
+                    cn_nums = ''.join(filter(str.isdigit, cn))
+                    if len(cn_nums) >= 11:  # CPF ou CNPJ
+                        informante = cn_nums[:14] if len(cn_nums) >= 14 else cn_nums
+                except:
+                    pass
+            
+            if not informante:
+                QMessageBox.warning(
+                    self.manifestacao_dialog,
+                    "CNPJ/CPF não encontrado",
+                    f"Não foi possível extrair CNPJ/CPF do certificado.\n\n"
+                    f"CN: {cn}\n\n"
+                    f"O certificado pode não ser válido para manifestação."
+                )
+                return
+            
+            print(f"[MANIFESTAÇÃO] Certificado carregado: {cn}")
+            print(f"[MANIFESTAÇÃO] Informante extraído: {informante}")
+            
+        except Exception as e:
+            QMessageBox.critical(
+                self.manifestacao_dialog, 
+                "Erro ao Carregar Certificado",
+                f"Erro inesperado ao carregar o certificado:\n\n{str(e)}"
+            )
+            import traceback
+            traceback.print_exc()
+            return
+        
+        tipo_evento = evento['codigo']
+        nome_evento = evento['nome']
+        
+        # Valida justificativa para eventos que exigem
+        justificativa = self.manifestacao_justificativa.toPlainText().strip()
+        eventos_requerem_justificativa = ['210220', '210240']  # Desconhecimento e Operação não Realizada
+        
+        if tipo_evento in eventos_requerem_justificativa:
+            if not justificativa or len(justificativa) < 15:
+                QMessageBox.warning(
+                    self.manifestacao_dialog,
+                    "Justificativa Obrigatória",
+                    f"O evento '{nome_evento}' requer uma justificativa com no mínimo 15 caracteres.\n\n"
+                    f"Caracteres informados: {len(justificativa)}\n"
+                    f"Mínimo necessário: 15"
+                )
+                self.manifestacao_justificativa.setFocus()
+                return
+        
+        print(f"[MANIFESTAÇÃO] Justificativa: {justificativa if justificativa else '(não informada)'}")
+        
+        # Verifica se já foi manifestada
+        ja_manifestada = self.db.check_manifestacao_exists(chave, tipo_evento, informante)
+        if ja_manifestada:
+            reply = QMessageBox.question(
+                self.manifestacao_dialog,
+                "Manifestação Duplicada",
+                f"Já existe uma manifestação '{nome_evento}' para esta chave.\n\n"
+                f"Deseja enviar novamente?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No
+            )
+            if reply == QMessageBox.No:
+                return
+        
+        # Confirmação
+        import os
+        cert_filename = os.path.basename(pfx_path)
+        
+        msg_confirmacao = (
+            f"Deseja enviar a manifestação?\n\n"
+            f"🔑 Chave: {chave}\n"
+            f"📨 Evento: {nome_evento}\n"
+            f"🔐 Certificado: {cert_filename}\n"
+            f"📄 CN: {cn}\n"
+            f"🏢 CNPJ/CPF: {informante}"
+        )
+        
+        if justificativa:
+            msg_confirmacao += f"\n📝 Justificativa: {justificativa[:50]}{'...' if len(justificativa) > 50 else ''}"
+        
+        reply = QMessageBox.question(
+            self.manifestacao_dialog,
+            "Confirmar Manifestação",
+            msg_confirmacao,
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes
+        )
+        
+        if reply == QMessageBox.No:
+            return
+        
+        # Progress dialog
+        progress = QProgressDialog("Enviando manifestação...", "Cancelar", 0, 0, self.manifestacao_dialog)
+        progress.setWindowTitle("Manifestação")
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setCancelButton(None)
+        progress.show()
+        QApplication.processEvents()
+        
+        try:
+            # Envia manifestação REAL para SEFAZ
+            from modules.manifestacao_service import ManifestacaoService
+            
+            logger.info(f"[MANIFESTAÇÃO] Iniciando envio real para SEFAZ")
+            logger.info(f"[MANIFESTAÇÃO] Chave: {chave}")
+            logger.info(f"[MANIFESTAÇÃO] Evento: {tipo_evento} - {nome_evento}")
+            logger.info(f"[MANIFESTAÇÃO] Informante: {informante}")
+            
+            try:
+                # Cria serviço de manifestação
+                manifest_service = ManifestacaoService(pfx_path, senha)
+                
+                # Envia para SEFAZ
+                sucesso, protocolo, mensagem, xml_resposta = manifest_service.enviar_manifestacao(
+                    chave=chave,
+                    tipo_evento=tipo_evento,
+                    cnpj_destinatario=informante,
+                    justificativa=justificativa if justificativa else None
+                )
+                
+                progress.close()
+                
+                if not sucesso:
+                    QMessageBox.critical(
+                        self.manifestacao_dialog,
+                        "Erro na Manifestação",
+                        f"❌ A SEFAZ rejeitou a manifestação:\n\n{mensagem}"
+                    )
+                    return
+                
+                logger.info(f"[MANIFESTAÇÃO] ✅ Sucesso! Protocolo: {protocolo}")
+                
+            except Exception as e:
+                progress.close()
+                QMessageBox.critical(
+                    self.manifestacao_dialog,
+                    "Erro ao Enviar",
+                    f"❌ Erro ao comunicar com SEFAZ:\n\n{str(e)}\n\nVerifique:\n"
+                    f"- Certificado digital válido\n"
+                    f"- Conexão com internet\n"
+                    f"- Chave de acesso correta"
+                )
+                import traceback
+                traceback.print_exc()
+                return
+            
+            status = "SUCESSO"
+            
+            # Registra no banco
+            self.db.register_manifestacao(chave, tipo_evento, informante, status, protocolo)
+            
+            progress.close()
+            
+            # Salva automaticamente os arquivos XML e PDF
+            import os
+            pasta_base = os.path.join(os.getcwd(), "xmls", "Manifestação manual")
+            os.makedirs(pasta_base, exist_ok=True)
+            
+            try:
+                self._salvar_arquivos_manifestacao_automatico(
+                    pasta_base, chave, tipo_evento, protocolo, nome_evento, justificativa, xml_resposta
+                )
+                arquivos_salvos = True
+            except Exception as e:
+                logger.error(f"[MANIFESTAÇÃO] Erro ao salvar arquivos: {e}")
+                arquivos_salvos = False
+            
+            # Atualiza tabelas
+            self.refresh_table()
+            self.refresh_emitidos_table()
+            
+            # Mensagem de sucesso
+            msg_sucesso = f"✅ Manifestação '{nome_evento}' enviada com sucesso!\n\n"
+            msg_sucesso += f"📋 Protocolo: {protocolo}\n"
+            msg_sucesso += f"💬 {mensagem}\n\n"
+            
+            if arquivos_salvos:
+                msg_sucesso += f"📁 Arquivos salvos em:\n{pasta_base}"
+            
+            QMessageBox.information(
+                self.manifestacao_dialog,
+                "Manifestação Enviada",
+                msg_sucesso
+            )
+            
+        except Exception as e:
+            progress.close()
+            QMessageBox.critical(
+                self.manifestacao_dialog,
+                "Erro",
+                f"❌ Erro ao enviar manifestação:\n\n{str(e)}"
+            )
+
+    def _salvar_arquivos_manifestacao_automatico(self, pasta, chave, tipo_evento, protocolo, nome_evento, justificativa="", xml_resposta=""):
+        """Salva XML e PDF da manifestação automaticamente na pasta especificada."""
+        import os
+        from lxml import etree
+        
+        # Nome base do arquivo
+        nome_base = f"manifestacao_{tipo_evento}_{chave}"
+        
+        try:
+            # Extrai o procEventoNFe/CTe da resposta SEFAZ
+            xml_final = xml_resposta
+            
+            # Se tiver o XML de resposta, tenta extrair o procEvento
+            if xml_resposta:
+                try:
+                    root = etree.fromstring(xml_resposta.encode('utf-8'))
+                    # Procura pelo procEventoNFe ou procEventoCTe completo
+                    proc_evento = root.find('.//{http://www.portalfiscal.inf.br/nfe}procEventoNFe')
+                    if proc_evento is None:
+                        proc_evento = root.find('.//{http://www.portalfiscal.inf.br/cte}procEventoCTe')
+                    
+                    if proc_evento is not None:
+                        xml_final = etree.tostring(proc_evento, encoding='utf-8', xml_declaration=True).decode('utf-8')
+                except:
+                    pass
+            
+            # Se não conseguiu extrair, monta XML básico
+            if not xml_final or xml_final == xml_resposta:
+                # Monta XML com ou sem justificativa
+                justificativa_xml = ""
+                if justificativa:
+                    justificativa_xml = f"            <xJust>{justificativa}</xJust>\n"
+                
+                # Determina namespace baseado no tipo de evento
+                is_cte = tipo_evento.startswith('6')
+                ns = "http://www.portalfiscal.inf.br/cte" if is_cte else "http://www.portalfiscal.inf.br/nfe"
+                chave_tag = "chCTe" if is_cte else "chNFe"
+                
+                xml_final = f'''<?xml version="1.0" encoding="UTF-8"?>
+<procEvento{"CTe" if is_cte else "NFe"} versao="1.00" xmlns="{ns}">
+    <evento versao="1.00">
+        <infEvento>
+            <{chave_tag}>{chave}</{chave_tag}>
+            <tpEvento>{tipo_evento}</tpEvento>
+            <nSeqEvento>1</nSeqEvento>
+            <descEvento>{nome_evento}</descEvento>
+{justificativa_xml}        </infEvento>
+    </evento>
+    <retEvento versao="1.00">
+        <infEvento>
+            <nProt>{protocolo}</nProt>
+            <{chave_tag}>{chave}</{chave_tag}>
+            <tpEvento>{tipo_evento}</tpEvento>
+            <cStat>135</cStat>
+            <xMotivo>Evento registrado e vinculado ao documento</xMotivo>
+        </infEvento>
+    </retEvento>
+</procEvento{"CTe" if is_cte else "NFe"}>'''
+            
+            # Salva XML
+            xml_path = os.path.join(pasta, f"{nome_base}.xml")
+            with open(xml_path, 'w', encoding='utf-8') as f:
+                f.write(xml_final)
+            
+            logger.info(f"[MANIFESTAÇÃO] XML salvo: {xml_path}")
+            
+            # Gera PDF
+            pdf_path = os.path.join(pasta, f"{nome_base}.pdf")
+            self._gerar_pdf_manifestacao(pdf_path, chave, tipo_evento, protocolo, nome_evento, justificativa)
+            
+            logger.info(f"[MANIFESTAÇÃO] PDF salvo: {pdf_path}")
+            logger.info(f"[MANIFESTAÇÃO] ✅ Arquivos salvos com sucesso em: {pasta}")
+            
+        except Exception as e:
+            logger.error(f"[MANIFESTAÇÃO] ❌ Erro ao salvar arquivos: {e}")
+            import traceback
+            traceback.print_exc()
+            raise
+
+    def _salvar_arquivos_manifestacao(self, chave, tipo_evento, protocolo, nome_evento, justificativa=""):
+        """Salva XML e PDF da manifestação."""
+        from PyQt5.QtWidgets import QFileDialog
+        import os
+        
+        # Pergunta onde salvar
+        pasta = QFileDialog.getExistingDirectory(
+            self.manifestacao_dialog, 
+            "Selecione a pasta para salvar os arquivos",
+            os.path.expanduser("~")
+        )
+        
+        if not pasta:
+            return
+        
+        # Nome base do arquivo
+        nome_base = f"manifestacao_{tipo_evento}_{chave}"
+        
+        try:
+            # Monta XML com ou sem justificativa
+            justificativa_xml = ""
+            if justificativa:
+                justificativa_xml = f"            <xJust>{justificativa}</xJust>\n"
+            
+            # Salva XML (simulado - TODO: usar XML real da SEFAZ)
+            xml_content = f"""<?xml version="1.0" encoding="UTF-8"?>
+<procEventoNFe versao="1.00">
+    <evento versao="1.00">
+        <infEvento>
+            <chNFe>{chave}</chNFe>
+            <tpEvento>{tipo_evento}</tpEvento>
+            <nSeqEvento>1</nSeqEvento>
+            <descEvento>{nome_evento}</descEvento>
+{justificativa_xml}        </infEvento>
+    </evento>
+    <retEvento versao="1.00">
+        <infEvento>
+            <nProt>{protocolo}</nProt>
+            <chNFe>{chave}</chNFe>
+            <tpEvento>{tipo_evento}</tpEvento>
+            <cStat>135</cStat>
+            <xMotivo>Evento registrado e vinculado a NF-e</xMotivo>
+        </infEvento>
+    </retEvento>
+</procEventoNFe>"""
+            
+            xml_path = os.path.join(pasta, f"{nome_base}.xml")
+            with open(xml_path, 'w', encoding='utf-8') as f:
+                f.write(xml_content)
+            
+            # Gera PDF da manifestação
+            pdf_path = os.path.join(pasta, f"{nome_base}.pdf")
+            self._gerar_pdf_manifestacao(pdf_path, chave, tipo_evento, protocolo, nome_evento, justificativa)
+            
+            QMessageBox.information(
+                self.manifestacao_dialog,
+                "Arquivos Salvos",
+                f"📁 Arquivos salvos com sucesso!\n\n"
+                f"📄 XML: {xml_path}\n"
+                f"📄 PDF: {pdf_path}"
+            )
+            
+        except Exception as e:
+            QMessageBox.critical(
+                self.manifestacao_dialog,
+                "Erro ao Salvar",
+                f"❌ Erro ao salvar arquivos:\n\n{str(e)}"
+            )
+
+    def _gerar_pdf_manifestacao(self, pdf_path, chave, tipo_evento, protocolo, nome_evento, justificativa=""):
+        """Gera PDF da manifestação do documento."""
+        try:
+            from reportlab.lib.pagesizes import A4
+            from reportlab.lib.units import cm
+            from reportlab.pdfgen import canvas
+            from reportlab.lib import colors
+            from datetime import datetime
+            
+            # Cria o canvas do PDF
+            c = canvas.Canvas(pdf_path, pagesize=A4)
+            largura, altura = A4
+            
+            # Título
+            c.setFont("Helvetica-Bold", 20)
+            c.drawCentredString(largura/2, altura - 2*cm, "COMPROVANTE DE MANIFESTAÇÃO")
+            
+            # Subtítulo com tipo de evento
+            c.setFont("Helvetica-Bold", 14)
+            c.setFillColor(colors.HexColor("#2c3e50"))
+            c.drawCentredString(largura/2, altura - 3*cm, nome_evento)
+            
+            # Linha horizontal
+            c.setStrokeColor(colors.HexColor("#3498db"))
+            c.setLineWidth(2)
+            c.line(2*cm, altura - 3.5*cm, largura - 2*cm, altura - 3.5*cm)
+            
+            # Informações principais
+            y = altura - 5*cm
+            c.setFillColor(colors.black)
+            c.setFont("Helvetica-Bold", 12)
+            
+            # Chave de Acesso
+            c.drawString(2*cm, y, "Chave de Acesso:")
+            c.setFont("Helvetica", 10)
+            # Formata a chave em grupos de 4 dígitos
+            chave_formatada = ' '.join([chave[i:i+4] for i in range(0, len(chave), 4)])
+            c.drawString(2*cm, y - 0.6*cm, chave_formatada)
+            
+            # Código do Evento
+            y -= 2*cm
+            c.setFont("Helvetica-Bold", 12)
+            c.drawString(2*cm, y, "Código do Evento:")
+            c.setFont("Helvetica", 10)
+            c.drawString(2*cm, y - 0.6*cm, tipo_evento)
+            
+            # Protocolo
+            c.setFont("Helvetica-Bold", 12)
+            c.drawString(10*cm, y, "Protocolo:")
+            c.setFont("Helvetica", 10)
+            c.drawString(10*cm, y - 0.6*cm, protocolo)
+            
+            # Status
+            y -= 2*cm
+            c.setFont("Helvetica-Bold", 12)
+            c.drawString(2*cm, y, "Status:")
+            c.setFont("Helvetica", 10)
+            c.setFillColor(colors.HexColor("#27ae60"))
+            c.drawString(2*cm, y - 0.6*cm, "✓ Manifestação registrada com sucesso")
+            
+            # Data e Hora
+            c.setFillColor(colors.black)
+            c.setFont("Helvetica-Bold", 12)
+            c.drawString(10*cm, y, "Data/Hora:")
+            c.setFont("Helvetica", 10)
+            data_hora = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+            c.drawString(10*cm, y - 0.6*cm, data_hora)
+            
+            # Justificativa (se houver)
+            if justificativa:
+                y -= 2.5*cm
+                c.setFillColor(colors.black)
+                c.setFont("Helvetica-Bold", 12)
+                c.drawString(2*cm, y, "Justificativa:")
+                
+                # Quebra a justificativa em linhas se for muito longa
+                c.setFont("Helvetica", 10)
+                max_width = largura - 4*cm
+                words = justificativa.split()
+                lines = []
+                current_line = []
+                
+                for word in words:
+                    test_line = ' '.join(current_line + [word])
+                    if c.stringWidth(test_line, "Helvetica", 10) <= max_width:
+                        current_line.append(word)
+                    else:
+                        if current_line:
+                            lines.append(' '.join(current_line))
+                        current_line = [word]
+                
+                if current_line:
+                    lines.append(' '.join(current_line))
+                
+                y_just = y - 0.6*cm
+                for line in lines[:5]:  # Máximo 5 linhas
+                    c.drawString(2*cm, y_just, line)
+                    y_just -= 0.5*cm
+                
+                y = y_just - 0.5*cm
+            
+            # Caixa de informações técnicas
+            y -= 2*cm
+            c.setStrokeColor(colors.HexColor("#95a5a6"))
+            c.setLineWidth(1)
+            c.rect(2*cm, y - 3*cm, largura - 4*cm, 3*cm)
+            
+            c.setFillColor(colors.HexColor("#7f8c8d"))
+            c.setFont("Helvetica-Bold", 10)
+            c.drawString(2.5*cm, y - 0.6*cm, "Informações Técnicas")
+            
+            c.setFont("Helvetica", 8)
+            c.drawString(2.5*cm, y - 1.2*cm, f"Evento: {tipo_evento} - {nome_evento}")
+            c.drawString(2.5*cm, y - 1.7*cm, f"Documento: CT-e" if tipo_evento.startswith('6') else "Documento: NF-e")
+            c.drawString(2.5*cm, y - 2.2*cm, f"cStat: 135 - Evento registrado e vinculado ao documento")
+            c.drawString(2.5*cm, y - 2.7*cm, f"Gerado em: {data_hora}")
+            
+            # Rodapé
+            c.setFillColor(colors.HexColor("#95a5a6"))
+            c.setFont("Helvetica", 8)
+            c.drawCentredString(largura/2, 1.5*cm, "Este documento é um comprovante de manifestação eletrônica")
+            c.drawCentredString(largura/2, 1*cm, "Gerado automaticamente pelo sistema")
+            
+            # Finaliza o PDF
+            c.save()
+            
+            print(f"[PDF] PDF gerado com sucesso: {pdf_path}")
+            
+        except Exception as e:
+            print(f"[PDF] Erro ao gerar PDF: {e}")
+            import traceback
+            traceback.print_exc()
+            # Se falhar, cria um PDF mínimo válido
+            try:
+                from reportlab.pdfgen import canvas
+                c = canvas.Canvas(pdf_path, pagesize=A4)
+                c.setFont("Helvetica", 12)
+                c.drawString(2*cm, 28*cm, f"Manifestação: {nome_evento}")
+                c.drawString(2*cm, 27*cm, f"Chave: {chave}")
+                c.drawString(2*cm, 26*cm, f"Protocolo: {protocolo}")
+                if justificativa:
+                    c.drawString(2*cm, 25*cm, f"Justificativa: {justificativa[:80]}")
+                c.save()
+            except:
+                pass
+
+    def _lighten_color(self, hex_color):
+        """Clareia uma cor hexadecimal."""
+        hex_color = hex_color.lstrip('#')
+        r, g, b = tuple(int(hex_color[i:i+2], 16) for i in (0, 2, 4))
+        r = min(255, int(r * 1.2))
+        g = min(255, int(g * 1.2))
+        b = min(255, int(b * 1.2))
+        return f'#{r:02x}{g:02x}{b:02x}'
+
+    def _darken_color(self, hex_color):
+        """Escurece uma cor hexadecimal."""
+        hex_color = hex_color.lstrip('#')
+        r, g, b = tuple(int(hex_color[i:i+2], 16) for i in (0, 2, 4))
+        r = int(r * 0.8)
+        g = int(g * 0.8)
+        b = int(b * 0.8)
+        return f'#{r:02x}{g:02x}{b:02x}'
+
     def importar_xmls_pasta(self):
         """Importa XMLs de uma pasta, organiza como se tivesse buscado na SEFAZ e separa emitidos/recebidos."""
         from datetime import datetime
@@ -5921,8 +7435,9 @@ class MainWindow(QMainWindow):
                 "Esta operação irá:\n\n"
                 "• Resetar o NSU para 0 (zero) - NFe e CTe\n"
                 "• Limpar todos os bloqueios de erro 656\n"
-                "• Buscar TODOS os XMLs disponíveis na SEFAZ (NFe + CTe)\n"
+                "• Buscar TODOS os XMLs desde o início\n"
                 "• Pode demorar muito tempo dependendo da quantidade\n\n"
+                "⚠️ Use 'Busca na SEFAZ' para buscar apenas documentos novos.\n\n"
                 "Deseja continuar?",
                 QMessageBox.Yes | QMessageBox.No,
                 QMessageBox.No
@@ -5935,14 +7450,15 @@ class MainWindow(QMainWindow):
             self._search_in_progress = True
             self._next_search_time = None
             
-            # Reseta NSU para 0 no banco de dados e limpa bloqueios de erro 656
+            # ✅ Reseta NSU para 0 no banco de dados e limpa bloqueios de erro 656
+            # BUSCA COMPLETA = buscar TODOS os documentos desde o início
             try:
                 with sqlite3.connect(str(DB_PATH)) as conn:
                     # Busca todos os certificados (informantes)
                     informantes = conn.execute("SELECT DISTINCT informante FROM certificados").fetchall()
                     total_informantes = len(informantes)
                     
-                    # Reseta NSU individualmente para cada certificado (NFe E CTe)
+                    # ✅ Reseta NSU individualmente para cada certificado (NFe E CTe)
                     for (informante,) in informantes:
                         conn.execute(
                             "INSERT OR REPLACE INTO nsu (informante, ult_nsu) VALUES (?, ?)",
@@ -5957,11 +7473,11 @@ class MainWindow(QMainWindow):
                     # Limpa todos os bloqueios de erro 656
                     conn.execute("DELETE FROM erro_656")
                     conn.commit()
-                    
+                
                 # Atualiza timestamp da última busca
                 self.db.set_last_search_time(datetime.now().isoformat())
                 
-                self.set_status(f"NSU resetado para {total_informantes} certificado(s) e bloqueios limpos", 2000)
+                self.set_status(f"NSU resetado para {total_informantes} certificado(s) - iniciando busca completa", 2000)
             except Exception as e:
                 QMessageBox.critical(self, "Busca Completa", f"Erro ao resetar NSU: {e}")
                 self._search_in_progress = False

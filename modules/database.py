@@ -299,17 +299,24 @@ class DatabaseManager:
                     )
                 else:
                     # Insert new
+                    # ⚠️ VALIDAÇÃO: informante deve ser CNPJ/CPF (11 ou 14 dígitos), NUNCA a senha
+                    informante_value = data.get('informante')
+                    if not informante_value or not str(informante_value).replace('.', '').replace('-', '').replace('/', '').isdigit():
+                        # Se informante inválido, usa cnpj_cpf como fallback
+                        print(f"[SEGURANÇA] Informante inválido detectado! Usando cnpj_cpf como fallback.")
+                        informante_value = data.get('cnpj_cpf')
+                    
                     conn.execute('''INSERT INTO certificados 
                         (informante, cnpj_cpf, caminho, senha, cUF_autor, ativo, criado_em, razao_social, nome_certificado)
                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
-                        (data.get('informante'), data.get('cnpj_cpf'),
+                        (informante_value, data.get('cnpj_cpf'),
                          data.get('caminho'), senha_to_save,
                          data.get('cUF_autor'), data.get('ativo', 1),
                          datetime.now().isoformat(), data.get('razao_social'),
                          data.get('nome_certificado'))
                     )
                 conn.commit()
-                print(f"[DEBUG] Certificado salvo com sucesso: {data.get('informante')}")
+                print(f"[DEBUG] Certificado salvo com sucesso: {informante_value}")
                 return True, None
         except sqlite3.IntegrityError as e:
             error_msg = f"Erro de integridade do banco de dados: {e}"

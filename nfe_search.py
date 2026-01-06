@@ -1265,6 +1265,12 @@ class DatabaseManager:
             return last
 
     def set_last_nsu(self, informante, nsu):
+        # ⚠️ VALIDAÇÃO DE SEGURANÇA: informante deve ser CNPJ/CPF (números), nunca senha!
+        if not informante or not str(informante).replace('.', '').replace('-', '').replace('/', '').isdigit():
+            logger.error(f"🚨 SEGURANÇA: Tentativa de salvar valor inválido como informante NSU: {informante[:20] if informante else 'None'}...")
+            logger.error(f"   NSU não será salvo para evitar corrupção do banco de dados!")
+            return
+        
         with self._connect() as conn:
             conn.execute(
                 "INSERT OR REPLACE INTO nsu (informante,ult_nsu) VALUES (?,?)",
@@ -1289,6 +1295,12 @@ class DatabaseManager:
 
     def set_last_nsu_cte(self, informante, nsu):
         """Atualiza último NSU processado de CT-e para o informante"""
+        # ⚠️ VALIDAÇÃO DE SEGURANÇA: informante deve ser CNPJ/CPF (números), nunca senha!
+        if not informante or not str(informante).replace('.', '').replace('-', '').replace('/', '').isdigit():
+            logger.error(f"🚨 SEGURANÇA: Tentativa de salvar valor inválido como informante NSU CT-e: {informante[:20] if informante else 'None'}...")
+            logger.error(f"   NSU CT-e não será salvo para evitar corrupção do banco de dados!")
+            return
+        
         with self._connect() as conn:
             conn.execute(
                 "INSERT OR REPLACE INTO nsu_cte (informante,ult_nsu) VALUES (?,?)",
@@ -2276,27 +2288,33 @@ def processar_cte(db, cert_data):
             
             logger.info(f"📦 [{inf}] CT-e: Fim da extração. Total documentos: {doc_count}, processados: {docs_processados}")
             
-            # Atualiza NSU CT-e
+            # Extrai ultNSU da resposta da SEFAZ
             logger.info(f"🔄 [{inf}] CT-e: Extraindo ultNSU da resposta...")
             ult_cte = cte_svc.extract_last_nsu(resp_cte)
             logger.info(f"📊 [{inf}] CT-e: ultNSU={ult_cte}, NSU atual={ult_nsu_cte}")
             
+            # ✅ CORREÇÃO: SEMPRE atualiza NSU quando SEFAZ retorna ultNSU
+            # Mesmo que seja igual, garante sincronização (importante após Busca Completa)
             if ult_cte:
                 if ult_cte != ult_nsu_cte:
                     logger.info(f"💾 [{inf}] CT-e: Atualizando NSU no banco: {ult_nsu_cte} → {ult_cte}")
-                    db.set_last_nsu_cte(inf, ult_cte)
                     logger.info(f"➡️ [{inf}] CT-e NSU avançou: {ult_nsu_cte} → {ult_cte} ({docs_processados} docs)")
                     ult_nsu_cte = ult_cte
                     logger.info(f"🔄 [{inf}] CT-e: Continuando para próxima iteração...")
                 else:
                     # NSU não mudou - sincroniza e encerra
-                    logger.info(f"🛑 [{inf}] CT-e: NSU não mudou, finalizando loop...")
-                    db.set_last_nsu_cte(inf, ult_cte)
+                    logger.info(f"🛑 [{inf}] CT-e: NSU confirmado pela SEFAZ (permanece em {ult_nsu_cte})")
                     if docs_processados > 0:
                         logger.info(f"✅ [{inf}] CT-e sincronizado: {docs_processados} documentos processados")
                     else:
                         logger.info(f"✅ [{inf}] CT-e sincronizado: nenhum documento novo")
                     logger.info(f"🏁 [{inf}] CT-e: Break - NSU não mudou")
+                
+                # ✅ SEMPRE atualiza no banco (garante sincronização)
+                db.set_last_nsu_cte(inf, ult_cte)
+                
+                # Break apenas se NSU não mudou
+                if ult_cte == ult_nsu_cte:
                     break
             else:
                 logger.warning(f"⚠️ [{inf}] CT-e: SEFAZ não retornou ultNSU, encerrando loop")
@@ -2585,12 +2603,14 @@ UF: {cuf}
                 else:
                     logger.info(f"📭 [{cnpj}] NF-e: Nenhum documento na resposta (docs_list vazio ou None)")
                 
-                # Atualiza NSU se houver
-                if ult and ult != last_nsu:
-                    logger.info(f"📊 [{cnpj}] NF-e: NSU atualizado {last_nsu} → {ult}")
+                # ✅ CORREÇÃO: SEMPRE atualiza NSU quando SEFAZ retorna ultNSU
+                # Mesmo que seja igual, garante sincronização (importante após Busca Completa)
+                if ult:
+                    if ult != last_nsu:
+                        logger.info(f"📊 [{cnpj}] NF-e: NSU atualizado {last_nsu} → {ult}")
+                    else:
+                        logger.debug(f"📊 [{cnpj}] NF-e: NSU confirmado pela SEFAZ (permanece em {last_nsu})")
                     db.set_last_nsu(inf, ult)
-                elif ult:
-                    logger.debug(f"📊 [{cnpj}] NF-e: NSU não mudou (permanece em {last_nsu})")
                 else:
                     logger.warning(f"⚠️ [{cnpj}] NF-e: ultNSU não encontrado na resposta!")
                 
