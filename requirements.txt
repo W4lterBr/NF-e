@@ -22,6 +22,7 @@ zeep>=4.2.1
 # Criptografia e Certificados Digitais
 cryptography>=41.0.7
 pyOpenSSL>=23.3.0
+wincertstore>=0.2  # Para acessar certificados do Windows
 
 # PDF Generation
 reportlab>=4.0.7
