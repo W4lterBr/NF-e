@@ -222,14 +222,18 @@ def ciclo_nsu(db, parser, intervalo=3600):
                                     logger.info(f"📊 [{inf}] Total documentos disponíveis: {int(max_nsu)} (varredura completa)")
                             
                             if cStat == '656':  # Consumo indevido, bloqueio temporário
-                                ult = parser.extract_last_nsu(resp)
-                                if ult and ult != ult_nsu:
-                                    db.set_last_nsu(inf, ult)
-                                    logger.info(f"NSU atualizado após consumo indevido para {inf}: {ult}")
+                                # ⚠️ IMPORTANTE: NÃO atualizar NSU em erro 656!
+                                # Se atualizar, perdemos documentos intermediários
+                                # Exemplo: NSU=1459, SEFAZ retorna ultNSU=1461
+                                # Documentos 1460 e 1461 serão perdidos se avançarmos para 1461
+                                # 
+                                # SOLUÇÃO: Manter NSU atual, bloquear por 65 min,
+                                # e na próxima consulta (após 65 min) buscar os documentos perdidos
                                 
                                 # Registra erro 656 para bloquear tentativas por 65 minutos
                                 db.registrar_erro_656(inf, ult_nsu)
-                                logger.warning(f"Consumo indevido para {inf}, bloqueado por 65 minutos")
+                                logger.warning(f"🔒 [{inf}] Erro 656 - NSU mantido em {ult_nsu}, bloqueado por 65 minutos")
+                                logger.warning(f"⚠️ [{inf}] Documentos intermediários serão baixados na próxima consulta")
                                 consumo_indevido = True
                                 break
 
@@ -283,8 +287,6 @@ def ciclo_nsu(db, parser, intervalo=3600):
                                     if not chave:
                                         continue
                                     
-                                    db.registrar_xml(chave, cnpj)
-                                    
                                     # Extrai e grava status diretamente do XML
                                     cStat, xMotivo = parser.extract_status_from_xml(xml)
                                     if cStat and xMotivo:
@@ -294,8 +296,15 @@ def ciclo_nsu(db, parser, intervalo=3600):
                                     # Busca nome do certificado (se configurado)
                                     nome_cert = db.get_cert_nome_by_informante(inf)
                                     
-                                    # 1. SEMPRE salva em xmls/ (backup local)
-                                    salvar_xml_por_certificado(xml, cnpj, pasta_base="xmls", nome_certificado=nome_cert)
+                                    # 1. SEMPRE salva em xmls/ (backup local) e obtém o caminho
+                                    caminho_xml = salvar_xml_por_certificado(xml, cnpj, pasta_base="xmls", nome_certificado=nome_cert)
+                                    
+                                    # Registra XML no banco COM o caminho
+                                    if caminho_xml:
+                                        db.registrar_xml(chave, cnpj, caminho_xml)
+                                    else:
+                                        db.registrar_xml(chave, cnpj)
+                                        logger.warning(f"⚠️ XML salvo mas caminho não obtido: {chave}")
                                     
                                     # 2. Se configurado armazenamento diferente, copia para lá também
                                     pasta_storage = db.get_config('storage_pasta_base', 'xmls')
@@ -684,21 +693,26 @@ def format_cnpj_cpf_dir(doc: str) -> str:
     """
     return ''.join(filter(str.isdigit, doc or ""))
 
-def salvar_xml_por_certificado(xml, cnpj_cpf, pasta_base="xmls", nome_certificado=None):
+def salvar_xml_por_certificado(xml, cnpj_cpf, pasta_base="xmls", nome_certificado=None, formato_mes=None):
     """
-    Salva o XML em uma pasta organizada por CNPJ e ano-mês de emissão.
+    Salva o XML em uma pasta organizada por CNPJ (backup local) ou nome amigável (armazenamento).
     Detecta automaticamente o tipo de documento e salva na pasta apropriada.
     
-    ⚠️ PADRÃO DE NOMENCLATURA (v1.0.86+):
-    - Nome do arquivo: SEMPRE a chave de acesso (44 dígitos)
-    - Estrutura: xmls/{CNPJ}/{ANO-MES}/{TIPO}/{CHAVE}.xml
-    - Consulte: PADRAO_ARQUIVAMENTO.md
+    ⚠️ PADRÃO DE NOMENCLATURA (v1.0.88+):
+    - Nome do arquivo: {NUMERO}-{FORNECEDOR}.xml
+    - Para eventos: Evento-{NUMERO}-{FORNECEDOR}.xml
+    - Estrutura LOCAL (xmls/): xmls/{CNPJ}/{ANO-MES}/{TIPO}/{NUMERO}-{FORNECEDOR}.xml
+    - Estrutura STORAGE: {storage}/{NOME_AMIGAVEL}/{ANO-MES}/{TIPO}/{NUMERO}-{FORNECEDOR}.xml
     
     Args:
         xml: String XML ou bytes do documento
         cnpj_cpf: CNPJ/CPF do certificado
         pasta_base: Pasta base onde os XMLs serão salvos (padrão: "xmls")
-        nome_certificado: OBSOLETO - Mantido por compatibilidade mas não usado
+        nome_certificado: Nome amigável do certificado (ex: "61-MATPARCG") - usado em STORAGE
+        formato_mes: Formato do mês (MM-AAAA, AAAA-MM, etc.) - lê do banco se None
+    
+    Returns:
+        str: Caminho absoluto onde o XML foi salvo, ou None se não foi salvo
     
     Tipos suportados:
     - NFe completas (procNFe) → NFe/
@@ -706,7 +720,9 @@ def salvar_xml_por_certificado(xml, cnpj_cpf, pasta_base="xmls", nome_certificad
     - Resumos NFe (resNFe) → Resumos/
     - Eventos (resEvento, procEventoNFe) → Eventos/
     
-    Exemplo: xmls/47539664000197/2025-08/NFe/52260115045348000172570010014777191002562584.xml
+    Exemplos: 
+    - LOCAL: xmls/47539664000197/2025-08/NFe/52260115045348000172570010014777191002562584.xml
+    - STORAGE: C:\Arquivo Walter\61-MATPARCG/2025-08/NFe/52260115045348000172570010014777191002562584.xml
     """
     import os
     from lxml import etree
@@ -732,11 +748,17 @@ def salvar_xml_por_certificado(xml, cnpj_cpf, pasta_base="xmls", nome_certificad
         
         if is_only_protocol:
             logger.warning("XML contém apenas protocolo, não será salvo")
-            return  # Não salva protocolos sem dados
+            return None  # Não salva protocolos sem dados
         
-        # ⚠️ SEMPRE usa CNPJ como pasta (PADRÃO v1.0.86)
-        # Ignora nome_certificado para garantir consistência
-        pasta_certificado = format_cnpj_cpf_dir(cnpj_cpf)
+        # ⚠️ LÓGICA DE NOMENCLATURA DE PASTA (v1.0.87+):
+        # - BACKUP LOCAL (xmls/): Usa CNPJ puro (47539664000197)
+        # - ARMAZENAMENTO (storage): Usa nome amigável se fornecido (61-MATPARCG)
+        if pasta_base == "xmls" or not nome_certificado:
+            # Backup local: sempre usa CNPJ
+            pasta_certificado = format_cnpj_cpf_dir(cnpj_cpf)
+        else:
+            # Armazenamento externo: usa nome amigável se disponível
+            pasta_certificado = nome_certificado.strip() if nome_certificado else format_cnpj_cpf_dir(cnpj_cpf)
 
         # Parse o XML para extrair dados de organização
         root = etree.fromstring(xml.encode("utf-8") if isinstance(xml, str) else xml)
@@ -754,8 +776,8 @@ def salvar_xml_por_certificado(xml, cnpj_cpf, pasta_base="xmls", nome_certificad
         elif root_tag == 'resNFe':
             tipo_pasta = "Resumos"
             tipo_doc = "ResNFe"
-        elif root_tag in ['resEvento', 'procEventoNFe', 'evento', 'retEvento']:
-            tipo_pasta = "Eventos"
+        elif root_tag in ['resEvento', 'procEventoNFe', 'evento', 'retEvento', 'infEvento']:
+            tipo_pasta = "Eventos"  # Temporário, será ajustado depois
             tipo_doc = "Evento"
         else:
             # Tipo desconhecido - salva em "Outros"
@@ -826,12 +848,19 @@ def salvar_xml_por_certificado(xml, cnpj_cpf, pasta_base="xmls", nome_certificad
             nNF = root.findtext(f'{ns}nNF') or "RESUMO"
             xNome = root.findtext(f'{ns}xNome') or "NFe"
         
-        # Para eventos (resEvento, procEventoNFe)
+        # Para eventos (resEvento, procEventoNFe, infEvento)
         elif tipo_doc == "Evento":
             ns = '{http://www.portalfiscal.inf.br/nfe}'
             
             # Tenta extrair chave e tipo de evento
             chNFe = root.findtext(f'.//{ns}chNFe')
+            
+            # ⚠️ FALLBACK: Se não achou chave no XML E já temos uma chave válida de 44 dígitos
+            # (pode ser infEvento onde a chave está apenas no nome do arquivo)
+            if (not chNFe or len(chNFe) != 44) and chave and len(chave) == 44:
+                chNFe = chave
+                print(f"[EVENTO] Usando chave do nome do arquivo: {chave[:10]}...")
+            
             tpEvento = root.findtext(f'.//{ns}tpEvento')
             nSeqEvento = root.findtext(f'.//{ns}nSeqEvento') or "1"
             dhEvento = root.findtext(f'.//{ns}dhEvento')
@@ -855,8 +884,19 @@ def salvar_xml_por_certificado(xml, cnpj_cpf, pasta_base="xmls", nome_certificad
                     data_raw = f"{ano}-{mes}-01"
                     # Extrai número da nota da chave (posições 25-34)
                     nNF = chNFe[25:34]
+                    
+                    # ⚠️ DETECTA TIPO DE DOCUMENTO PELO CÓDIGO DA UF NA CHAVE (v1.0.87+)
+                    # Posição 0-1 da chave = código UF
+                    # Se modelo (posição 20-21) for 57 = CT-e, senão = NF-e
+                    modelo = chNFe[20:22] if len(chNFe) >= 22 else '55'
+                    if modelo == '57':
+                        tipo_pasta = "CTe/Eventos"  # Evento de CT-e
+                    else:
+                        tipo_pasta = "NFe/Eventos"  # Evento de NF-e (padrão)
                 except:
-                    pass
+                    tipo_pasta = "NFe/Eventos"  # Padrão se não conseguir detectar
+            else:
+                tipo_pasta = "NFe/Eventos"  # Padrão se não houver chave
             
             if dhEvento:
                 data_raw = dhEvento
@@ -864,12 +904,52 @@ def salvar_xml_por_certificado(xml, cnpj_cpf, pasta_base="xmls", nome_certificad
             nNF = nNF or "EVENTO"
             xNome = tipo_evento
         
-        # Define ano-mês para organização
+        # Define ano-mês para organização com base na configuração
         if data_raw:
             data_part = data_raw.split("T")[0]
-            ano_mes = data_part[:7] if len(data_part) >= 7 else datetime.now().strftime("%Y-%m")
+            # Extrai ano e mês da data
+            if len(data_part) >= 7:
+                ano = data_part[:4]
+                mes = data_part[5:7]
+            else:
+                from datetime import datetime
+                now = datetime.now()
+                ano = str(now.year)
+                mes = f"{now.month:02d}"
         else:
-            ano_mes = datetime.now().strftime("%Y-%m")
+            from datetime import datetime
+            now = datetime.now()
+            ano = str(now.year)
+            mes = f"{now.month:02d}"
+        
+        # Aplica formato configurado (padrão: AAAA-MM)
+        # Se não foi fornecido, tenta ler do banco
+        if formato_mes is None:
+            try:
+                from modules.database import DatabaseManager
+                from pathlib import Path
+                # Usa o caminho correto do banco (mesmo que o resto do sistema)
+                data_dir = Path(__file__).parent
+                db_path = data_dir / 'notas.db'
+                db = DatabaseManager(str(db_path))
+                formato_mes = db.get_config('storage_formato_mes', 'AAAA-MM')
+                print(f"[DEBUG FORMATO] Lido do banco ({db_path}): '{formato_mes}'")
+            except Exception as e:
+                print(f"[WARN] Não conseguiu ler formato do banco: {e}")
+                formato_mes = 'AAAA-MM'
+        else:
+            print(f"[DEBUG FORMATO] Fornecido como parâmetro: '{formato_mes}'")
+        
+        if formato_mes == 'MM-AAAA':
+            ano_mes = f"{mes}-{ano}"
+        elif formato_mes == 'AAAA/MM':
+            ano_mes = f"{ano}/{mes}"
+        elif formato_mes == 'MM/AAAA':
+            ano_mes = f"{mes}/{ano}"
+        else:  # AAAA-MM (padrão)
+            ano_mes = f"{ano}-{mes}"
+        
+        print(f"[DEBUG FORMATO] Formato={formato_mes}, Resultado={ano_mes}")
         
         nNF = nNF or "SEM_NUMERO"
         xNome = xNome or "SEM_NOME"
@@ -878,13 +958,17 @@ def salvar_xml_por_certificado(xml, cnpj_cpf, pasta_base="xmls", nome_certificad
         pasta_dest = os.path.join(pasta_base, pasta_certificado, ano_mes, tipo_pasta)
         os.makedirs(pasta_dest, exist_ok=True)
 
-        # ⚠️ NOME DO ARQUIVO: SEMPRE A CHAVE (PADRÃO v1.0.86)
-        if chave and len(chave) == 44:
-            nome_arquivo = f"{chave}.xml"
+        # ⚠️ NOME DO ARQUIVO: NÚMERO-FORNECEDOR (PADRÃO v1.0.88+)
+        # Para eventos, usa apenas o tipo do evento sem repetir "Evento-"
+        nome_limpo = sanitize_filename(xNome)[:50]  # Limita a 50 caracteres
+        numero_limpo = sanitize_filename(nNF)
+        
+        if tipo_doc == "Evento":
+            # Para eventos, usa só: NUMERO-TIPO_EVENTO
+            # Ex: 000118032-CANCELAMENTO.xml (não "Evento-000118032-EVENTO_...")
+            nome_arquivo = f"{numero_limpo}-{nome_limpo}.xml"
         else:
-            # Fallback para arquivos sem chave válida (muito raro)
-            nome_arquivo = f"{sanitize_filename(nNF)}-{sanitize_filename(xNome)[:40]}.xml"
-            print(f"[AVISO] XML sem chave válida, usando nome: {nome_arquivo}")
+            nome_arquivo = f"{numero_limpo}-{nome_limpo}.xml"
         
         caminho_xml = os.path.join(pasta_dest, nome_arquivo)
 
@@ -892,26 +976,12 @@ def salvar_xml_por_certificado(xml, cnpj_cpf, pasta_base="xmls", nome_certificad
             f.write(xml)
         print(f"[SALVO {tipo_doc}] {caminho_xml}")
         
-        # ⚠️ REGISTRO NO BANCO (xmls_baixados) - PADRÃO v1.0.86
-        # Chave já foi extraída anteriormente
-        try:
-            if chave and len(chave) == 44:
-                # Importa DatabaseManager para registrar
-                from pathlib import Path
-                db_path = Path(__file__).parent.parent / 'notas_test.db'
-                if db_path.exists():
-                    import sqlite3
-                    with sqlite3.connect(str(db_path)) as conn:
-                        # Registra ou atualiza o caminho
-                        conn.execute('''
-                            INSERT OR REPLACE INTO xmls_baixados 
-                            (chave, cnpj_cpf, caminho_arquivo, baixado_em)
-                            VALUES (?, ?, ?, datetime('now'))
-                        ''', (chave, cnpj_cpf, os.path.abspath(caminho_xml)))
-                        conn.commit()
-                        print(f"[REGISTRADO no banco] Chave: {chave[:25]}... → {caminho_xml}")
-        except Exception as db_err:
-            print(f"[AVISO] Erro ao registrar no banco: {db_err}")
+        # Retorna o caminho absoluto
+        caminho_absoluto = os.path.abspath(caminho_xml)
+        
+        # ⚠️ REGISTRO NO BANCO (xmls_baixados) - REMOVIDO DAQUI
+        # O registro agora é feito pela função registrar_xml() do DatabaseManager
+        # que recebe o caminho retornado por esta função
         
         # Gerar PDF automaticamente (apenas para NFe/CTe completas)
         if tipo_doc in ["NFe", "CTe"]:
@@ -924,8 +994,12 @@ def salvar_xml_por_certificado(xml, cnpj_cpf, pasta_base="xmls", nome_certificad
                         print(f"[PDF GERADO] {caminho_pdf}")
             except Exception as pdf_err:
                 print(f"[AVISO] Erro ao gerar PDF: {pdf_err}")
+        
+        return caminho_absoluto  # ✅ Retorna o caminho para ser registrado no banco
+        
     except Exception as e:
         print(f"[ERRO ao salvar XML de {cnpj_cpf}]: {e}")
+        return None  # ❌ Erro ao salvar
 # -------------------------------------------------------------------
 # Validação de XML com XSD
 # -------------------------------------------------------------------
@@ -1131,6 +1205,16 @@ class DatabaseManager:
                 verificada_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 resultado TEXT
             )''')
+            cur.execute('''CREATE TABLE IF NOT EXISTS manifestacoes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chave TEXT NOT NULL,
+                tipo_evento TEXT NOT NULL,
+                informante TEXT NOT NULL,
+                data_manifestacao TEXT NOT NULL,
+                status TEXT,
+                protocolo TEXT,
+                UNIQUE(chave, tipo_evento, informante)
+            )''')
             conn.commit()
             logger.debug("Tabelas verificadas/criadas no banco")
     
@@ -1312,9 +1396,11 @@ class DatabaseManager:
     def registrar_erro_656(self, informante, nsu):
         """Registra que houve erro 656 para este informante/NSU"""
         with self._connect() as conn:
+            from datetime import datetime
+            agora_utc = datetime.utcnow().isoformat()
             conn.execute(
-                "INSERT OR REPLACE INTO erro_656 (informante, ultimo_erro, nsu_bloqueado) VALUES (?, datetime('now'), ?)",
-                (informante, nsu)
+                "INSERT OR REPLACE INTO erro_656 (informante, ultimo_erro, nsu_bloqueado) VALUES (?, ?, ?)",
+                (informante, agora_utc, nsu)
             )
             conn.commit()
             logger.debug(f"Erro 656 registrado: {informante} NSU={nsu}")
@@ -1322,9 +1408,11 @@ class DatabaseManager:
     def registrar_sem_documentos(self, informante):
         """Registra que não há documentos (cStat=137 ou maxNSU=ultNSU) - aguardar 1 hora conforme NT 2014.002"""
         with self._connect() as conn:
+            from datetime import datetime
+            agora_utc = datetime.utcnow().isoformat()
             conn.execute(
-                "INSERT OR REPLACE INTO erro_656 (informante, ultimo_erro, nsu_bloqueado) VALUES (?, datetime('now'), 'SYNC')",
-                (informante,)
+                "INSERT OR REPLACE INTO erro_656 (informante, ultimo_erro, nsu_bloqueado) VALUES (?, ?, 'SYNC')",
+                (informante, agora_utc)
             )
             conn.commit()
             logger.info(f"📊 [{informante}] Sincronizado - aguardando 1h conforme NT 2014.002 (cStat=137 ou ultNSU=maxNSU)")
@@ -1332,9 +1420,11 @@ class DatabaseManager:
     def marcar_primeira_consulta(self, informante):
         """Marca que este certificado está fazendo a primeira consulta (NSU=0)"""
         with self._connect() as conn:
+            from datetime import datetime
+            agora_utc = datetime.utcnow().isoformat()
             conn.execute(
-                "INSERT OR REPLACE INTO config (chave, valor) VALUES (?, datetime('now'))",
-                (f'primeira_consulta_{informante}',)
+                "INSERT OR REPLACE INTO config (chave, valor) VALUES (?, ?)",
+                (f'primeira_consulta_{informante}', agora_utc)
             )
             conn.commit()
             logger.info(f"✅ Primeira consulta marcada para {informante}")
@@ -1358,7 +1448,7 @@ class DatabaseManager:
             # Mudança de NSU não libera consulta antes de 65 minutos!
             from datetime import datetime, timedelta
             ultimo_erro = datetime.fromisoformat(ultimo_erro_str)
-            agora = datetime.now()
+            agora = datetime.utcnow()  # Usar UTC para comparar com ultimo_erro (também UTC)
             diferenca = (agora - ultimo_erro).total_seconds() / 60  # em minutos
             
             if diferenca >= 65:  # 65 minutos de segurança
@@ -1416,14 +1506,34 @@ class DatabaseManager:
         except Exception:
             return default
 
-    def registrar_xml(self, chave, cnpj):
+    def registrar_xml(self, chave, cnpj, caminho_arquivo=None):
+        """
+        Registra XML baixado no banco de dados.
+        
+        Args:
+            chave: Chave de acesso (44 dígitos)
+            cnpj: CNPJ/CPF do informante
+            caminho_arquivo: Caminho completo onde o XML foi salvo (opcional mas recomendado)
+        """
         with self._connect() as conn:
-            conn.execute(
-                "INSERT OR IGNORE INTO xmls_baixados (chave,cnpj_cpf) VALUES (?,?)",
-                (chave, cnpj)
-            )
+            if caminho_arquivo:
+                # Registra ou atualiza com o caminho do arquivo
+                conn.execute('''
+                    INSERT INTO xmls_baixados (chave, cnpj_cpf, caminho_arquivo, baixado_em)
+                    VALUES (?, ?, ?, datetime('now'))
+                    ON CONFLICT(chave) DO UPDATE SET
+                        caminho_arquivo = excluded.caminho_arquivo,
+                        baixado_em = datetime('now')
+                ''', (chave, cnpj, caminho_arquivo))
+                logger.debug(f"XML registrado: {chave} (CNPJ {cnpj}) → {caminho_arquivo}")
+            else:
+                # Compatibilidade: apenas registra chave e CNPJ
+                conn.execute(
+                    "INSERT OR IGNORE INTO xmls_baixados (chave,cnpj_cpf) VALUES (?,?)",
+                    (chave, cnpj)
+                )
+                logger.debug(f"XML registrado: {chave} (CNPJ {cnpj}) - caminho não informado")
             conn.commit()
-            logger.debug(f"XML registrado: {chave} (CNPJ {cnpj})")
 
     def get_chaves_missing_status(self):
         with self._connect() as conn:
@@ -1515,6 +1625,59 @@ class DatabaseManager:
                 return row is not None
         except Exception as e:
             logger.debug(f"Erro ao verificar se nota foi verificada '{chave}': {e}")
+            return False
+    
+    def check_manifestacao_exists(self, chave: str, tipo_evento: str, informante: str) -> bool:
+        """
+        Verifica se manifestação já foi registrada.
+        
+        Args:
+            chave: Chave de acesso da NF-e
+            tipo_evento: Tipo do evento (ex: '210210' para Ciência da Operação)
+            informante: CNPJ/CPF do informante
+        
+        Returns:
+            bool: True se manifestação já existe, False caso contrário
+        """
+        try:
+            with self._connect() as conn:
+                result = conn.execute(
+                    "SELECT COUNT(*) FROM manifestacoes WHERE chave = ? AND tipo_evento = ? AND informante = ?",
+                    (chave, tipo_evento, informante)
+                ).fetchone()
+                return result[0] > 0
+        except Exception as e:
+            logger.debug(f"Erro ao verificar manifestação: {e}")
+            return False
+    
+    def register_manifestacao(self, chave: str, tipo_evento: str, informante: str, 
+                             status: str = 'ENVIADA', protocolo: str = None) -> bool:
+        """
+        Registra manifestação para prevenir duplicatas.
+        
+        Args:
+            chave: Chave de acesso da NF-e
+            tipo_evento: Tipo do evento (ex: '210210')
+            informante: CNPJ/CPF do informante
+            status: Status da manifestação
+            protocolo: Número do protocolo SEFAZ
+        
+        Returns:
+            bool: True se registrado com sucesso, False se já existe
+        """
+        try:
+            from datetime import datetime
+            with self._connect() as conn:
+                conn.execute('''INSERT INTO manifestacoes 
+                    (chave, tipo_evento, informante, data_manifestacao, status, protocolo)
+                    VALUES (?, ?, ?, ?, ?, ?)''',
+                    (chave, tipo_evento, informante, datetime.now().isoformat(), status, protocolo)
+                )
+                conn.commit()
+                return True
+        except Exception as e:
+            # Manifestação já existe (UNIQUE constraint violated)
+            logger.debug(f"Manifestação já existe ou erro: {e}")
             return False
 
 # -------------------------------------------------------------------
@@ -1719,6 +1882,80 @@ class NFeService:
             logger.warning(f"Falha ao inicializar WSDL de protocolo ({wsdl}): {e}")
         self.informante = informante
         self.cuf        = cuf
+
+    def fetch_by_chave_dist(self, chave):
+        """
+        Consulta documento específico via Distribuição DFe usando a chave de acesso.
+        Útil para XMLs antigos que não estão mais disponíveis via ConsultaProtocolo.
+        Disponibilidade: ~1000+ dias (muito maior que ConsultaProtocolo ~180 dias)
+        
+        Args:
+            chave: Chave de 44 dígitos da NF-e/CT-e
+            
+        Returns:
+            XML da resposta ou None em caso de erro
+        """
+        logger.info(f"🔑 Consultando via Distribuição DFe por chave: {chave}")
+        
+        distInt = etree.Element("distDFeInt",
+            xmlns=XMLProcessor.NS['nfe'], versao="1.01"
+        )
+        etree.SubElement(distInt, "tpAmb").text    = "1"
+        etree.SubElement(distInt, "cUFAutor").text = str(self.cuf)
+        etree.SubElement(distInt, "CNPJ").text     = self.informante
+        
+        # Usa consChNFe em vez de distNSU para buscar por chave específica
+        sub = etree.SubElement(distInt, "consChNFe")
+        etree.SubElement(sub, "chNFe").text = chave
+
+        xml_envio = etree.tostring(distInt, encoding='utf-8').decode()
+        
+        # 🔍 DEBUG: Salva XML enviado
+        save_debug_soap(self.informante, "request", xml_envio, prefixo="nfe_dist_chave")
+        
+        # Valide antes de enviar
+        try:
+            validar_xml_auto(xml_envio, 'distDFeInt_v1.01.xsd')
+        except Exception as e:
+            logger.warning(f"XML de distribuição por chave não passou na validação XSD: {e}")
+            # Continua mesmo com erro de validação (às vezes o XSD está desatualizado)
+
+        # 🌐 DEBUG HTTP: Informações da requisição SOAP
+        logger.info(f"🌐 [{self.informante}] HTTP REQUEST Distribuição por Chave:")
+        logger.info(f"   📍 URL: {URL_DISTRIBUICAO}")
+        logger.info(f"   🔐 Certificado: Configurado com PKCS12")
+        logger.info(f"   📦 Método: POST (SOAP)")
+        logger.info(f"   📋 Payload: distDFeInt (consChNFe={chave}, cUF={self.cuf})")
+        logger.info(f"   📏 Tamanho XML: {len(xml_envio)} bytes")
+
+        try:
+            resp = self.dist_client.service.nfeDistDFeInteresse(nfeDadosMsg=distInt)
+            
+            # 🌐 DEBUG HTTP: Informações da resposta
+            logger.info(f"✅ [{self.informante}] HTTP RESPONSE Distribuição por Chave recebida")
+            logger.info(f"   📊 Tipo: {type(resp).__name__}")
+            if hasattr(resp, '__dict__'):
+                logger.debug(f"   🔍 Atributos: {list(resp.__dict__.keys())[:5]}...")
+            
+        except Fault as fault:
+            logger.error(f"SOAP Fault Distribuição por Chave: {fault}")
+            logger.error(f"   ❌ Falha na comunicação SOAP")
+            # 🔍 DEBUG: Salva erro SOAP
+            save_debug_soap(self.informante, "fault", str(fault), prefixo="nfe_dist_chave")
+            return None
+        except Exception as e:
+            logger.error(f"❌ [{self.informante}] Erro HTTP na distribuição por chave: {e}")
+            logger.exception(e)
+            return None
+        
+        xml_str = etree.tostring(resp, encoding='utf-8').decode()
+        logger.info(f"📥 [{self.informante}] Resposta processada: {len(xml_str)} bytes")
+        logger.debug(f"Resposta Distribuição por Chave:\n{xml_str}")
+        
+        # 🔍 DEBUG: Salva XML recebido
+        save_debug_soap(self.informante, "response", xml_str, prefixo="nfe_dist_chave")
+        
+        return xml_str
 
     def fetch_by_cnpj(self, tipo, ult_nsu):
         logger.debug(f"Chamando distribuição: tipo={tipo}, informante={self.informante}, ultNSU={ult_nsu}")
@@ -2158,6 +2395,8 @@ def processar_cte(db, cert_data):
                 max_nsu = cte_svc.extract_max_nsu(resp)
                 if max_nsu and max_nsu != "000000000000000":
                     logger.info(f"📊 [{inf}] CT-e disponíveis até NSU: {max_nsu}")
+                elif max_nsu == "000000000000000":
+                    logger.info(f"✅ [{inf}] CT-e: SEFAZ retornou maxNSU=0 (sem documentos disponíveis)")
         
         # Loop de busca incremental com limite de segurança
         ult_nsu_cte = last_nsu_cte
@@ -2188,7 +2427,12 @@ def processar_cte(db, cert_data):
             logger.info(f"📊 [{inf}] CT-e cStat: {cStat_cte}")
             
             if cStat_cte == '656':
-                logger.warning(f"⚠️ [{inf}] CT-e: Consumo indevido (656), encerrando loop")
+                logger.warning(f"🔒 [{inf}] CT-e: Erro 656 - Consumo indevido")
+                # ⚠️ IMPORTANTE: NÃO atualizar NSU em erro 656!
+                # Se atualizar, perdemos documentos intermediários
+                # SOLUÇÃO: Manter NSU atual, bloquear por 65 min
+                logger.warning(f"⚠️ [{inf}] CT-e: NSU mantido em {ult_nsu_cte}, documentos serão baixados após bloqueio")
+                logger.info(f"   ⏰ Bloqueio por consulta muito frequente - aguarde 65 minutos")
                 break
             
             # Extrai e processa documentos CT-e
@@ -2228,16 +2472,19 @@ def processar_cte(db, cert_data):
                         chave_cte = infcte.attrib.get('Id', '')[-44:]
                         logger.debug(f"✅ [{inf}] CT-e NSU {nsu}: chave={chave_cte}")
                     
-                    # Registra XML no banco
-                    logger.debug(f"💾 [{inf}] CT-e {chave_cte}: Registrando no banco...")
-                    db.registrar_xml(chave_cte, cnpj)
-                    
                     # Busca nome do certificado (se configurado)
                     nome_cert = db.get_cert_nome_by_informante(inf)
                     
-                    # 1. SEMPRE salva em xmls/ (backup local)
+                    # 1. SEMPRE salva em xmls/ (backup local) e obtém o caminho
                     logger.debug(f"💾 [{inf}] CT-e {chave_cte}: Salvando em xmls/ (backup)...")
-                    salvar_xml_por_certificado(xml_cte, cnpj, pasta_base="xmls", nome_certificado=nome_cert)
+                    caminho_xml = salvar_xml_por_certificado(xml_cte, cnpj, pasta_base="xmls", nome_certificado=nome_cert)
+                    
+                    # Registra XML no banco COM o caminho
+                    if caminho_xml:
+                        db.registrar_xml(chave_cte, cnpj, caminho_xml)
+                    else:
+                        db.registrar_xml(chave_cte, cnpj)
+                        logger.warning(f"⚠️ [{inf}] CT-e XML salvo mas caminho não obtido: {chave_cte}")
                     
                     # 2. Se configurado armazenamento diferente, copia para lá também
                     pasta_storage = db.get_config('storage_pasta_base', 'xmls')
@@ -2420,10 +2667,20 @@ def run_single_cycle():
             logger.info(f"📊 [{cnpj}] NF-e: NSU atual = {last_nsu}")
             logger.info(f"🔐 [{cnpj}] NF-e: Certificado = {path}, cUF = {cuf}")
             
-            resp     = svc.fetch_by_cnpj("CNPJ" if len(cnpj)==14 else "CPF", last_nsu)
-            if not resp:
-                logger.warning(f"Sem resposta NFe para {inf}")
-            else:
+            # 🔄 LOOP para buscar TODOS os documentos até ultNSU == maxNSU
+            max_iterations = 100  # Limite de segurança
+            iteration_count = 0
+            
+            while iteration_count < max_iterations:
+                iteration_count += 1
+                logger.info(f"🔄 [{cnpj}] NF-e iteração {iteration_count}/{max_iterations}, NSU atual: {last_nsu}")
+                
+                resp = svc.fetch_by_cnpj("CNPJ" if len(cnpj)==14 else "CPF", last_nsu)
+                if not resp:
+                    logger.warning(f"Sem resposta NFe para {inf} na iteração {iteration_count}")
+                    break  # Sai do loop
+                
+                # Processa a resposta dentro do loop
                 # Log da resposta para debug
                 logger.info(f"📥 [{cnpj}] NF-e: Resposta recebida ({len(resp)} bytes)")
                 logger.info(f"📄 [{cnpj}] NF-e: Primeiros 800 caracteres da resposta:")
@@ -2447,9 +2704,55 @@ UF: {cuf}
                 ult   = parser.extract_last_nsu(resp)
                 max_nsu = parser.extract_max_nsu(resp)
                 
-                logger.info(f"📊 [{cnpj}] NF-e: cStat={cStat}, ultNSU={ult}, maxNSU={max_nsu}")
+                # Log mais claro sobre maxNSU
+                if max_nsu == "000000000000000":
+                    logger.info(f"📊 [{cnpj}] NF-e: cStat={cStat}, ultNSU={ult}, maxNSU={max_nsu} (SEFAZ: sem docs novos)")
+                else:
+                    logger.info(f"📊 [{cnpj}] NF-e: cStat={cStat}, ultNSU={ult}, maxNSU={max_nsu}")
                 
-                # SEMPRE processa documentos, mesmo com erro 656
+                # 🔴 TRATAMENTO DE ERRO 656 - Consumo Indevido (ANTES de processar docs)
+                if cStat == '656':
+                    logger.warning(f"🚫 [{cnpj}] NF-e: cStat=656 - Consumo Indevido detectado")
+                    
+                    # ⚠️ IMPORTANTE: NÃO atualizar NSU em erro 656!
+                    # Se atualizar, perdemos documentos intermediários
+                    # Exemplo: NSU=1459, SEFAZ retorna ultNSU=1461
+                    # Documentos 1460 e 1461 serão perdidos se avançarmos
+                    logger.warning(f"⚠️ [{cnpj}] NF-e: NSU mantido em {last_nsu} para evitar perda de documentos")
+                    logger.warning(f"📋 [{cnpj}] NF-e: SEFAZ indicou ultNSU={ult}, documentos serão baixados após bloqueio")
+                    
+                    # Registra erro 656 para bloquear por 65 minutos
+                    db.registrar_erro_656(inf, last_nsu)
+                    logger.warning(f"🔒 [{cnpj}] NF-e bloqueada por 65 minutos - próxima consulta possível às {(datetime.now() + timedelta(minutes=65)).strftime('%H:%M:%S')}")
+                    
+                    # Explica o erro de forma clara
+                    if max_nsu == "000000000000000":
+                        logger.info(f"   ✅ Situação normal: SEFAZ retornou maxNSU=0 (não há documentos novos)")
+                        logger.info(f"   📝 NSU atual ({ult}) está atualizado - sistema aguardando novos documentos")
+                    else:
+                        logger.info(f"   📭 SEFAZ informa maxNSU={max_nsu}")
+                    logger.info(f"   ⏰ Bloqueio por consulta muito frequente (< 1 hora) - aguarde intervalo")
+                    
+                    break  # Sai do loop NF-e, vai para CT-e
+                
+                # 🛑 ORDEM CORRETA: Verifica cStat=137 PRIMEIRO (antes de ultNSU==maxNSU)
+                # cStat 137 = Nenhum documento localizado
+                if cStat == '137':
+                    logger.info(f"📭 [{cnpj}] NF-e: cStat=137 - Nenhum documento localizado")
+                    
+                    # Atualiza NSU
+                    if ult:
+                        db.set_last_nsu(inf, ult)
+                        logger.debug(f"📊 [{cnpj}] NF-e: NSU atualizado para {ult}")
+                    
+                    # Registra sem documentos (bloqueia por 1h)
+                    db.registrar_sem_documentos(inf)
+                    logger.info(f"⏰ [{cnpj}] NF-e: Aguardando 1h conforme NT 2014.002 - próxima consulta às {(datetime.now() + timedelta(hours=1)).strftime('%H:%M:%S')}")
+                    
+                    break  # Sai do loop NF-e, vai para CT-e
+                
+                # ✅ Se chegou aqui: cStat=138 (há documentos para processar)
+                # Processa documentos normalmente
                 docs_count = 0
                 docs_list = parser.extract_docs(resp)
                 
@@ -2511,10 +2814,17 @@ UF: {cuf}
                                     # 🔍 DEBUG: Salva XML do evento individualmente
                                     save_debug_soap(inf, f"evento_{tpEvento}_NSU{nsu}", xml, prefixo="extraido")
                                     
-                                    # Salva o evento na pasta Eventos (função já suporta eventos)
+                                    # Busca nome do certificado (se configurado)
                                     nome_cert = db.get_cert_nome_by_informante(inf)
+                                    
+                                    # 1. SEMPRE salva evento em xmls/ (backup local)
                                     salvar_xml_por_certificado(xml, cnpj, pasta_base="xmls", nome_certificado=nome_cert)
                                     logger.info(f"💾 [{cnpj}] Evento salvo na pasta Eventos/")
+                                    
+                                    # 2. Se configurado armazenamento diferente, copia para lá também
+                                    pasta_storage = db.get_config('storage_pasta_base', 'xmls')
+                                    if pasta_storage and pasta_storage != 'xmls':
+                                        salvar_xml_por_certificado(xml, cnpj, pasta_base=pasta_storage, nome_certificado=nome_cert)
                                     
                                     # Processa o evento (atualiza status da nota se for cancelamento, etc)
                                     processar_evento_status(xml, chave, db)
@@ -2568,14 +2878,20 @@ UF: {cuf}
                             # 🔍 DEBUG: Salva XML da NF-e individualmente
                             save_debug_soap(inf, f"nfe_NSU{nsu}_chave{chave[:8]}", xml, prefixo="extraido")
                             
-                            db.registrar_xml(chave, cnpj)
-                            
                             # Busca nome do certificado (se configurado)
                             nome_cert = db.get_cert_nome_by_informante(inf)
                             
-                            # 1. SEMPRE salva em xmls/ (backup local)
+                            # 1. SEMPRE salva em xmls/ (backup local) e obtém o caminho
                             logger.info(f"💾 [{cnpj}] NF-e: Salvando em xmls/ (backup) - chave={chave}")
-                            salvar_xml_por_certificado(xml, cnpj, pasta_base="xmls", nome_certificado=nome_cert)
+                            caminho_xml = salvar_xml_por_certificado(xml, cnpj, pasta_base="xmls", nome_certificado=nome_cert)
+                            
+                            # Registra XML no banco COM o caminho do arquivo
+                            if caminho_xml:
+                                db.registrar_xml(chave, cnpj, caminho_xml)
+                            else:
+                                # Fallback: registra sem caminho
+                                db.registrar_xml(chave, cnpj)
+                                logger.warning(f"⚠️ [{cnpj}] XML salvo mas caminho não obtido: {chave}")
                             
                             # 2. Se configurado armazenamento diferente, copia para lá também
                             pasta_storage = db.get_config('storage_pasta_base', 'xmls')
@@ -2602,9 +2918,13 @@ UF: {cuf}
                     logger.info(f"📊 [{cnpj}] Resumo de documentos salvo em Debug de notas/")
                 else:
                     logger.info(f"📭 [{cnpj}] NF-e: Nenhum documento na resposta (docs_list vazio ou None)")
+                    
+                    # Se não há documentos E ultNSU < maxNSU, pode haver problema
+                    if ult and max_nsu and int(ult) < int(max_nsu):
+                        logger.warning(f"⚠️ [{cnpj}] NF-e: Sem documentos, mas ultNSU ({ult}) < maxNSU ({max_nsu})")
+                        logger.warning(f"   Possível problema no parser ou resposta da SEFAZ")
                 
-                # ✅ CORREÇÃO: SEMPRE atualiza NSU quando SEFAZ retorna ultNSU
-                # Mesmo que seja igual, garante sincronização (importante após Busca Completa)
+                # ✅ ATUALIZA NSU APÓS PROCESSAR DOCUMENTOS
                 if ult:
                     if ult != last_nsu:
                         logger.info(f"📊 [{cnpj}] NF-e: NSU atualizado {last_nsu} → {ult}")
@@ -2614,48 +2934,37 @@ UF: {cuf}
                 else:
                     logger.warning(f"⚠️ [{cnpj}] NF-e: ultNSU não encontrado na resposta!")
                 
-                # Verifica status APÓS processar documentos
-                if cStat == '137':
-                    # cStat=137: Nenhum documento localizado - aguardar 1h (NT 2014.002 item 3.11.4.1)
-                    logger.info(f"📭 [{cnpj}] NF-e: cStat=137 - Nenhum documento localizado")
-                    db.registrar_sem_documentos(inf)
-                    logger.info(f"⏰ [{cnpj}] NF-e: Aguardando 1h conforme NT 2014.002 - próxima consulta às {(datetime.now() + timedelta(hours=1)).strftime('%H:%M:%S')}")
-                elif cStat == '138' and ult and max_nsu and ult == max_nsu:
-                    # ultNSU = maxNSU: Não há mais documentos - aguardar 1h (NT 2014.002 item 3.11.4.1)
-                    logger.info(f"📊 [{cnpj}] NF-e: ultNSU ({ult}) = maxNSU ({max_nsu}) - sincronizado")
-                    if docs_count == 0:
-                        db.registrar_sem_documentos(inf)
-                        logger.info(f"⏰ [{cnpj}] NF-e: Aguardando 1h conforme NT 2014.002 - próxima consulta às {(datetime.now() + timedelta(hours=1)).strftime('%H:%M:%S')}")
-                    else:
-                        logger.info(f"✅ [{cnpj}] NF-e: {docs_count} documento(s) processado(s) - banco atualizado")
-                elif cStat == '656':
-                    # Registra erro 656 para bloquear consultas por 65 minutos
-                    db.registrar_erro_656(inf, last_nsu)
+                # Log final do processamento
+                if docs_count > 0:
+                    logger.info(f"✅ [{cnpj}] NF-e: {docs_count} documento(s) processado(s) com sucesso")
                     
-                    if docs_count > 0:
-                        logger.warning(f"⚠️ [{cnpj}] NF-e: Consumo indevido (656), mas {docs_count} doc(s) processado(s)")
+                    # Se processou documentos mas ultNSU == maxNSU, ainda está sincronizado
+                    if ult and max_nsu and ult == max_nsu:
+                        logger.info(f"📊 [{cnpj}] NF-e: Após processar {docs_count} doc(s), sistema sincronizado (ultNSU=maxNSU)")
+                        db.registrar_sem_documentos(inf)
+                        logger.info(f"   ⏰ Próxima consulta em 1h conforme NT 2014.002")
+                
+                # 🔄 Controle do loop NF-e
+                # Verifica se há mais documentos para buscar
+                if ult and max_nsu:
+                    if ult == max_nsu:
+                        logger.info(f"✅ [{cnpj}] NF-e sincronizada: ultNSU={ult} == maxNSU={max_nsu}")
+                        break  # Sai do loop, vai para CT-e
                     else:
-                        # Erro 656 sem documentos = SEFAZ bloqueando por excesso de consultas
-                        # Isso é normal se estiver consultando com frequência
-                        logger.info(f"⏸️ [{cnpj}] NF-e: Consumo indevido (656) - aguardar intervalo antes de nova consulta")
-                        logger.info(f"   📊 NSU local: {last_nsu} → Atualizado para: {ult}")
-                        logger.info(f"   📭 maxNSU={max_nsu} (0 = sem documentos disponíveis)")
+                        # Ainda há documentos
+                        docs_restantes = int(max_nsu) - int(ult)
+                        logger.info(f"🔄 [{cnpj}] Ainda há ~{docs_restantes} documentos - continuando loop (ultNSU={ult}, maxNSU={max_nsu})")
                         
-                        # Explica o que significa
-                        if max_nsu == "000000000000000":
-                            logger.info(f"   ℹ️ Não há documentos novos disponíveis na SEFAZ")
-                            logger.info(f"   ℹ️ A diferença de NSU ({int(ult) - int(last_nsu)} posições) pode indicar:")
-                            logger.info(f"      • Documentos cancelados ou invalidados")
-                            logger.info(f"      • Eventos já processados")
-                            logger.info(f"      • Documentos ainda não liberados")
+                        # Atualiza NSU para próxima iteração
+                        last_nsu = ult
+                        db.set_last_nsu(inf, ult)
                         
-                        logger.info(f"   ⏰ Motivo do erro 656: Consultas muito frequentes (< 1 hora)")
-                        logger.warning(f"🔒 [{cnpj}] NF-e bloqueada por 65 minutos - próxima consulta possível às {(datetime.now() + timedelta(minutes=65)).strftime('%H:%M:%S')}")
-                else:
-                    if docs_count > 0:
-                        logger.info(f"✅ [{cnpj}] NF-e: {docs_count} documento(s) processado(s)")
-                    else:
-                        logger.info(f"✅ [{cnpj}] NF-e sincronizado: nenhum documento novo")
+                        # Continua loop (não faz break)
+                        continue
+                
+                # Se não conseguiu extrair NSUs, sai do loop
+                logger.warning(f"⚠️ [{cnpj}] Não foi possível extrair ultNSU/maxNSU - saindo do loop")
+                break
             
             # 1.2) Busca CTe
             try:
@@ -2799,7 +3108,26 @@ def atualizar_status_notas_lote(db, certificados, chaves_list, progress_callback
                     # Salva XML do evento
                     try:
                         evento_xml = etree.tostring(evento, encoding='utf-8', pretty_print=True).decode()
-                        informante = evento.findtext(f'{{{ns_uri}}}CNPJ') or 'desconhecido'
+                        
+                        # Tenta extrair CNPJ do evento, depois da chave, e por último usa o informante do certificado
+                        informante = evento.findtext(f'{{{ns_uri}}}CNPJ')
+                        
+                        if not informante:
+                            # Extrai CNPJ da chave (posições 6-20 = 14 dígitos do CNPJ)
+                            try:
+                                informante = chave[6:20] if len(chave) >= 20 else None
+                            except:
+                                pass
+                        
+                        # Se ainda não tem, usa o CNPJ do certificado (self.cnpj_cpf)
+                        if not informante:
+                            informante = getattr(self, 'cnpj_cpf', None)
+                        
+                        # Último fallback: usa string vazia (vai para pasta raiz)
+                        if not informante:
+                            logger.warning(f"⚠️ Não foi possível identificar CNPJ para evento de {chave}")
+                            informante = ""
+                        
                         ano_mes = chave[2:6]  # AAMM da chave
                         ano = '20' + ano_mes[:2]
                         mes = ano_mes[2:4]

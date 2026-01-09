@@ -456,7 +456,8 @@ class MainWindow(QMainWindow):
         btn_busca = QPushButton("Buscar na SEFAZ"); btn_busca.clicked.connect(self.do_search)
         btn_busca_completa = QPushButton("Busca Completa"); btn_busca_completa.clicked.connect(self.do_busca_completa)
         btn_busca_chave = QPushButton("Busca por chave"); btn_busca_chave.clicked.connect(self.buscar_por_chave)
-        btn_manifestacao = QPushButton("✉️ Manifestação"); btn_manifestacao.clicked.connect(self.abrir_manifestacao)
+        btn_manifestacao = QPushButton("✉️ Manifestação Manual"); btn_manifestacao.clicked.connect(lambda: self._manifestar_nota(None))
+        btn_manifestacao.setToolTip("Manifestar um documento digitando a chave manualmente")
         btn_exportar = QPushButton("📤 Exportar"); btn_exportar.clicked.connect(self.abrir_exportacao)
         
         # Seletor de intervalo entre buscas
@@ -470,16 +471,6 @@ class MainWindow(QMainWindow):
         self.spin_intervalo.valueChanged.connect(self._save_intervalo_config)
         self.spin_intervalo.setToolTip("Intervalo mínimo: 1 hora | Intervalo máximo: 23 horas")
         
-        # Checkbox para habilitar/desabilitar consulta de status
-        from PyQt5.QtWidgets import QCheckBox
-        self.check_consultar_status = QCheckBox("Consultar status (protocolo)")
-        self.check_consultar_status.setChecked(self._load_consultar_status_config())
-        self.check_consultar_status.stateChanged.connect(self._save_consultar_status_config)
-        self.check_consultar_status.setToolTip(
-            "Se habilitado, consulta o status de notas sem status após buscar documentos.\n"
-            "DICA: Desabilite se a consulta estiver travando a busca de novos documentos."
-        )
-
         # Icons (fallback to standard icons if custom not found)
         def _icon(name: str, std=None) -> QIcon:
             p = BASE_DIR / 'Icone' / name
@@ -509,7 +500,6 @@ class MainWindow(QMainWindow):
         t.addWidget(limit_label)
         t.addWidget(self.limit_dd)
         t.addStretch(1)
-        t.addWidget(self.check_consultar_status)
         t.addWidget(intervalo_label)
         t.addWidget(self.spin_intervalo)
         t.addWidget(self.btn_refresh)
@@ -962,6 +952,9 @@ class MainWindow(QMainWindow):
                 self.notes = self.db.load_notes(limit=5000)  # Aumenta limite para 5000
                 print(f"[AUTO-UPDATE] {len(self.notes)} notas carregadas (antes: {old_count})")
                 
+                # Corrige xml_status baseado em arquivos existentes
+                self._corrigir_xml_status_automatico()
+                
                 # Verifica quantas estão canceladas
                 canceladas_count = sum(1 for n in self.notes if 'cancel' in (n.get('status') or '').lower())
                 print(f"[AUTO-UPDATE] {canceladas_count} notas canceladas detectadas nos dados")
@@ -1113,6 +1106,10 @@ class MainWindow(QMainWindow):
                     print("[PÓS-BUSCA] Recarregando dados...")
                     self.notes = self.db.load_notes(limit=5000)
                     self._refresh_table_only()
+                
+                # 🆕 SEMPRE executa correção de status (mesmo sem atualizações)
+                print("[PÓS-BUSCA] Executando correção automática de status XML...")
+                QTimer.singleShot(500, lambda: self._executar_correcao_status())
             
             def on_error(error_msg):
                 print(f"[PÓS-BUSCA] Erro: {error_msg}")
@@ -1128,6 +1125,127 @@ class MainWindow(QMainWindow):
             
         except Exception as e:
             print(f"[PÓS-BUSCA] Erro geral: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    def _executar_correcao_status(self):
+        """Executa correção de xml_status em thread separada (background task)"""
+        try:
+            # Evita múltiplas execuções simultâneas
+            if hasattr(self, '_correcao_worker') and self._correcao_worker:
+                print("[CORREÇÃO] Já existe uma correção em andamento, aguardando...")
+                return
+            
+            print("[CORREÇÃO] Iniciando correção automática de xml_status em background...")
+            
+            from PyQt5.QtCore import QThread, pyqtSignal
+            
+            class CorrecaoStatusWorker(QThread):
+                finished = pyqtSignal(int)  # Número de registros corrigidos
+                error = pyqtSignal(str)
+                
+                def __init__(self, parent_window):
+                    super().__init__()
+                    self.parent_window = parent_window
+                
+                def run(self):
+                    try:
+                        from pathlib import Path
+                        corrigidos = 0
+                        
+                        print("[CORREÇÃO-THREAD] Verificando consistência de xml_status...")
+                        
+                        for nota in self.parent_window.notes:
+                            chave = nota.get('chave')
+                            xml_status_atual = (nota.get('xml_status') or 'RESUMO').upper()
+                            informante = nota.get('informante', '')
+                            tipo = (nota.get('tipo') or 'NFe').strip().upper().replace('-', '')
+                            data_emissao = (nota.get('data_emissao') or '')[:10]
+                            
+                            if not chave or not informante or not data_emissao:
+                                continue
+                            
+                            # Extrai ano-mês
+                            year_month = data_emissao[:7] if len(data_emissao) >= 7 else None
+                            if not year_month:
+                                continue
+                            
+                            # Verifica se arquivo existe (múltiplas possibilidades)
+                            xml_path = DATA_DIR / "xmls" / informante / year_month / tipo / f"{chave}.xml"
+                            pdf_path = DATA_DIR / "xmls" / informante / year_month / tipo / f"{chave}.pdf"
+                            
+                            # Tenta estrutura antiga também
+                            if not xml_path.exists():
+                                xml_path = DATA_DIR / "xmls" / informante / year_month / f"{chave}.xml"
+                                pdf_path = DATA_DIR / "xmls" / informante / year_month / f"{chave}.pdf"
+                            
+                            # Verifica também no banco xmls_baixados
+                            arquivo_existe = xml_path.exists() or pdf_path.exists()
+                            
+                            if not arquivo_existe:
+                                # Verifica no banco
+                                try:
+                                    with self.parent_window.db._connect() as conn:
+                                        cursor = conn.cursor()
+                                        cursor.execute("SELECT xml_completo FROM xmls_baixados WHERE chave = ?", (chave,))
+                                        if cursor.fetchone():
+                                            arquivo_existe = True
+                                except Exception:
+                                    pass
+                            
+                            # Corrige inconsistência
+                            if arquivo_existe and xml_status_atual == 'RESUMO':
+                                # Tem arquivo mas está marcado como RESUMO → corrigir para COMPLETO
+                                nota['xml_status'] = 'COMPLETO'
+                                with self.parent_window.db._connect() as conn:
+                                    conn.execute(
+                                        "UPDATE notas_detalhadas SET xml_status = 'COMPLETO' WHERE chave = ?",
+                                        (chave,)
+                                    )
+                                corrigidos += 1
+                            elif not arquivo_existe and xml_status_atual == 'COMPLETO':
+                                # Não tem arquivo mas está marcado como COMPLETO → corrigir para RESUMO
+                                nota['xml_status'] = 'RESUMO'
+                                with self.parent_window.db._connect() as conn:
+                                    conn.execute(
+                                        "UPDATE notas_detalhadas SET xml_status = 'RESUMO' WHERE chave = ?",
+                                        (chave,)
+                                    )
+                                corrigidos += 1
+                        
+                        self.finished.emit(corrigidos)
+                        
+                    except Exception as e:
+                        import traceback
+                        error_msg = f"Erro na correção: {str(e)}\n{traceback.format_exc()}"
+                        self.error.emit(error_msg)
+            
+            def on_finished(corrigidos):
+                if corrigidos > 0:
+                    print(f"[CORREÇÃO] ✅ {corrigidos} registros corrigidos")
+                    # Atualiza visualização
+                    self._refresh_table_only()
+                    self.set_status(f"✅ {corrigidos} status XML corrigidos", 5000)
+                else:
+                    print(f"[CORREÇÃO] ✅ Todos os registros estão consistentes")
+                
+                # Limpa worker
+                self._correcao_worker = None
+            
+            def on_error(error_msg):
+                print(f"[CORREÇÃO] ❌ Erro: {error_msg}")
+                self._correcao_worker = None
+            
+            worker = CorrecaoStatusWorker(self)
+            worker.finished.connect(on_finished)
+            worker.error.connect(on_error)
+            worker.start()
+            
+            # Mantém referência
+            self._correcao_worker = worker
+            
+        except Exception as e:
+            print(f"[CORREÇÃO] Erro ao iniciar worker: {e}")
             import traceback
             traceback.print_exc()
     
@@ -1407,24 +1525,6 @@ class MainWindow(QMainWindow):
         # Checkbox: Consultar Status na SEFAZ
         print("DEBUG: Criando checkbox Consultar Status...")
         self._act_consultar_status = QAction("✅ Consultar Status na SEFAZ", self)
-        self._act_consultar_status.setCheckable(True)
-        self._act_consultar_status.setChecked(self._load_consultar_status_config())
-        self._act_consultar_status.setToolTip(
-            "Se habilitado, consulta o status de notas sem status após buscar documentos.\n"
-            "DICA: Desabilite se a consulta estiver travando a busca de novos documentos."
-        )
-        def _toggle_consultar_status(checked: bool):
-            try:
-                self._save_consultar_status_config(2 if checked else 0)  # Qt.Checked = 2
-                if hasattr(self, 'check_consultar_status'):
-                    self.check_consultar_status.setChecked(checked)
-            except Exception:
-                pass
-            self.set_status("Consultar status: " + ("ativado" if checked else "desativado"), 2500)
-        self._act_consultar_status.toggled.connect(_toggle_consultar_status)
-        tarefas.addAction(self._act_consultar_status)
-        print("DEBUG: Checkbox adicionado ao menu")
-        
         tarefas.addSeparator()
         add_action(tarefas, "🔄 Atualizações", self.check_updates, "Ctrl+U", qstyle_icon=QStyle.SP_BrowserReload)
         tarefas.addSeparator()
@@ -1875,6 +1975,10 @@ class MainWindow(QMainWindow):
         def on_loaded(notes: List[Dict[str, Any]]):
             try:
                 self.notes = notes or []
+                
+                # Corrige xml_status baseado em arquivos existentes
+                self._corrigir_xml_status_automatico()
+                
                 try:
                     self._populate_certs_tree()
                 except Exception:
@@ -1920,6 +2024,69 @@ class MainWindow(QMainWindow):
             print("[REFRESH] Tabelas atualizadas")
         except Exception as e:
             print(f"[REFRESH] Erro ao atualizar tabelas: {e}")
+    
+    def _corrigir_xml_status_automatico(self):
+        """Corrige xml_status baseado na existência de arquivos XML/PDF no disco"""
+        from pathlib import Path
+        corrigidos = 0
+        
+        try:
+            print("[CORREÇÃO] Verificando consistência de xml_status...")
+            
+            for nota in self.notes:
+                chave = nota.get('chave')
+                xml_status_atual = (nota.get('xml_status') or 'RESUMO').upper()
+                informante = nota.get('informante', '')
+                tipo = (nota.get('tipo') or 'NFe').strip().upper().replace('-', '')
+                data_emissao = (nota.get('data_emissao') or '')[:10]
+                
+                if not chave or not informante or not data_emissao:
+                    continue
+                
+                # Extrai ano-mês
+                year_month = data_emissao[:7] if len(data_emissao) >= 7 else None
+                if not year_month:
+                    continue
+                
+                # Verifica se arquivo existe
+                xml_path = DATA_DIR / "xmls" / informante / year_month / tipo / f"{chave}.xml"
+                pdf_path = DATA_DIR / "xmls" / informante / year_month / tipo / f"{chave}.pdf"
+                
+                # Tenta estrutura antiga também
+                if not xml_path.exists():
+                    xml_path = DATA_DIR / "xmls" / informante / year_month / f"{chave}.xml"
+                    pdf_path = DATA_DIR / "xmls" / informante / year_month / f"{chave}.pdf"
+                
+                arquivo_existe = xml_path.exists() or pdf_path.exists()
+                
+                # Corrige inconsistência
+                if arquivo_existe and xml_status_atual == 'RESUMO':
+                    # Tem arquivo mas está marcado como RESUMO → corrigir para COMPLETO
+                    nota['xml_status'] = 'COMPLETO'
+                    # Atualiza no banco
+                    with self.db._connect() as conn:
+                        conn.execute(
+                            "UPDATE notas_detalhadas SET xml_status = 'COMPLETO' WHERE chave = ?",
+                            (chave,)
+                        )
+                    corrigidos += 1
+                elif not arquivo_existe and xml_status_atual == 'COMPLETO':
+                    # Não tem arquivo mas está marcado como COMPLETO → corrigir para RESUMO
+                    nota['xml_status'] = 'RESUMO'
+                    with self.db._connect() as conn:
+                        conn.execute(
+                            "UPDATE notas_detalhadas SET xml_status = 'RESUMO' WHERE chave = ?",
+                            (chave,)
+                        )
+                    corrigidos += 1
+            
+            if corrigidos > 0:
+                print(f"[CORREÇÃO] ✅ {corrigidos} registros corrigidos")
+            else:
+                print(f"[CORREÇÃO] ✅ Todos os registros estão consistentes")
+                
+        except Exception as e:
+            print(f"[CORREÇÃO] ❌ Erro: {e}")
     
     def _clear_date_filters(self):
         """Limpa os filtros de data (volta ao padrão)"""
@@ -2398,33 +2565,17 @@ class MainWindow(QMainWindow):
         return codigo_to_uf.get(str(codigo).strip(), codigo)
     
     def _verificar_notas_cinza(self):
-        """Verifica automaticamente notas com status cinza (RESUMO) e busca XML completo."""
-        try:
-            # Busca notas com status RESUMO que ainda não foram verificadas
-            from nfe_search import DatabaseManager
-            db_nfe = DatabaseManager(str(DB_PATH))
-            
-            notas_resumo = [
-                nota for nota in self.notes 
-                if (nota.get('xml_status') or '').upper() == 'RESUMO' 
-                and (nota.get('tipo') or '').upper() not in ['CTE', 'CT-E']  # ⛔ Pula CTes (já vêm completos)
-                and not db_nfe.nota_ja_verificada(nota.get('chave'))
-            ]
-            
-            if not notas_resumo:
-                return  # Nenhuma nota pendente de verificação
-            
-            print(f"[AUTO-VERIFICAÇÃO] Encontradas {len(notas_resumo)} notas pendentes de verificação")
-            self.set_status(f"🔍 {len(notas_resumo)} notas pendentes - verificando em background...", 3000)
-            
-            # Busca XML completo de cada nota em background (thread separada)
-            for idx, nota in enumerate(notas_resumo, 1):
-                # Delay progressivo para não sobrecarregar
-                delay = idx * 2000  # 2 segundos entre cada busca
-                QTimer.singleShot(delay, lambda n=nota: self._buscar_xml_completo_silencioso(n))
-            
-        except Exception as e:
-            print(f"[ERRO] Erro ao verificar notas cinza: {e}")
+        """
+        [DEPRECATED] Auto-verificação foi movida para o Gerenciador de Trabalhos.
+        
+        Para usar a auto-verificação:
+        1. Abra o Gerenciador de Trabalhos (Ctrl+Shift+G ou menu Configurações)
+        2. Clique no botão "🔍 Auto-Verificação"
+        3. A tarefa rodará em segundo plano sem travar a interface
+        
+        Esta função permanece aqui apenas para compatibilidade.
+        """
+        pass  # Não faz nada - funcionalidade movida para o Gerenciador de Trabalhos
     
     def _buscar_xml_completo_silencioso(self, item):
         """Busca XML completo em background sem mostrar diálogos."""
@@ -2632,24 +2783,26 @@ class MainWindow(QMainWindow):
             tooltip_text = "✅ XML Completo disponível"
             icon_name = 'xml.png'
         else:  # RESUMO
-            status_text = ""  # Apenas ícone, sem texto
+            status_text = ""  # Sem ícone para facilitar identificação
             bg_color = QColor(235, 235, 235)  # Cinza claro
             tooltip_text = "⚠️ Apenas Resumo - clique para baixar XML completo"
-            icon_name = 'xml.png'
+            icon_name = None  # Resumo não mostra ícone
         
         c0 = cell(status_text)
         c0.setBackground(QBrush(bg_color))
         c0.setTextAlignment(Qt.AlignCenter)
         c0.setToolTip(tooltip_text)
-        try:
-            icon_path = BASE_DIR / 'Icone' / icon_name
-            if icon_path.exists():
-                icon = QIcon(str(icon_path))
-                c0.setIcon(icon)
-                # Define tamanho do ícone para melhor centralização
-                self.table.setIconSize(QSize(20, 20))
-        except Exception:
-            pass
+        # Só adiciona ícone se definido (COMPLETO ou CANCELADO)
+        if icon_name:
+            try:
+                icon_path = BASE_DIR / 'Icone' / icon_name
+                if icon_path.exists():
+                    icon = QIcon(str(icon_path))
+                    c0.setIcon(icon)
+                    # Define tamanho do ícone para melhor centralização
+                    self.table.setIconSize(QSize(20, 20))
+            except Exception:
+                pass
         self.table.setItem(r, 0, c0)
         # Coluna Número - ordenação numérica
         numero = it.get("numero") or ""
@@ -2771,11 +2924,11 @@ class MainWindow(QMainWindow):
             bg_color = QColor(214, 245, 224)  # Verde claro
             tooltip_text = "✅ XML Completo disponível"
             icon_name = 'xml.png'
-        else:
-            status_text = ""
+        else:  # RESUMO
+            status_text = ""  # Sem ícone para facilitar identificação
             bg_color = QColor(235, 235, 235)
             tooltip_text = "⚠️ Apenas Resumo - clique para baixar XML completo"
-            icon_name = 'xml.png'
+            icon_name = None  # Resumo não mostra ícone
         
         # DEBUG: Log do ícone escolhido
         if numero_nota in ['29511', '5629031']:
@@ -2787,24 +2940,26 @@ class MainWindow(QMainWindow):
         c0.setBackground(QBrush(bg_color))
         c0.setTextAlignment(Qt.AlignCenter)
         c0.setToolTip(tooltip_text)
-        try:
-            icon_path = BASE_DIR / 'Icone' / icon_name
-            if numero_nota in ['29511', '5629031']:
-                print(f"  icon_path: {icon_path}")
-                print(f"  icon_path.exists(): {icon_path.exists()}")
-            if icon_path.exists():
-                icon = QIcon(str(icon_path))
-                c0.setIcon(icon)
+        # Só adiciona ícone se definido (COMPLETO ou CANCELADO)
+        if icon_name:
+            try:
+                icon_path = BASE_DIR / 'Icone' / icon_name
                 if numero_nota in ['29511', '5629031']:
-                    print(f"  Ícone setado com sucesso!")
-                # Define tamanho do ícone para melhor centralização
-                self.table_emitidos.setIconSize(QSize(20, 20))
-            else:
+                    print(f"  icon_path: {icon_path}")
+                    print(f"  icon_path.exists(): {icon_path.exists()}")
+                if icon_path.exists():
+                    icon = QIcon(str(icon_path))
+                    c0.setIcon(icon)
+                    if numero_nota in ['29511', '5629031']:
+                        print(f"  Ícone setado com sucesso!")
+                    # Define tamanho do ícone para melhor centralização
+                    self.table_emitidos.setIconSize(QSize(20, 20))
+                else:
+                    if numero_nota in ['29511', '5629031']:
+                        print(f"  ERRO: Arquivo de ícone não existe!")
+            except Exception as e:
                 if numero_nota in ['29511', '5629031']:
-                    print(f"  ERRO: Arquivo de ícone não existe!")
-        except Exception as e:
-            if numero_nota in ['29511', '5629031']:
-                print(f"  ERRO ao setar ícone: {e}")
+                    print(f"  ERRO ao setar ícone: {e}")
         self.table_emitidos.setItem(r, 0, c0)
         
         # Coluna Número - ordenação numérica
@@ -2909,8 +3064,9 @@ class MainWindow(QMainWindow):
                     pass
                 self.set_status(f"{total} registros carregados", 2000)
                 
-                # Verifica notas com status cinza (RESUMO) e busca XML completo automaticamente
-                QTimer.singleShot(1000, self._verificar_notas_cinza)
+                # ⚠️ AUTO-VERIFICAÇÃO REMOVIDA DAQUI
+                # Agora está disponível no Gerenciador de Trabalhos (Ctrl+Shift+G)
+                # O usuário pode iniciar quando quiser sem travar a interface
                 return
             start = self._table_fill_index
             end = min(start + self._table_fill_chunk, total)
@@ -3026,25 +3182,6 @@ class MainWindow(QMainWindow):
         except Exception as e:
             QMessageBox.warning(self, "Erro", f"Não foi possível salvar intervalo: {e}")
     
-    def _load_consultar_status_config(self) -> bool:
-        """Carrega configuração se deve consultar status de protocolo. Padrão: True."""
-        try:
-            valor = self.db.get_config('consultar_status_protocolo', '1')
-            return valor == '1'
-        except Exception:
-            return True  # Padrão: habilitado
-    
-    def _save_consultar_status_config(self, state: int):
-        """Salva configuração de consulta de status (0=desabilitado, 2=habilitado)."""
-        try:
-            # Qt.CheckState: 0=Unchecked, 2=Checked
-            valor = '1' if state == 2 else '0'
-            self.db.set_config('consultar_status_protocolo', valor)
-            status_text = "habilitada" if state == 2 else "desabilitada"
-            self.set_status(f"Consulta de status {status_text}", 3000)
-        except Exception as e:
-            QMessageBox.warning(self, "Erro", f"Não foi possível salvar configuração: {e}")
-    
     def _set_intervalo_from_menu(self, horas: int):
         """Define intervalo de busca a partir do menu (sincroniza com SpinBox)."""
         try:
@@ -3135,9 +3272,6 @@ class MainWindow(QMainWindow):
         xml_status = (item.get('xml_status') or '').upper()
         status_nota = (item.get('status') or '').lower()
         
-        # Verifica se o status é indefinido (não autorizada, cancelada, denegada ou rejeitada)
-        is_status_indefinido = not any(x in status_nota for x in ['autorizad', 'cancel', 'denegad', 'rejeitad'])
-        
         # Cria menu
         menu = QMenu(self)
         
@@ -3150,12 +3284,6 @@ class MainWindow(QMainWindow):
             action_buscar = menu.addAction("🔍 Buscar XML Completo na SEFAZ")
         else:
             action_buscar = None
-        
-        # Opção: Consultar Status (só para status indefinido)
-        if is_status_indefinido:
-            action_consultar_status = menu.addAction("🔄 Consultar Status na SEFAZ")
-        else:
-            action_consultar_status = None
         
         # Opção: Eventos (sempre disponível)
         menu.addSeparator()
@@ -3180,8 +3308,6 @@ class MainWindow(QMainWindow):
             self._mostrar_detalhes_nota(item)
         elif action == action_buscar:
             self._buscar_xml_completo(item)
-        elif action == action_consultar_status:
-            self._consultar_status_nota(item)
         elif action == action_eventos:
             self._mostrar_eventos(item)
         elif action == action_manifestar:
@@ -3203,9 +3329,6 @@ class MainWindow(QMainWindow):
         xml_status = (item.get('xml_status') or '').upper()
         status_nota = (item.get('status') or '').lower()
         
-        # Verifica se o status é indefinido (não autorizada, cancelada, denegada ou rejeitada)
-        is_status_indefinido = not any(x in status_nota for x in ['autorizad', 'cancel', 'denegad', 'rejeitad'])
-        
         # Cria menu
         menu = QMenu(self)
         
@@ -3219,12 +3342,6 @@ class MainWindow(QMainWindow):
         else:
             action_buscar = None
         
-        # Opção: Consultar Status (só para status indefinido)
-        if is_status_indefinido:
-            action_consultar_status = menu.addAction("🔄 Consultar Status na SEFAZ")
-        else:
-            action_consultar_status = None
-        
         # Opção: Eventos (sempre disponível)
         menu.addSeparator()
         action_eventos = menu.addAction("📋 Ver Eventos")
@@ -3236,8 +3353,6 @@ class MainWindow(QMainWindow):
             self._mostrar_detalhes_nota(item)
         elif action == action_buscar:
             self._buscar_xml_completo(item)
-        elif action == action_consultar_status:
-            self._consultar_status_nota(item)
         elif action == action_eventos:
             self._mostrar_eventos(item)
     
@@ -3445,7 +3560,13 @@ class MainWindow(QMainWindow):
                 else:
                     # XML completo obtido com sucesso
                     from nfe_search import salvar_xml_por_certificado
+                    # 1. Salva localmente (backup)
                     salvar_xml_por_certificado(xml_completo, informante or cert_to_use.get('cnpj_cpf'))
+                    # 2. Se configurado armazenamento, salva lá também
+                    pasta_storage = self.db.get_config('storage_pasta_base', 'xmls')
+                    if pasta_storage and pasta_storage != 'xmls':
+                        nome_cert = cert_to_use.get('nome_certificado')
+                        salvar_xml_por_certificado(xml_completo, informante or cert_to_use.get('cnpj_cpf'), pasta_base=pasta_storage, nome_certificado=nome_cert)
                     
                     # Atualiza no banco
                     from modules.xml_parser import XMLParser
@@ -3713,7 +3834,13 @@ class MainWindow(QMainWindow):
                 if xml_resposta and ('retCancNFe' in xml_resposta or 'procEventoNFe' in xml_resposta):
                     # Salva o evento
                     from nfe_search import salvar_xml_por_certificado
+                    # 1. Salva localmente (backup)
                     salvar_xml_por_certificado(xml_resposta, informante or cert_to_use.get('cnpj_cpf'))
+                    # 2. Se configurado armazenamento, salva lá também
+                    pasta_storage = self.db.get_config('storage_pasta_base', 'xmls')
+                    if pasta_storage and pasta_storage != 'xmls':
+                        nome_cert = cert_to_use.get('nome_certificado')
+                        salvar_xml_por_certificado(xml_resposta, informante or cert_to_use.get('cnpj_cpf'), pasta_base=pasta_storage, nome_certificado=nome_cert)
                     self.set_status("✅ Evento de cancelamento baixado e salvo!", 3000)
                 else:
                     self.set_status("ℹ️ Evento de cancelamento não disponível na SEFAZ", 3000)
@@ -3740,7 +3867,37 @@ class MainWindow(QMainWindow):
         eventos_encontrados = []
         
         try:
-            # Procura em TODAS as pastas de eventos (não só do informante)
+            # 1️⃣ Busca manifestações registradas no banco
+            try:
+                manifestacoes = self.db.get_manifestacoes_by_chave(chave)
+                for manif in manifestacoes:
+                    tipo_evento = manif.get('tipo_evento', '')
+                    protocolo = manif.get('protocolo', 'N/A')
+                    data_envio = manif.get('enviado_em', 'N/A')
+                    status = manif.get('status', 'N/A')
+                    
+                    # Mapeia tipo de evento para descrição amigável
+                    tipos_eventos = {
+                        '210200': '📬 Confirmação da Operação',
+                        '210210': '❓ Ciência da Operação',
+                        '210220': '⛔ Desconhecimento da Operação',
+                        '210240': '🚫 Operação não Realizada',
+                    }
+                    
+                    evento_desc = tipos_eventos.get(tipo_evento, f"Manifestação {tipo_evento}")
+                    
+                    eventos_encontrados.append({
+                        'arquivo': f'Manifestação {tipo_evento}',
+                        'tipo': evento_desc,
+                        'descricao': f"Protocolo: {protocolo}",
+                        'data': data_envio[:19] if len(data_envio) >= 19 else data_envio,
+                        'status': status,
+                        'caminho': None  # Manifestação registrada no banco
+                    })
+            except Exception as e:
+                print(f"[DEBUG] Erro ao buscar manifestações: {e}")
+            
+            # 2️⃣ Procura em TODAS as pastas de eventos (não só do informante)
             # porque eventos podem estar na pasta do destinatário
             xmls_root = DATA_DIR / "xmls"
             if xmls_root.exists():
@@ -3861,12 +4018,164 @@ class MainWindow(QMainWindow):
         except Exception as e:
             QMessageBox.warning(self, "Erro", f"Erro ao abrir pasta: {e}")
     
-    def _manifestar_nota(self, item: Dict[str, Any]):
+    def _manifestar_nota(self, item: Dict[str, Any] = None):
         """
         Exibe dialog moderna para manifestar NF-e ou CT-e.
         NF-e: eventos 210200, 210210, 210220, 210240
         CT-e: eventos 610110, 610112
+        
+        CASO 1: item=None → Pede certificado, senha e chave (manifestação manual)
+        CASO 2: item fornecido → Usa chave e certificado da seleção
         """
+        # Debug para verificar se item está sendo passado
+        print(f"[DEBUG MANIFESTAÇÃO] item recebido: {item is not None}")
+        if item:
+            print(f"[DEBUG MANIFESTAÇÃO] Chave: {item.get('chave', 'N/A')}")
+            print(f"[DEBUG MANIFESTAÇÃO] Informante: {item.get('informante', 'N/A')}")
+        
+        # CASO 1: Manifestação manual (sem documento selecionado)
+        if item is None:
+            dialog_input = QDialog(self)
+            dialog_input.setWindowTitle("✉️ Manifestar Documento (Manual)")
+            dialog_input.setMinimumWidth(500)
+            dialog_input.setMaximumWidth(550)
+            
+            layout = QVBoxLayout(dialog_input)
+            layout.setSpacing(10)
+            layout.setContentsMargins(15, 15, 15, 15)
+            
+            # Título
+            title = QLabel("<h3 style='color: #2c3e50;'>📝 Manifestação Manual</h3>")
+            layout.addWidget(title)
+            
+            info = QLabel("<span style='color: #666; font-size: 9pt;'>Preencha os dados abaixo para manifestar um documento.</span>")
+            info.setWordWrap(True)
+            layout.addWidget(info)
+            
+            # Seleção de certificado
+            cert_label = QLabel("<b>Certificado Digital:</b>")
+            cert_label.setStyleSheet("font-size: 9pt;")
+            layout.addWidget(cert_label)
+            
+            cert_combo = QComboBox()
+            cert_combo.setMinimumHeight(28)
+            certs = self.db.load_certificates()
+            for cert in certs:
+                nome_cert = cert.get('nome_certificado', 'Sem Nome')
+                cnpj = cert.get('cnpj_cpf', '')
+                cert_combo.addItem(f"{nome_cert} - {cnpj}", cert)
+            
+            if cert_combo.count() == 0:
+                QMessageBox.warning(self, "Erro", "Nenhum certificado cadastrado!\n\nCadastre um certificado primeiro.")
+                return
+            
+            layout.addWidget(cert_combo)
+            
+            # Senha do certificado
+            senha_label = QLabel("<b>Senha do Certificado:</b>")
+            senha_label.setStyleSheet("font-size: 9pt;")
+            layout.addWidget(senha_label)
+            
+            senha_input = QLineEdit()
+            senha_input.setMinimumHeight(28)
+            senha_input.setEchoMode(QLineEdit.Password)
+            senha_input.setPlaceholderText("Digite a senha do certificado")
+            layout.addWidget(senha_input)
+            
+            # Chave de acesso
+            chave_label = QLabel("<b>Chave de Acesso (44 dígitos):</b>")
+            chave_label.setStyleSheet("font-size: 9pt;")
+            layout.addWidget(chave_label)
+            
+            chave_input = QLineEdit()
+            chave_input.setMinimumHeight(28)
+            chave_input.setPlaceholderText("Digite a chave de acesso do documento")
+            chave_input.setMaxLength(44)
+            layout.addWidget(chave_input)
+            
+            # Botões
+            buttons_layout = QHBoxLayout()
+            buttons_layout.setSpacing(10)
+            
+            btn_cancelar = QPushButton("❌ Cancelar")
+            btn_cancelar.setMinimumHeight(32)
+            btn_cancelar.setStyleSheet("""
+                QPushButton {
+                    background-color: #95a5a6;
+                    color: white;
+                    border: none;
+                    padding: 6px 16px;
+                    border-radius: 4px;
+                    font-weight: bold;
+                    font-size: 9pt;
+                }
+                QPushButton:hover {
+                    background-color: #7f8c8d;
+                }
+            """)
+            btn_cancelar.clicked.connect(dialog_input.reject)
+            buttons_layout.addWidget(btn_cancelar)
+            
+            btn_continuar = QPushButton("➡️ Continuar")
+            btn_continuar.setMinimumHeight(32)
+            btn_continuar.setStyleSheet("""
+                QPushButton {
+                    background-color: #3498db;
+                    color: white;
+                    border: none;
+                    padding: 6px 16px;
+                    border-radius: 4px;
+                    font-weight: bold;
+                    font-size: 9pt;
+                }
+                QPushButton:hover {
+                    background-color: #2980b9;
+                }
+            """)
+            
+            def continuar_manifestacao():
+                chave = chave_input.text().strip()
+                senha = senha_input.text().strip()
+                
+                if len(chave) != 44:
+                    QMessageBox.warning(dialog_input, "Erro", "A chave deve ter exatamente 44 dígitos!")
+                    return
+                
+                if not senha:
+                    QMessageBox.warning(dialog_input, "Erro", "Digite a senha do certificado!")
+                    return
+                
+                cert_data = cert_combo.currentData()
+                if not cert_data:
+                    QMessageBox.warning(dialog_input, "Erro", "Selecione um certificado!")
+                    return
+                
+                dialog_input.accept()
+                
+                # Cria item virtual para prosseguir
+                item_virtual = {
+                    'chave': chave,
+                    'informante': cert_data.get('cnpj_cpf', ''),
+                    'tipo': 'NFE',  # Detecta automaticamente depois
+                    'numero': chave[-9:],
+                    'nome_emitente': 'Desconhecido',
+                    '_manual': True,
+                    '_cert_path': cert_data.get('caminho'),
+                    '_cert_senha': senha,
+                    '_cert_cnpj': cert_data.get('cnpj_cpf')
+                }
+                
+                # Continua com o fluxo normal
+                self._manifestar_nota(item_virtual)
+            
+            btn_continuar.clicked.connect(continuar_manifestacao)
+            buttons_layout.addWidget(btn_continuar)
+            
+            layout.addLayout(buttons_layout)
+            dialog_input.exec_()
+            return
+        
+        # CASO 2: Manifestação com documento selecionado
         chave = item.get('chave', '')
         if not chave or len(chave) != 44:
             QMessageBox.warning(self, "Manifestação", "Chave de acesso inválida!")
@@ -3886,36 +4195,37 @@ class MainWindow(QMainWindow):
         # Cria dialog moderna
         dialog = QDialog(self)
         dialog.setWindowTitle(f"✉️ Manifestar {'CT-e' if is_cte else 'NF-e'}")
-        dialog.setMinimumWidth(600)
-        dialog.setMinimumHeight(500)
+        dialog.setMinimumWidth(450)
+        dialog.setMaximumWidth(500)
+        dialog.setMinimumHeight(400)
         
         layout = QVBoxLayout(dialog)
-        layout.setSpacing(15)
-        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(10)
+        layout.setContentsMargins(15, 15, 15, 15)
         
         # Header com informações da nota
         header_frame = QFrame()
         header_frame.setStyleSheet("""
             QFrame {
                 background-color: #f0f4f8;
-                border-radius: 10px;
-                padding: 15px;
+                border-radius: 6px;
+                padding: 10px;
             }
         """)
         header_layout = QVBoxLayout(header_frame)
         
         doc_type = "CT-e" if is_cte else "NF-e"
-        title_label = QLabel(f"<h2 style='color: #2c3e50; margin: 0;'>📄 {doc_type} {numero}</h2>")
+        title_label = QLabel(f"<h3 style='color: #2c3e50; margin: 0;'>📄 {doc_type} {numero}</h3>")
         header_layout.addWidget(title_label)
         
         info_label = QLabel(f"<b>Emitente:</b> {emitente}<br><b>Chave:</b> {chave[:10]}...{chave[-10:]}")
-        info_label.setStyleSheet("color: #555; font-size: 11pt;")
+        info_label.setStyleSheet("color: #555; font-size: 9pt;")
         header_layout.addWidget(info_label)
         
         layout.addWidget(header_frame)
         
         # Título da seção
-        section_label = QLabel(f"<h3 style='color: #2c3e50;'>Selecione o tipo de manifestação:</h3>")
+        section_label = QLabel(f"<b style='color: #2c3e50; font-size: 10pt;'>Selecione o tipo de manifestação:</b>")
         layout.addWidget(section_label)
         
         # Tipos de manifestação com botões estilizados
@@ -3970,62 +4280,50 @@ class MainWindow(QMainWindow):
         
         selected_evento = {'codigo': None}
         
-        def criar_botao_evento(evento_data):
-            btn_frame = QFrame()
-            btn_frame.setStyleSheet(f"""
-                QFrame {{
-                    background-color: white;
-                    border: 2px solid {evento_data['cor']};
-                    border-radius: 10px;
-                    padding: 15px;
-                }}
-                QFrame:hover {{
-                    background-color: {evento_data['cor']}22;
-                    cursor: pointer;
-                }}
-            """)
+        # Lista simples com radio buttons
+        from PyQt5.QtWidgets import QRadioButton, QButtonGroup
+        
+        button_group = QButtonGroup(dialog)
+        radio_buttons = []
+        
+        for idx, evento_data in enumerate(eventos):
+            # Layout horizontal simples
+            item_layout = QHBoxLayout()
+            item_layout.setSpacing(12)
             
-            btn_layout = QHBoxLayout(btn_frame)
-            btn_layout.setContentsMargins(10, 10, 10, 10)
+            # Radio button
+            radio = QRadioButton()
+            radio.codigo = evento_data['codigo']
             
             # Ícone
-            icone_label = QLabel(f"<span style='font-size: 32pt;'>{evento_data['icone']}</span>")
-            btn_layout.addWidget(icone_label)
+            icone = QLabel(evento_data['icone'])
+            icone.setStyleSheet(f"font-size: 24pt; color: {evento_data['cor']};")
+            icone.setFixedWidth(40)
             
-            # Texto
-            text_layout = QVBoxLayout()
-            nome_label = QLabel(f"<b style='font-size: 12pt; color: {evento_data['cor']};'>{evento_data['nome']}</b>")
-            desc_label = QLabel(f"<span style='color: #666; font-size: 10pt;'>{evento_data['descricao']}</span>")
-            desc_label.setWordWrap(True)
-            text_layout.addWidget(nome_label)
-            text_layout.addWidget(desc_label)
-            btn_layout.addLayout(text_layout)
+            # Texto (nome + descrição)
+            texto = QLabel(f"<b style='color: {evento_data['cor']};'>{evento_data['nome']}</b><br>"
+                          f"<span style='color: #666; font-size: 9pt;'>{evento_data['descricao']}</span>")
+            texto.setWordWrap(True)
             
-            btn_layout.addStretch()
+            item_layout.addWidget(radio)
+            item_layout.addWidget(icone)
+            item_layout.addWidget(texto, 1)
             
-            # Evento de clique
-            btn_frame.mousePressEvent = lambda e, cod=evento_data['codigo']: selecionar_evento(cod, btn_frame)
-            btn_frame.codigo = evento_data['codigo']
+            layout.addLayout(item_layout)
             
-            return btn_frame
+            button_group.addButton(radio, idx)
+            radio_buttons.append(radio)
         
-        botoes_frames = []
-        def selecionar_evento(codigo, frame_clicado):
-            selected_evento['codigo'] = codigo
-            # Destaca o botão selecionado
-            for btn_frame in botoes_frames:
-                if btn_frame == frame_clicado:
-                    btn_frame.setStyleSheet(btn_frame.styleSheet().replace('border: 2px', 'border: 4px').replace('white', '#f0f8ff'))
-                else:
-                    # Remove destaque dos outros
-                    style = btn_frame.styleSheet()
-                    style = style.replace('border: 4px', 'border: 2px').replace('#f0f8ff', 'white')
-                    btn_frame.setStyleSheet(style)
+        # Seleciona o primeiro por padrão
+        if radio_buttons:
+            radio_buttons[0].setChecked(True)
         
-        for evento_data in eventos:
-            btn_frame = criar_botao_evento(evento_data)
-            botoes_frames.append(btn_frame)
-            layout.addWidget(btn_frame)
+        # Função para pegar o código selecionado
+        def get_selected_codigo():
+            for radio in radio_buttons:
+                if radio.isChecked():
+                    return radio.codigo
+            return None
         
         layout.addStretch()
         
@@ -4033,15 +4331,16 @@ class MainWindow(QMainWindow):
         buttons_layout = QHBoxLayout()
         
         btn_cancelar = QPushButton("❌ Cancelar")
+        btn_cancelar.setMinimumHeight(32)
         btn_cancelar.setStyleSheet("""
             QPushButton {
                 background-color: #95a5a6;
                 color: white;
                 border: none;
-                padding: 12px 24px;
-                border-radius: 6px;
+                padding: 8px 16px;
+                border-radius: 4px;
                 font-weight: bold;
-                font-size: 11pt;
+                font-size: 9pt;
             }
             QPushButton:hover {
                 background-color: #7f8c8d;
@@ -4050,33 +4349,120 @@ class MainWindow(QMainWindow):
         btn_cancelar.clicked.connect(dialog.reject)
         buttons_layout.addWidget(btn_cancelar)
         
-        btn_enviar = QPushButton("📤 Enviar Manifestação")
+        btn_enviar = QPushButton("📤 Enviar")
+        btn_enviar.setMinimumHeight(32)
         btn_enviar.setStyleSheet("""
             QPushButton {
                 background-color: #3498db;
                 color: white;
                 border: none;
-                padding: 12px 24px;
-                border-radius: 6px;
+                padding: 8px 16px;
+                border-radius: 4px;
                 font-weight: bold;
-                font-size: 11pt;
+                font-size: 9pt;
             }
             QPushButton:hover {
                 background-color: #2980b9;
             }
         """)
-        btn_enviar.clicked.connect(lambda: self._enviar_manifestacao(dialog, chave, informante, selected_evento['codigo']))
+        btn_enviar.clicked.connect(lambda: self._enviar_manifestacao(dialog, chave, informante, get_selected_codigo(), item))
         buttons_layout.addWidget(btn_enviar)
         
         layout.addLayout(buttons_layout)
         
         dialog.exec_()
     
-    def _enviar_manifestacao(self, dialog, chave, informante, tipo_evento):
+    def _enviar_manifestacao(self, dialog, chave, informante, tipo_evento, item=None):
         """Envia manifestação para SEFAZ"""
         if not tipo_evento:
             QMessageBox.warning(dialog, "Atenção", "Selecione um tipo de manifestação!")
             return
+        
+        # Eventos que exigem justificativa
+        eventos_com_justificativa = ['210220', '210240', '110111']
+        justificativa = None
+        
+        # Solicita justificativa se necessário
+        if tipo_evento in eventos_com_justificativa:
+            dialog_just = QDialog(dialog)
+            dialog_just.setWindowTitle("✍️ Justificativa Obrigatória")
+            dialog_just.setMinimumWidth(500)
+            
+            layout_just = QVBoxLayout(dialog_just)
+            layout_just.setSpacing(15)
+            layout_just.setContentsMargins(20, 20, 20, 20)
+            
+            # Título
+            tipo_names = {
+                '210220': 'Desconhecimento da Operação',
+                '210240': 'Operação não Realizada',
+                '110111': 'Cancelamento'
+            }
+            tipo_nome = tipo_names.get(tipo_evento, 'Manifestação')
+            
+            title = QLabel(f"<h3 style='color: #e74c3c;'>⚠️ {tipo_nome}</h3>")
+            layout_just.addWidget(title)
+            
+            info = QLabel("<span style='color: #555;'>Digite uma justificativa para esta manifestação (mínimo 15 caracteres):</span>")
+            info.setWordWrap(True)
+            layout_just.addWidget(info)
+            
+            # Campo de texto
+            text_edit = QTextEdit()
+            text_edit.setPlaceholderText("Exemplo: Mercadoria não foi recebida no endereço indicado...")
+            text_edit.setMinimumHeight(120)
+            layout_just.addWidget(text_edit)
+            
+            # Contador de caracteres
+            char_label = QLabel("<span style='color: #999;'>0 caracteres</span>")
+            def atualizar_contador():
+                texto = text_edit.toPlainText()
+                qtd = len(texto)
+                cor = '#27ae60' if qtd >= 15 else '#e74c3c'
+                char_label.setText(f"<span style='color: {cor};'>{qtd} caracteres</span>")
+            
+            text_edit.textChanged.connect(atualizar_contador)
+            layout_just.addWidget(char_label)
+            
+            # Botões
+            buttons_just = QHBoxLayout()
+            
+            btn_cancelar_just = QPushButton("❌ Cancelar")
+            btn_cancelar_just.clicked.connect(dialog_just.reject)
+            buttons_just.addWidget(btn_cancelar_just)
+            
+            btn_confirmar_just = QPushButton("✅ Confirmar")
+            btn_confirmar_just.setStyleSheet("""
+                QPushButton {
+                    background-color: #27ae60;
+                    color: white;
+                    border: none;
+                    padding: 10px 20px;
+                    border-radius: 6px;
+                    font-weight: bold;
+                }
+                QPushButton:hover {
+                    background-color: #229954;
+                }
+            """)
+            
+            def confirmar_justificativa():
+                texto = text_edit.toPlainText().strip()
+                if len(texto) < 15:
+                    QMessageBox.warning(dialog_just, "Atenção", "A justificativa deve ter no mínimo 15 caracteres!")
+                    return
+                dialog_just.accept()
+            
+            btn_confirmar_just.clicked.connect(confirmar_justificativa)
+            buttons_just.addWidget(btn_confirmar_just)
+            
+            layout_just.addLayout(buttons_just)
+            
+            # Mostra dialog de justificativa
+            if dialog_just.exec_() != QDialog.Accepted:
+                return  # Usuário cancelou
+            
+            justificativa = text_edit.toPlainText().strip()
         
         # Verifica se já foi manifestada antes
         try:
@@ -4111,54 +4497,88 @@ class MainWindow(QMainWindow):
         QApplication.processEvents()
         
         try:
-            # Carrega certificado do informante
-            certs = self.db.load_certificates()
-            cert_info = None
-            for cert in certs:
-                if cert.get('informante') == informante:
-                    cert_info = cert
-                    break
-            
-            if not cert_info:
-                progress.close()
-                QMessageBox.critical(self, "Erro", f"Certificado do informante {informante} não encontrado!")
-                return
+            # Carrega certificado (manual ou da seleção)
+            if item and item.get('_manual'):
+                # Manifestação manual - usa dados fornecidos
+                cert_path = item.get('_cert_path')
+                cert_senha = item.get('_cert_senha')
+                cert_cnpj = item.get('_cert_cnpj')
+            else:
+                # Manifestação normal - busca certificado do informante
+                certs = self.db.load_certificates()
+                cert_info = None
+                for cert in certs:
+                    if cert.get('informante') == informante:
+                        cert_info = cert
+                        break
+                
+                if not cert_info:
+                    progress.close()
+                    QMessageBox.critical(self, "Erro", f"Certificado do informante {informante} não encontrado!")
+                    return
+                
+                cert_path = cert_info.get('caminho')
+                cert_senha = cert_info.get('senha')
+                cert_cnpj = cert_info.get('cnpj_cpf')
             
             # Prepara dados do evento
-            from nfe_search import NFeService
+            from modules.manifestacao_service import ManifestacaoService
+            from nfe_search import salvar_xml_por_certificado
             import sys
             sys.path.insert(0, str(BASE_DIR))
             
-            cert_path = cert_info.get('caminho')
-            cert_senha = cert_info.get('senha')
-            cert_cnpj = cert_info.get('cnpj_cpf')
-            cert_cuf = cert_info.get('cuf')
+            # Envia manifestação REAL via SEFAZ
+            print(f"[MANIFESTAÇÃO] Enviando {tipo_evento} para chave {chave}...")
             
-            nfe_service = NFeService(cert_path, cert_senha, cert_cnpj, cert_cuf)
+            # Justificativa só para eventos que exigem (já foi solicitada antes se necessário)
+            # Eventos 210210 e 210200 NÃO devem ter justificativa
+            # Justificativa já foi capturada antes para 210220, 210240, 110111
             
-            # Envia manifestação
-            print(f"[MANIFESTAÇÃO] Enviando {tipo_evento} para chave {chave[:10]}...")
+            # Cria serviço de manifestação
+            manifesta_service = ManifestacaoService(cert_path, cert_senha)
             
-            # Mapeamento de justificativas padrão
-            justificativas = {
-                '210210': 'Ciência da Operação',
-                '210200': 'Confirmação da Operação',
-                '210220': 'Operação não reconhecida',
-                '210240': 'Operação não realizada'
-            }
+            # Envia para SEFAZ (justificativa=None para eventos que não precisam)
+            sucesso, protocolo, mensagem, xml_resposta = manifesta_service.enviar_manifestacao(
+                chave=chave,
+                tipo_evento=tipo_evento,
+                cnpj_destinatario=cert_cnpj,
+                justificativa=justificativa  # Já é None para 210210/210200
+            )
             
-            justificativa = justificativas.get(tipo_evento, 'Manifestação do Destinatário')
+            if not sucesso:
+                progress.close()
+                QMessageBox.critical(
+                    self,
+                    "❌ Erro SEFAZ",
+                    f"A SEFAZ rejeitou a manifestação:\n\n{mensagem}"
+                )
+                return
             
-            # AQUI: Implementar envio real via SOAP
-            # Por enquanto, simula sucesso
-            protocolo = f"999{chave[:10]}"  # Protocolo simulado
+            # Salva XML de retorno na pasta de eventos
+            if xml_resposta:
+                try:
+                    # Salva na pasta de eventos do certificado
+                    caminho_xml = salvar_xml_por_certificado(
+                        xml_resposta, 
+                        cert_cnpj, 
+                        pasta_base="xmls"
+                    )
+                    # Se configurado armazenamento, salva lá também
+                    pasta_storage = self.db.get_config('storage_pasta_base', 'xmls')
+                    if pasta_storage and pasta_storage != 'xmls':
+                        cert_info = self.db.get_certificado_por_cnpj(cert_cnpj)
+                        nome_cert = cert_info.get('nome_certificado') if cert_info else None
+                        salvar_xml_por_certificado(xml_resposta, cert_cnpj, pasta_base=pasta_storage, nome_certificado=nome_cert)
+                    print(f"[MANIFESTAÇÃO] XML de retorno salvo: {caminho_xml}")
+                except Exception as e:
+                    print(f"[WARN] Erro ao salvar XML de retorno: {e}")
             
             # Registra no banco
             self.db.register_manifestacao(
                 chave=chave,
                 tipo_evento=tipo_evento,
                 informante=informante,
-                status="ENVIADA",
+                status="REGISTRADA",
                 protocolo=protocolo
             )
             
@@ -4477,6 +4897,26 @@ class MainWindow(QMainWindow):
         if pdf_path and pdf_path.exists():
             print(f"[DEBUG PDF] Abrindo PDF: {pdf_path}")
             try:
+                # CORREÇÃO: Atualiza xml_status para COMPLETO no banco
+                xml_status_atual = item.get('xml_status', 'RESUMO').upper()
+                if xml_status_atual == 'RESUMO':
+                    print(f"[DEBUG PDF] ⚡ Corrigindo xml_status: RESUMO → COMPLETO")
+                    with self.db._connect() as conn:
+                        conn.execute(
+                            "UPDATE notas_detalhadas SET xml_status = 'COMPLETO' WHERE chave = ?",
+                            (chave,)
+                        )
+                    # Atualiza também no item em memória
+                    item['xml_status'] = 'COMPLETO'
+                    # Atualiza a lista self.notes
+                    for nota in self.notes:
+                        if nota.get('chave') == chave:
+                            nota['xml_status'] = 'COMPLETO'
+                            break
+                    # Atualiza a interface para refletir mudança
+                    print(f"[DEBUG PDF] ⚡ Atualizando interface...")
+                    self._refresh_table_only()
+                
                 # Adiciona ao cache para próximas aberturas
                 self._pdf_cache[chave] = str(pdf_path)
                 print(f"[DEBUG PDF] PDF adicionado ao cache (tamanho: {len(self._pdf_cache)})")
@@ -4490,7 +4930,7 @@ class MainWindow(QMainWindow):
                 print(f"[DEBUG PDF] Etapa 4 concluída em {time.time() - open_start:.3f}s")
                 total_time = time.time() - start_time
                 print(f"[DEBUG PDF] ✅ PDF aberto com sucesso - Tempo total: {total_time:.3f}s\n")
-                self.set_status("✅ PDF aberto", 1000)
+                self.set_status("✅ PDF aberto (xml_status atualizado)", 1000)
                 return
             except Exception as e:
                 print(f"[DEBUG PDF] ❌ Erro ao abrir PDF: {e}")
@@ -4751,6 +5191,26 @@ class MainWindow(QMainWindow):
         if pdf_path and pdf_path.exists():
             print(f"[DEBUG PDF EMITIDOS] Abrindo PDF: {pdf_path}")
             try:
+                # CORREÇÃO: Atualiza xml_status para COMPLETO no banco
+                xml_status_atual = item.get('xml_status', 'RESUMO').upper()
+                if xml_status_atual == 'RESUMO':
+                    print(f"[DEBUG PDF EMITIDOS] ⚡ Corrigindo xml_status: RESUMO → COMPLETO")
+                    with self.db._connect() as conn:
+                        conn.execute(
+                            "UPDATE notas_detalhadas SET xml_status = 'COMPLETO' WHERE chave = ?",
+                            (chave,)
+                        )
+                    # Atualiza também no item em memória
+                    item['xml_status'] = 'COMPLETO'
+                    # Atualiza a lista self.notes
+                    for nota in self.notes:
+                        if nota.get('chave') == chave:
+                            nota['xml_status'] = 'COMPLETO'
+                            break
+                    # Atualiza a interface para refletir mudança
+                    print(f"[DEBUG PDF EMITIDOS] ⚡ Atualizando interface...")
+                    self._refresh_table_only()
+                
                 # Adiciona ao cache para próximas aberturas
                 self._pdf_cache[chave] = str(pdf_path)
                 print(f"[DEBUG PDF EMITIDOS] PDF adicionado ao cache (tamanho: {len(self._pdf_cache)})")
@@ -4764,7 +5224,7 @@ class MainWindow(QMainWindow):
                 print(f"[DEBUG PDF EMITIDOS] Etapa 4 concluída em {time.time() - open_start:.3f}s")
                 total_time = time.time() - start_time
                 print(f"[DEBUG PDF EMITIDOS] ✅ PDF aberto com sucesso - Tempo total: {total_time:.3f}s\n")
-                self.set_status("✅ PDF aberto", 1000)
+                self.set_status("✅ PDF aberto (xml_status atualizado)", 1000)
                 return
             except Exception as e:
                 print(f"[DEBUG PDF EMITIDOS] ❌ Erro ao abrir PDF: {e}")
@@ -4804,6 +5264,14 @@ class MainWindow(QMainWindow):
     
     def _process_pdf_async(self, item: Dict[str, Any]):
         """Processa PDF em thread separada para não travar a UI"""
+        
+        # ⛔ NUNCA GERAR PDF PARA EVENTOS!
+        xml_status = (item.get('xml_status') or '').upper()
+        if xml_status == 'EVENTO':
+            print("[PDF] ⛔ Eventos não geram PDF - pulando...")
+            QMessageBox.information(self, "PDF não disponível", 
+                "Eventos não geram PDF.\nApenas o arquivo XML está disponível.")
+            return
         
         class PDFWorker(QThread):
             finished = pyqtSignal(dict)  # {ok, pdf_path, error}
@@ -5233,6 +5701,10 @@ class MainWindow(QMainWindow):
                 if res.get("ok"):
                     print("[PÓS-BUSCA] Iniciando consulta de eventos dos documentos baixados...")
                     QTimer.singleShot(3000, lambda: self._atualizar_status_apos_busca())
+                    
+                    # 🆕 CORREÇÃO DE STATUS após busca (executa após eventos)
+                    print("[PÓS-BUSCA] Agendando correção automática de status XML...")
+                    QTimer.singleShot(10000, lambda: self._executar_correcao_status())
             except Exception as e:
                 import traceback
                 error_msg = f"Erro em on_finished: {str(e)}\n{traceback.format_exc()}"
@@ -5494,15 +5966,25 @@ class MainWindow(QMainWindow):
                                 
                                 # Se autorizado (código 100 = Autorizado)
                                 if cStat in ['100', '101', '110', '150', '301', '302']:
-                                    # Registra no banco usando informante do certificado correto
+                                    # Salva XML completo do CT-e e obtém o caminho
+                                    xml_completo = etree.tostring(tree, encoding='utf-8').decode('utf-8')
                                     cnpj_cert, _, _, inf_correto, _ = cert_encontrado
-                                    db.registrar_xml(chave, inf_correto)
+                                    caminho_xml = salvar_xml_por_certificado(xml_completo, cnpj_cert)
+                                    # Se configurado armazenamento, salva lá também
+                                    pasta_storage = db.get_config('storage_pasta_base', 'xmls')
+                                    if pasta_storage and pasta_storage != 'xmls':
+                                        cert_info = db.get_certificado_por_cnpj(cnpj_cert)
+                                        nome_cert = cert_info.get('nome_certificado') if cert_info else None
+                                        salvar_xml_por_certificado(xml_completo, cnpj_cert, pasta_base=pasta_storage, nome_certificado=nome_cert)
+                                    
+                                    # Registra no banco COM o caminho
+                                    if caminho_xml:
+                                        db.registrar_xml(chave, inf_correto, caminho_xml)
+                                    else:
+                                        db.registrar_xml(chave, inf_correto)
+                                    
                                     encontradas += 1
                                     print(f"[SUCCESS] CT-e autorizado e registrado com certificado {inf_correto}!")
-                                    
-                                    # Salva XML completo do CT-e
-                                    xml_completo = etree.tostring(tree, encoding='utf-8').decode('utf-8')
-                                    salvar_xml_por_certificado(xml_completo, cnpj_cert)
                                     
                                     # Processa e salva dados detalhados do CT-e
                                     try:
@@ -5540,9 +6022,23 @@ class MainWindow(QMainWindow):
                                 
                                 # Se autorizada
                                 if cStat in ['100', '101', '110', '150', '301', '302']:
-                                    # Registra no banco usando informante do certificado correto
+                                    # Salva XML e obtém o caminho
+                                    xml_completo = etree.tostring(tree, encoding='utf-8').decode('utf-8')
                                     cnpj_cert, _, _, inf_correto, _ = cert_encontrado
-                                    db.registrar_xml(chave, inf_correto)
+                                    caminho_xml = salvar_xml_por_certificado(xml_completo, cnpj_cert)
+                                    # Se configurado armazenamento, salva lá também
+                                    pasta_storage = db.get_config('storage_pasta_base', 'xmls')
+                                    if pasta_storage and pasta_storage != 'xmls':
+                                        cert_info = db.get_certificado_por_cnpj(cnpj_cert)
+                                        nome_cert = cert_info.get('nome_certificado') if cert_info else None
+                                        salvar_xml_por_certificado(xml_completo, cnpj_cert, pasta_base=pasta_storage, nome_certificado=nome_cert)
+                                    
+                                    # Registra no banco COM o caminho
+                                    if caminho_xml:
+                                        db.registrar_xml(chave, inf_correto, caminho_xml)
+                                    else:
+                                        db.registrar_xml(chave, inf_correto)
+                                    
                                     encontradas += 1
                                     print(f"[SUCCESS] Nota autorizada e registrada com certificado {inf_correto}!")
                                     
@@ -7831,8 +8327,10 @@ class MainWindow(QMainWindow):
                     conn.execute("DELETE FROM notas_detalhadas")
                     conn.execute("DELETE FROM xmls_baixados")
                     conn.execute("DELETE FROM nf_status")
-                    # Resetar NSU para recomeçar do zero
-                    conn.execute("DELETE FROM nsu")
+                    # ⚠️ IMPORTANTE: NÃO deletar NSU! É o histórico de sincronização com SEFAZ
+                    # Se deletar, sistema volta para NSU=0 e baixa TUDO novamente
+                    # conn.execute("DELETE FROM nsu")  # ❌ REMOVIDO - não deve ser zerado
+                    # conn.execute("DELETE FROM nsu_cte")  # ❌ REMOVIDO - não deve ser zerado
                     conn.commit()
             except Exception as e:
                 QMessageBox.warning(self, "Limpar", f"Erro ao limpar banco de dados: {e}")
@@ -8256,7 +8754,12 @@ class MainWindow(QMainWindow):
                                         
                                         if cstat in ['135', '136'] and tp_evento:
                                             evento_xml_str = etree.tostring(evento, encoding='utf-8').decode('utf-8')
+                                            # 1. Salva localmente (backup)
                                             salvar_xml_por_certificado(evento_xml_str, cert_uf.get('informante'))
+                                            # 2. Se configurado armazenamento, salva lá também
+                                            pasta_storage = self.parent.db.get_config('storage_pasta_base', 'xmls')
+                                            if pasta_storage and pasta_storage != 'xmls':
+                                                salvar_xml_por_certificado(evento_xml_str, cert_uf.get('informante'), pasta_base=pasta_storage, nome_certificado=cert_uf.get('nome_certificado'))
                                             
                                             if tp_evento == '110111' and cstat == '135':
                                                 self.parent.db.marcar_chave_cancelada(chave, 'Cancelamento de NF-e')
@@ -8518,6 +9021,29 @@ class GerenciadorTrabalhosDialog(QDialog):
         """)
         btn_atualizar_status.clicked.connect(self._atualizar_status_lote)
         toolbar_layout.addWidget(btn_atualizar_status)
+        
+        # Botão Auto-Verificação
+        btn_auto_verificacao = QPushButton("🔍 Auto-Verificação")
+        btn_auto_verificacao.setToolTip("Busca XMLs completos para notas com status RESUMO")
+        btn_auto_verificacao.setStyleSheet("""
+            QPushButton {
+                background-color: #6f42c1;
+                color: white;
+                border: none;
+                padding: 8px 20px;
+                border-radius: 4px;
+                font-weight: bold;
+                font-size: 11px;
+            }
+            QPushButton:hover {
+                background-color: #5a32a3;
+            }
+            QPushButton:pressed {
+                background-color: #4c2a8a;
+            }
+        """)
+        btn_auto_verificacao.clicked.connect(self._iniciar_auto_verificacao)
+        toolbar_layout.addWidget(btn_auto_verificacao)
         
         toolbar_layout.addStretch()
         
@@ -8800,6 +9326,621 @@ class GerenciadorTrabalhosDialog(QDialog):
             )
         else:
             print("[SYNC MANUAL] ERRO: parent_window ou _iniciar_sync_background não disponível")
+    
+    def _iniciar_auto_verificacao(self):
+        """Inicia auto-verificação de notas com status RESUMO em background"""
+        if not self.parent_window:
+            return
+        
+        try:
+            # Busca notas com status RESUMO
+            from nfe_search import DatabaseManager
+            db_nfe = DatabaseManager(str(self.parent_window.db.db_path))
+            
+            notas_resumo = []
+            for nota in self.parent_window.notes:
+                try:
+                    xml_status = (nota.get('xml_status') or '').upper()
+                    tipo = (nota.get('tipo') or '').upper()
+                    chave = nota.get('chave')
+                    
+                    if not chave:
+                        continue
+                    
+                    # Filtra apenas RESUMO, não CT-e, e não verificada
+                    if xml_status == 'RESUMO' and tipo not in ['CTE', 'CT-E']:
+                        try:
+                            if not db_nfe.nota_ja_verificada(chave):
+                                notas_resumo.append(nota)
+                        except Exception:
+                            # Se der erro ao verificar, inclui na lista
+                            notas_resumo.append(nota)
+                except Exception as e:
+                    print(f"[AUTO-VERIFICAÇÃO] Erro ao filtrar nota: {e}")
+                    continue
+            
+        except Exception as e:
+            QMessageBox.critical(
+                self,
+                "Erro",
+                f"Erro ao buscar notas com status RESUMO:\n\n{str(e)}"
+            )
+            return
+        
+        if not notas_resumo:
+            QMessageBox.information(
+                self,
+                "Auto-Verificação",
+                "Nenhuma nota pendente de verificação!\n\n"
+                "Todas as notas com status RESUMO já foram verificadas."
+            )
+            return
+        
+        # Confirma ação
+        reply = QMessageBox.question(
+            self,
+            "Auto-Verificação",
+            f"Encontradas {len(notas_resumo)} notas com status RESUMO.\n\n"
+            f"Deseja buscar os XMLs completos na SEFAZ?\n\n"
+            f"⚠️ Esta operação pode demorar alguns minutos.\n"
+            f"A tarefa rodará em segundo plano.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No
+        )
+        
+        if reply == QMessageBox.No:
+            return
+        
+        # Cria worker para auto-verificação
+        from PyQt5.QtCore import QThread, pyqtSignal
+        
+        class AutoVerificacaoWorker(QThread):
+            progress = pyqtSignal(str, int, int)  # mensagem, atual, total
+            finished = pyqtSignal(int, int)  # encontrados, nao_encontrados
+            error = pyqtSignal(str)
+            log_message = pyqtSignal(str)  # 🆕 Para enviar logs ao terminal
+            
+            def __init__(self, parent_window, notas_resumo):
+                super().__init__()
+                self.parent_window = parent_window
+                self.notas_resumo = notas_resumo
+                self._cancelado = False
+                self._pausado = False
+            
+            def cancelar(self):
+                self._cancelado = True
+            
+            def pausar(self):
+                self._pausado = True
+                self.log("[AUTO-VERIFICAÇÃO] ⏸️ Pausando...")
+            
+            def retomar(self):
+                self._pausado = False
+                self.log("[AUTO-VERIFICAÇÃO] ▶️ Retomando...")
+            
+            def log(self, msg: str):
+                """Envia log para o terminal"""
+                self.log_message.emit(msg)
+            
+            def run(self):
+                try:
+                    from nfe_search import DatabaseManager, NFeService, salvar_xml_por_certificado
+                    from lxml import etree
+                    
+                    self.log("[AUTO-VERIFICAÇÃO] ========================================")
+                    self.log(f"[AUTO-VERIFICAÇÃO] Iniciando verificação de {len(self.notas_resumo)} notas")
+                    self.log("[AUTO-VERIFICAÇÃO] ========================================")
+                    
+                    db_nfe = DatabaseManager(str(self.parent_window.db.db_path))
+                    certs = self.parent_window.db.load_certificates()
+                    
+                    if not certs:
+                        self.error.emit("Nenhum certificado configurado!")
+                        return
+                    
+                    self.log(f"[AUTO-VERIFICAÇÃO] Certificados disponíveis: {len(certs)}")
+                    
+                    encontrados = 0
+                    nao_encontrados = 0
+                    total = len(self.notas_resumo)
+                    
+                    for idx, item in enumerate(self.notas_resumo, 1):
+                        # Verifica cancelamento
+                        if self._cancelado:
+                            self.log("[AUTO-VERIFICAÇÃO] ❌ Cancelado pelo usuário")
+                            self.error.emit("Cancelado pelo usuário")
+                            return
+                        
+                        # Verifica pausa
+                        while self._pausado and not self._cancelado:
+                            import time
+                            time.sleep(0.5)
+                        
+                        chave = item.get('chave')
+                        if not chave:
+                            continue
+                        
+                        # Detecta tipo (NF-e ou CT-e)
+                        modelo = chave[20:22] if len(chave) >= 22 else '55'
+                        is_cte = modelo == '57'
+                        tipo_doc = 'CT-e' if is_cte else 'NF-e'
+                        
+                        self.log(f"\n[AUTO-VERIFICAÇÃO] [{idx}/{total}] {tipo_doc}: {chave}")
+                        
+                        # ==========================================
+                        # PASSO 1: BUSCA LOCAL DO ARQUIVO (MESMA LÓGICA DO DUPLO CLIQUE)
+                        # ==========================================
+                        self.log(f"[AUTO-VERIFICAÇÃO]    🔍 Etapa 1: Verificando arquivos locais...")
+                        
+                        # Tenta buscar XML localmente primeiro
+                        xml_local_text = resolve_xml_text(item)
+                        
+                        if xml_local_text:
+                            # XML encontrado localmente!
+                            self.log(f"[AUTO-VERIFICAÇÃO]    ✅ XML encontrado LOCALMENTE (tamanho: {len(xml_local_text)} bytes)")
+                            self.log(f"[AUTO-VERIFICAÇÃO]    ⚡ Pulando download da SEFAZ (arquivo já existe)")
+                            
+                            # Verifica se tem PDF também
+                            from pathlib import Path
+                            informante = item.get('informante', '')
+                            tipo_item = (item.get('tipo') or 'NFe').strip().upper().replace('-', '')
+                            data_emissao = (item.get('data_emissao') or '')[:10]
+                            
+                            pdf_path = None
+                            if chave and informante and data_emissao:
+                                try:
+                                    year_month = data_emissao[:7] if len(data_emissao) >= 7 else None
+                                    if year_month:
+                                        # Tenta estrutura nova primeiro
+                                        pdf_path = DATA_DIR / "xmls" / informante / year_month / tipo_item / f"{chave}.pdf"
+                                        if not pdf_path.exists():
+                                            # Tenta estrutura antiga
+                                            pdf_path = DATA_DIR / "xmls" / informante / year_month / f"{chave}.pdf"
+                                            if not pdf_path.exists():
+                                                pdf_path = None
+                                except:
+                                    pdf_path = None
+                            
+                            if pdf_path and pdf_path.exists():
+                                self.log(f"[AUTO-VERIFICAÇÃO]    ✅ PDF também encontrado: {pdf_path.name}")
+                            else:
+                                self.log(f"[AUTO-VERIFICAÇÃO]    ℹ️ PDF não existe (será gerado quando necessário)")
+                            
+                            # Atualiza banco para COMPLETO
+                            try:
+                                with db_nfe._connect() as conn:
+                                    conn.execute(
+                                        "UPDATE notas_detalhadas SET xml_status = 'COMPLETO' WHERE chave = ?",
+                                        (chave,)
+                                    )
+                                self.log(f"[AUTO-VERIFICAÇÃO]    📝 Status atualizado: RESUMO → COMPLETO")
+                            except Exception as e_update:
+                                self.log(f"[AUTO-VERIFICAÇÃO]    ⚠️ Erro ao atualizar status: {str(e_update)[:80]}")
+                            
+                            encontrados += 1
+                            continue  # Pula para próxima nota
+                        
+                        self.log(f"[AUTO-VERIFICAÇÃO]    ❌ XML não encontrado localmente")
+                        
+                        # ==========================================
+                        # PASSO 2: VERIFICA STATUS ANTES DE BAIXAR
+                        # ==========================================
+                        self.log(f"[AUTO-VERIFICAÇÃO]    🔍 Etapa 2: Verificando status na SEFAZ...")
+                        
+                        # Verifica status da nota primeiro (evita baixar notas canceladas/denegadas)
+                        status_info = db_nfe.get_nf_status(chave)
+                        if status_info:
+                            cstat, xmotivo = status_info
+                            if cstat in ['101', '151', '135', '155']:  # Cancelada
+                                self.log(f"[AUTO-VERIFICAÇÃO]    ⏭️ Nota CANCELADA (cStat {cstat}) - pulando download")
+                                nao_encontrados += 1
+                                continue
+                            elif cstat in ['110', '301', '302']:  # Denegada
+                                self.log(f"[AUTO-VERIFICAÇÃO]    ⏭️ Nota DENEGADA (cStat {cstat}) - pulando download")
+                                nao_encontrados += 1
+                                continue
+                        
+                        # ==========================================
+                        # PASSO 3: TENTAR BAIXAR DA SEFAZ
+                        # ==========================================
+                        self.log(f"[AUTO-VERIFICAÇÃO]    🌐 Etapa 3: Baixando da SEFAZ...")
+                        
+                        self.progress.emit(
+                            f"[{idx}/{total}] Buscando {tipo_doc}: {chave[:20]}...",
+                            idx,
+                            total
+                        )
+                        
+                        xml_encontrado = False
+                        resp_xml = None
+                        cert_usado = None
+                        cert_service = None  # Guarda o serviço NFeService usado
+                        
+                        # Tenta com cada certificado
+                        for cert_idx, cert in enumerate(certs, 1):
+                            # Verifica cancelamento
+                            if self._cancelado:
+                                break
+                            
+                            # Aguarda se estiver pausado
+                            while self._pausado and not self._cancelado:
+                                import time
+                                time.sleep(0.5)
+                            
+                            # Aguarda intervalo entre consultas (evitar erro 656)
+                            import time
+                            time.sleep(0.6)  # 600ms entre cada consulta
+                            
+                            cnpj_cert = cert.get('cnpj_cpf')
+                            senha_cert = cert.get('senha')
+                            caminho_cert = cert.get('caminho')
+                            cuf_cert = cert.get('cUF_autor')
+                            
+                            self.log(f"[AUTO-VERIFICAÇÃO]    Tentativa {cert_idx}/{len(certs)} - Certificado: {cnpj_cert} (UF: {cuf_cert})")
+                            
+                            try:
+                                # Cria serviço NF-e
+                                svc = NFeService(caminho_cert, senha_cert, cnpj_cert, cuf_cert)
+                                
+                                # Busca usando o método apropriado
+                                if is_cte:
+                                    resp_xml = svc.fetch_prot_cte(chave)
+                                else:
+                                    resp_xml = svc.fetch_prot_nfe(chave)
+                                
+                                if resp_xml:
+                                    # Verifica erros que indicam "tentar outro certificado"
+                                    erros_tentar_outro = ['217', '226', '404']
+                                    tem_erro_cert = any(f'<cStat>{cod}</cStat>' in resp_xml for cod in erros_tentar_outro)
+                                    
+                                    if tem_erro_cert:
+                                        # Identifica erro
+                                        if '<cStat>217</cStat>' in resp_xml:
+                                            self.log(f"[AUTO-VERIFICAÇÃO]       ❌ Nota não consta na base (217)")
+                                        elif '<cStat>226</cStat>' in resp_xml:
+                                            self.log(f"[AUTO-VERIFICAÇÃO]       ❌ UF divergente (226)")
+                                        elif '<cStat>404</cStat>' in resp_xml:
+                                            self.log(f"[AUTO-VERIFICAÇÃO]       ❌ Erro de namespace (404)")
+                                        continue
+                                    
+                                    # XML encontrado!
+                                    cert_usado = cert
+                                    cert_service = svc  # Guarda o serviço para usar depois
+                                    xml_encontrado = True
+                                    self.log(f"[AUTO-VERIFICAÇÃO]    ✅ XML encontrado! Tamanho: {len(resp_xml)} bytes")
+                                    break
+                                else:
+                                    self.log(f"[AUTO-VERIFICAÇÃO]       ❌ Resposta vazia")
+                                    
+                            except Exception as e:
+                                error_detail = str(e)
+                                self.log(f"[AUTO-VERIFICAÇÃO]       ⚠️ Erro: {error_detail[:100]}")
+                                continue
+                        
+                        if xml_encontrado and resp_xml and cert_usado:
+                            try:
+                                # Parse e extrai XML completo
+                                tree = etree.fromstring(resp_xml.encode('utf-8') if isinstance(resp_xml, str) else resp_xml)
+                                
+                                # Verifica se é apenas protocolo (XML antigo não disponível via ConsultaProtocolo)
+                                resp_lower = resp_xml.lower() if isinstance(resp_xml, str) else resp_xml.decode('utf-8', errors='ignore').lower()
+                                is_only_protocol = (
+                                    '<retconssit' in resp_lower and 
+                                    '<protnfe' in resp_lower and
+                                    '<nfeproc' not in resp_lower and
+                                    '<nfe' not in resp_lower.replace('nferesultmsg', '').replace('protnfe', '')
+                                )
+                                
+                                if is_only_protocol:
+                                    self.log(f"[AUTO-VERIFICAÇÃO]    ⚠️ ConsultaProtocolo retornou apenas protocolo")
+                                    self.log(f"[AUTO-VERIFICAÇÃO]    🔄 Tentando via Distribuição DFe por chave...")
+                                    
+                                    # Tenta buscar via Distribuição DFe (disponível por ~1000+ dias)
+                                    try:
+                                        if cert_service:
+                                            resp_dist = cert_service.fetch_by_chave_dist(chave)
+                                        else:
+                                            # Recria serviço se necessário
+                                            svc_dist = NFeService(
+                                                cert_usado.get('caminho'),
+                                                cert_usado.get('senha'),
+                                                cert_usado.get('cnpj_cpf'),
+                                                cert_usado.get('cUF_autor')
+                                            )
+                                            resp_dist = svc_dist.fetch_by_chave_dist(chave)
+                                        
+                                        if resp_dist:
+                                            # Debug: Mostra conteúdo da resposta
+                                            resp_dist_lower = resp_dist.lower() if isinstance(resp_dist, str) else str(resp_dist).lower()
+                                            self.log(f"[AUTO-VERIFICAÇÃO]       🔍 Analisando resposta ({len(resp_dist)} bytes)...")
+                                            
+                                            # Verifica código de status da SEFAZ
+                                            if '<cstat>' in resp_dist_lower:
+                                                import re
+                                                cstat_match = re.search(r'<cstat>(\d+)</cstat>', resp_dist_lower)
+                                                if cstat_match:
+                                                    cstat = cstat_match.group(1)
+                                                    self.log(f"[AUTO-VERIFICAÇÃO]       📊 cStat SEFAZ: {cstat}")
+                                                    
+                                                    # Erro 656: Consumo Indevido - BLOQUEIO DE 1 HORA
+                                                    if cstat == '656':
+                                                        self.log(f"[AUTO-VERIFICAÇÃO]       🚫 ERRO 656: Consumo Indevido!")
+                                                        self.log(f"[AUTO-VERIFICAÇÃO]       ⏰ SEFAZ bloqueou consultas por ~60 minutos")
+                                                        self.log(f"[AUTO-VERIFICAÇÃO]       ⏸️ PARANDO Auto-Verificação...")
+                                                        
+                                                        # Registra bloqueio no banco
+                                                        try:
+                                                            from datetime import datetime
+                                                            with db_nfe._connect() as conn:
+                                                                conn.execute("""
+                                                                    INSERT OR REPLACE INTO erro_656 (informante, tipo, bloqueado_em)
+                                                                    VALUES (?, 'nfe', ?)
+                                                                """, (cert_usado.get('cnpj_cpf'), datetime.now().isoformat()))
+                                                        except:
+                                                            pass
+                                                        
+                                                        # Para a execução
+                                                        self._cancelado = True
+                                                        self.error.emit("⏰ Erro 656: SEFAZ bloqueou consultas por ~60 minutos. Aguarde antes de tentar novamente.")
+                                                        return
+                                                    
+                                                    # Códigos que indicam sucesso mas sem documento
+                                                    if cstat == '137':  # Nenhum documento localizado
+                                                        self.log(f"[AUTO-VERIFICAÇÃO]       ℹ️ SEFAZ: Nenhum documento localizado (cStat 137)")
+                                                    elif cstat == '138':  # Documento cancelado
+                                                        self.log(f"[AUTO-VERIFICAÇÃO]       ℹ️ SEFAZ: Documento cancelado (cStat 138)")
+                                            
+                                            # Verifica se é resNFe (resumo - precisa manifestar)
+                                            if '<resnfe' in resp_dist_lower:
+                                                self.log(f"[AUTO-VERIFICAÇÃO]    📋 Distribuição DFe retornou RESUMO (resNFe)")
+                                                self.log(f"[AUTO-VERIFICAÇÃO]    ✉️ Manifestando Ciência da Operação para liberar XML completo...")
+                                                self.log(f"[AUTO-VERIFICAÇÃO]    📋 Distribuição DFe retornou RESUMO (resNFe)")
+                                                self.log(f"[AUTO-VERIFICAÇÃO]    ✉️ Manifestando Ciência da Operação para liberar XML completo...")
+                                                
+                                                # Manifesta Ciência da Operação (210210)
+                                                try:
+                                                    from modules.manifestacao_service import ManifestacaoService
+                                                    
+                                                    # Verifica se já manifestou antes
+                                                    if db_nfe.check_manifestacao_exists(chave, '210210', cert_usado.get('cnpj_cpf')):
+                                                        self.log(f"[AUTO-VERIFICAÇÃO]       ⏭️ Ciência já manifestada anteriormente")
+                                                    else:
+                                                        # Envia manifestação
+                                                        manif_service = ManifestacaoService(
+                                                            cert_usado.get('caminho'),
+                                                            cert_usado.get('senha')
+                                                        )
+                                                        
+                                                        sucesso, protocolo, mensagem, xml_resp = manif_service.enviar_manifestacao(
+                                                            chave=chave,
+                                                            tipo_evento='210210',  # Ciência da Operação
+                                                            cnpj_destinatario=cert_usado.get('cnpj_cpf'),
+                                                            justificativa=None
+                                                        )
+                                                        
+                                                        if sucesso:
+                                                            self.log(f"[AUTO-VERIFICAÇÃO]       ✅ Ciência manifestada! Protocolo: {protocolo}")
+                                                            
+                                                            # Registra no banco
+                                                            db_nfe.register_manifestacao(
+                                                                chave=chave,
+                                                                tipo_evento='210210',
+                                                                informante=cert_usado.get('cnpj_cpf'),
+                                                                protocolo=protocolo,
+                                                                status='sucesso'
+                                                            )
+                                                            
+                                                            # Aguarda processamento SEFAZ (5 segundos)
+                                                            self.log(f"[AUTO-VERIFICAÇÃO]       ⏳ Aguardando processamento SEFAZ...")
+                                                            import time
+                                                            time.sleep(5)
+                                                            
+                                                            # Tenta buscar XML completo novamente
+                                                            self.log(f"[AUTO-VERIFICAÇÃO]       🔄 Buscando XML completo novamente...")
+                                                            if cert_service:
+                                                                resp_dist = cert_service.fetch_by_chave_dist(chave)
+                                                            else:
+                                                                svc_dist = NFeService(
+                                                                    cert_usado.get('caminho'),
+                                                                    cert_usado.get('senha'),
+                                                                    cert_usado.get('cnpj_cpf'),
+                                                                    cert_usado.get('cUF_autor')
+                                                                )
+                                                                resp_dist = svc_dist.fetch_by_chave_dist(chave)
+                                                        else:
+                                                            self.log(f"[AUTO-VERIFICAÇÃO]       ❌ Erro ao manifestar: {mensagem}")
+                                                            
+                                                except Exception as e_manif:
+                                                    self.log(f"[AUTO-VERIFICAÇÃO]       ⚠️ Erro na manifestação: {str(e_manif)[:100]}")
+                                            
+                                            # Verifica se agora tem XML completo
+                                            if '<nfeProc' in resp_dist or '<NFe' in resp_dist:
+                                                self.log(f"[AUTO-VERIFICAÇÃO]    ✅ XML completo encontrado via Distribuição DFe!")
+                                                resp_xml = resp_dist
+                                                tree = etree.fromstring(resp_xml.encode('utf-8') if isinstance(resp_xml, str) else resp_xml)
+                                                is_only_protocol = False  # Encontrou XML completo
+                                            else:
+                                                self.log(f"[AUTO-VERIFICAÇÃO]    ⚠️ Distribuição DFe não retornou XML completo")
+                                        else:
+                                            self.log(f"[AUTO-VERIFICAÇÃO]    ❌ Distribuição DFe não retornou dados")
+                                    except Exception as e_dist:
+                                        self.log(f"[AUTO-VERIFICAÇÃO]    ⚠️ Erro na Distribuição DFe: {str(e_dist)[:100]}")
+                                    
+                                    # Se ainda é apenas protocolo, marca e continua
+                                    if is_only_protocol:
+                                        nao_encontrados += 1
+                                        db_nfe.marcar_nota_verificada(chave, 'apenas_protocolo')
+                                        continue
+                                
+                                if is_cte:
+                                    NS = {'cte': 'http://www.portalfiscal.inf.br/cte'}
+                                    proc_node = tree.find('.//cte:cteProc', namespaces=NS)
+                                    if proc_node is not None:
+                                        xml_completo = etree.tostring(proc_node, encoding='utf-8').decode()
+                                    else:
+                                        xml_completo = resp_xml
+                                else:
+                                    NS = {'nfe': 'http://www.portalfiscal.inf.br/nfe'}
+                                    proc_node = tree.find('.//nfe:nfeProc', namespaces=NS) or tree.find('.//nfe:NFe', namespaces=NS)
+                                    if proc_node is not None:
+                                        xml_completo = etree.tostring(proc_node, encoding='utf-8').decode()
+                                    else:
+                                        xml_completo = resp_xml
+                                
+                                # Salva XML
+                                cnpj_salvar = cert_usado.get('cnpj_cpf')
+                                caminho_xml = salvar_xml_por_certificado(xml_completo, cnpj_salvar)
+                                # Se configurado armazenamento, salva lá também
+                                pasta_storage = db_nfe.get_config('storage_pasta_base', 'xmls')
+                                if pasta_storage and pasta_storage != 'xmls':
+                                    nome_cert = cert_usado.get('nome_certificado')
+                                    salvar_xml_por_certificado(xml_completo, cnpj_salvar, pasta_base=pasta_storage, nome_certificado=nome_cert)
+                                
+                                if caminho_xml:
+                                    self.log(f"[AUTO-VERIFICAÇÃO]    💾 Salvo em: {caminho_xml}")
+                                    
+                                    # Atualiza banco
+                                    try:
+                                        db_nfe.registrar_xml(chave, cnpj_salvar, caminho_xml)
+                                        self.log(f"[AUTO-VERIFICAÇÃO]    ✅ Registrado em xmls_baixados")
+                                    except Exception as e:
+                                        self.log(f"[AUTO-VERIFICAÇÃO]    ⚠️ Erro ao registrar XML: {str(e)[:100]}")
+                                    
+                                    try:
+                                        # Atualiza xml_status para COMPLETO
+                                        with db_nfe._connect() as conn:
+                                            conn.execute(
+                                                "UPDATE notas_detalhadas SET xml_status = 'COMPLETO' WHERE chave = ?",
+                                                (chave,)
+                                            )
+                                        self.log(f"[AUTO-VERIFICAÇÃO]    ✅ xml_status atualizado para COMPLETO")
+                                    except Exception as e:
+                                        self.log(f"[AUTO-VERIFICAÇÃO]    ⚠️ Erro ao atualizar xml_status: {str(e)[:100]}")
+                                    
+                                    # Marca como verificada
+                                    try:
+                                        db_nfe.marcar_nota_verificada(chave, 'xml_completo')
+                                        self.log(f"[AUTO-VERIFICAÇÃO]    ✅ Marcada como verificada")
+                                    except Exception as e:
+                                        self.log(f"[AUTO-VERIFICAÇÃO]    ⚠️ Erro ao marcar como verificada: {str(e)[:100]}")
+                                    
+                                    encontrados += 1
+                                    self.log(f"[AUTO-VERIFICAÇÃO]    ✅ Sucesso! Total encontrados: {encontrados}")
+                                else:
+                                    self.log(f"[AUTO-VERIFICAÇÃO]    ❌ Erro ao salvar XML")
+                                    nao_encontrados += 1
+                                    
+                            except Exception as e:
+                                self.log(f"[AUTO-VERIFICAÇÃO]    ❌ Erro ao processar: {str(e)}")
+                                nao_encontrados += 1
+                        else:
+                            nao_encontrados += 1
+                            db_nfe.marcar_nota_verificada(chave, 'nao_encontrado')
+                            self.log(f"[AUTO-VERIFICAÇÃO]    ❌ XML não encontrado em nenhum certificado")
+                    
+                    self.log(f"\n[AUTO-VERIFICAÇÃO] ========================================")
+                    self.log(f"[AUTO-VERIFICAÇÃO] Verificação concluída!")
+                    self.log(f"[AUTO-VERIFICAÇÃO] ✅ Encontrados: {encontrados}")
+                    self.log(f"[AUTO-VERIFICAÇÃO] ❌ Não encontrados: {nao_encontrados}")
+                    self.log(f"[AUTO-VERIFICAÇÃO] ========================================")
+                    
+                    self.finished.emit(encontrados, nao_encontrados)
+                    
+                except Exception as e:
+                    error_msg = f"[AUTO-VERIFICAÇÃO] ❌ ERRO: {str(e)}"
+                    self.log(error_msg)
+                    self.error.emit(str(e))
+        
+        # Cria e inicia o worker
+        worker = AutoVerificacaoWorker(self.parent_window, notas_resumo)
+        
+        # Adiciona à lista de trabalhos ativos
+        trabalho = {
+            'tipo': 'auto_verificacao',
+            'nome': 'Auto-Verificação de XMLs',
+            'status': 'Em execução',
+            'progresso': 0,
+            'total': len(notas_resumo),
+            'mensagem': 'Iniciando...',
+            'worker': worker
+        }
+        self.parent_window._trabalhos_ativos.append(trabalho)
+        
+        # Conecta sinais
+        def on_progress(msg, atual, total):
+            for t in self.parent_window._trabalhos_ativos:
+                if t.get('tipo') == 'auto_verificacao':
+                    t['progresso'] = atual
+                    t['total'] = total
+                    t['mensagem'] = msg
+                    break
+        
+        def on_finished(encontrados, nao_encontrados):
+            # Remove da lista de trabalhos
+            self.parent_window._trabalhos_ativos = [
+                t for t in self.parent_window._trabalhos_ativos
+                if t.get('tipo') != 'auto_verificacao'
+            ]
+            
+            # Atualiza interface de forma OTIMIZADA (usa QTimer para garantir execução na thread principal)
+            from PyQt5.QtCore import QTimer
+            def atualizar_interface():
+                try:
+                    print("[AUTO-VERIFICAÇÃO] Atualizando interface...")
+                    
+                    # 1. Apenas corrige xml_status (rápido - já está otimizado)
+                    self.parent_window._corrigir_xml_status_automatico()
+                    
+                    # 2. Apenas atualiza a tabela SEM recarregar dados
+                    # (os dados em self.notes já estão corretos, só precisa re-renderizar)
+                    self.parent_window._refresh_table_only()
+                    
+                    print("[AUTO-VERIFICAÇÃO] Interface atualizada!")
+                except Exception as e:
+                    print(f"[AUTO-VERIFICAÇÃO] Erro ao atualizar interface: {e}")
+                    import traceback
+                    traceback.print_exc()
+            
+            # Executa atualização com delay pequeno (evita travamento)
+            QTimer.singleShot(200, atualizar_interface)
+            
+            # Mostra resultado IMEDIATAMENTE (não espera atualização)
+            print(f"[AUTO-VERIFICAÇÃO] Exibindo resultado final...")
+            QMessageBox.information(
+                self,
+                "Auto-Verificação Concluída",
+                f"Verificação concluída!\n\n"
+                f"✅ XMLs encontrados: {encontrados}\n"
+                f"❌ XMLs não encontrados: {nao_encontrados}\n\n"
+                f"A interface será atualizada em instantes."
+            )
+        
+        def on_error(error_msg):
+            # Remove da lista de trabalhos
+            self.parent_window._trabalhos_ativos = [
+                t for t in self.parent_window._trabalhos_ativos
+                if t.get('tipo') != 'auto_verificacao'
+            ]
+            
+            if "Cancelado" not in error_msg:
+                QMessageBox.warning(self, "Erro", f"Erro na auto-verificação:\n{error_msg}")
+        
+        worker.progress.connect(on_progress)
+        worker.finished.connect(on_finished)
+        worker.error.connect(on_error)
+        
+        # Conecta sinal de log para imprimir no terminal
+        worker.log_message.connect(lambda msg: print(msg, flush=True))
+        
+        worker.start()
+        
+        QMessageBox.information(
+            self,
+            "Auto-Verificação Iniciada",
+            f"A auto-verificação foi iniciada em segundo plano.\n\n"
+            f"Total de notas: {len(notas_resumo)}\n\n"
+            f"Você pode acompanhar o progresso nesta janela."
+        )
     
     def _atualizar_lista(self):
         """Atualiza a lista de trabalhos"""
@@ -11356,9 +12497,14 @@ class StorageConfigDialog(QDialog):
                 return
             
             # Salva configurações (caminho normalizado)
+            formato_selecionado = self.formato_combo.currentData()
+            print(f"[DEBUG CONFIG] Salvando formato: '{formato_selecionado}'")
             self.db.set_config('storage_pasta_base', str(pasta_path))
-            self.db.set_config('storage_formato_mes', self.formato_combo.currentData())
+            self.db.set_config('storage_formato_mes', formato_selecionado)
             self.db.set_config('storage_xml_pdf_separado', '1' if self.radio_separados.isChecked() else '0')
+            # Confirma se foi salvo
+            formato_lido = self.db.get_config('storage_formato_mes', 'ERRO')
+            print(f"[DEBUG CONFIG] Lido após salvar: '{formato_lido}'")
             
             # Pergunta se quer copiar os arquivos existentes
             pasta_antiga = DATA_DIR / 'xmls'
@@ -11391,14 +12537,18 @@ class StorageConfigDialog(QDialog):
             QMessageBox.critical(self, "Erro", f"Erro ao salvar configurações:\n{e}")
     
     def _copiar_arquivos(self, origem: Path, destino: Path):
-        """Copia os arquivos XML e PDF da pasta antiga para a nova"""
+        """
+        Copia arquivos XML/PDF da pasta antiga para a nova usando salvar_xml_por_certificado()
+        Isso garante que a estrutura será correta mesmo se a origem tiver pastas mal organizadas
+        """
         try:
+            from nfe_search import salvar_xml_por_certificado
             import shutil
             import re
             
             # Cria diálogo de progresso
             progress = QProgressDialog("Preparando cópia de arquivos...", "Cancelar", 0, 100, self)
-            progress.setWindowTitle("Copiando Arquivos")
+            progress.setWindowTitle("Reorganizando e Copiando Arquivos")
             progress.setWindowModality(Qt.WindowModal)
             progress.setMinimumDuration(0)
             progress.setValue(0)
@@ -11406,33 +12556,31 @@ class StorageConfigDialog(QDialog):
             # Pastas a ignorar
             pastas_ignorar = ['Debug de notas', 'Resumos', 'debug', 'resumos']
             
-            # Lista todos os arquivos XML e PDF recursivamente, exceto das pastas ignoradas
-            arquivos = []
-            for ext in ['*.xml', '*.pdf']:
-                for arquivo in origem.rglob(ext):
-                    # Verifica se o arquivo está em uma pasta que deve ser ignorada
-                    deve_ignorar = False
-                    for parte in arquivo.parts:
-                        if parte in pastas_ignorar:
-                            deve_ignorar = True
-                            break
-                    
-                    if not deve_ignorar:
-                        arquivos.append(arquivo)
+            # Lista apenas arquivos XML (PDF será copiado junto automaticamente)
+            arquivos_xml = []
+            for arquivo in origem.rglob('*.xml'):
+                # Verifica se o arquivo está em uma pasta que deve ser ignorada
+                deve_ignorar = False
+                for parte in arquivo.parts:
+                    if parte in pastas_ignorar:
+                        deve_ignorar = True
+                        break
+                
+                if not deve_ignorar:
+                    arquivos_xml.append(arquivo)
             
-            total = len(arquivos)
+            total = len(arquivos_xml)
             if total == 0:
-                QMessageBox.information(self, "Informação", "Nenhum arquivo encontrado para copiar.")
+                QMessageBox.information(self, "Informação", "Nenhum arquivo XML encontrado para copiar.")
                 return
             
             progress.setMaximum(total)
-            progress.setLabelText(f"Copiando {total} arquivo(s)...")
-            
-            # Pega formato de mês configurado
-            formato_mes = self.formato_combo.currentData()
+            progress.setLabelText(f"Reorganizando {total} arquivo(s) XML...")
             
             # Carrega mapeamento de CNPJ -> Nome do Certificado
+            # E cria mapeamento reverso (Nome -> CNPJ) para suportar pastas com nome amigável
             mapeamento_nomes = {}
+            mapeamento_reverso = {}  # Nome amigável -> CNPJ
             try:
                 certs = self.db.load_certificates()
                 for cert in certs:
@@ -11442,7 +12590,8 @@ class StorageConfigDialog(QDialog):
                         # Remove caracteres inválidos do nome
                         nome_limpo = re.sub(r'[\\/*?:"<>|]', "_", nome_cert).strip()
                         mapeamento_nomes[informante] = nome_limpo
-                        print(f"[DEBUG] Mapeamento: {informante} -> {nome_limpo}")
+                        mapeamento_reverso[nome_limpo] = informante
+                        mapeamento_reverso[nome_limpo.upper()] = informante  # Case insensitive
             except Exception as e:
                 print(f"[ERRO] Ao carregar mapeamento de certificados: {e}")
             
@@ -11450,103 +12599,82 @@ class StorageConfigDialog(QDialog):
             erros = 0
             ignorados = 0
             
-            for idx, arquivo in enumerate(arquivos):
+            for idx, arquivo_xml in enumerate(arquivos_xml):
                 if progress.wasCanceled():
                     QMessageBox.information(self, "Cancelado", f"Cópia cancelada. {copiados} arquivo(s) copiado(s).")
                     return
                 
                 try:
-                    # Calcula o caminho relativo
-                    caminho_relativo = arquivo.relative_to(origem)
+                    # Lê o conteúdo do XML
+                    xml_content = arquivo_xml.read_text(encoding='utf-8')
+                    
+                    # Extrai o CNPJ/CPF da estrutura de pastas (primeira pasta após origem)
+                    caminho_relativo = arquivo_xml.relative_to(origem)
                     partes = list(caminho_relativo.parts)
                     
-                    # Verifica se há pelo menos 3 partes: CNPJ/MES/resto
-                    if len(partes) >= 3:
-                        cnpj_pasta = partes[0]
-                        mes_pasta = partes[1]
-                        resto = partes[2:]
+                    if len(partes) >= 1:
+                        pasta_origem = partes[0]  # Primeira pasta (pode ser CNPJ ou nome amigável)
                         
-                        # NOVO: Busca nome do certificado para este CNPJ
-                        nome_pasta_cert = mapeamento_nomes.get(cnpj_pasta, cnpj_pasta)
-                        if nome_pasta_cert != cnpj_pasta:
-                            print(f"[DEBUG] Convertendo pasta de {cnpj_pasta} para {nome_pasta_cert}")
+                        # Tenta identificar se é CNPJ ou nome amigável
+                        # Se for apenas dígitos, é CNPJ
+                        if pasta_origem.replace('-', '').replace('.', '').replace('/', '').isdigit():
+                            cnpj_cpf = pasta_origem
+                            nome_cert = mapeamento_nomes.get(cnpj_cpf, None)
+                        else:
+                            # É nome amigável, busca o CNPJ correspondente
+                            cnpj_cpf = mapeamento_reverso.get(pasta_origem.upper())
+                            if cnpj_cpf:
+                                nome_cert = pasta_origem  # Usa o nome da pasta como está
+                            else:
+                                # Não encontrou mapeamento, usa a pasta como CNPJ mesmo
+                                print(f"[AVISO] Pasta '{pasta_origem}' não encontrada no mapeamento")
+                                cnpj_cpf = pasta_origem
+                                nome_cert = None
                         
-                        # Tenta converter o formato do mês se necessário
-                        # Detecta formato AAAA-MM ou MM-AAAA
-                        match_aaaa_mm = re.match(r'^(\d{4})-(\d{2})$', mes_pasta)
-                        match_mm_aaaa = re.match(r'^(\d{2})-(\d{4})$', mes_pasta)
-                        match_aaaa_slash_mm = re.match(r'^(\d{4})/(\d{2})$', mes_pasta)
-                        match_mm_slash_aaaa = re.match(r'^(\d{2})/(\d{4})$', mes_pasta)
+                        if not cnpj_cpf:
+                            print(f"[ERRO] Não foi possível determinar CNPJ para {arquivo_xml}")
+                            ignorados += 1
+                            continue
                         
-                        nova_mes_pasta = mes_pasta  # Padrão: mantém original
+                        # Usa salvar_xml_por_certificado para salvar com estrutura correta
+                        # Isso garante:
+                        # 1. Data extraída corretamente do XML
+                        # 2. Tipo de pasta correto (NFe, CTe, NFe/Eventos, CTe/Eventos)
+                        # 3. Nome amigável do certificado usado
+                        caminho_salvo = salvar_xml_por_certificado(
+                            xml_content, 
+                            cnpj_cpf, 
+                            pasta_base=str(destino),
+                            nome_certificado=nome_cert
+                        )
                         
-                        if match_aaaa_mm:
-                            ano, mes = match_aaaa_mm.groups()
-                            if formato_mes == 'AAAA-MM':
-                                nova_mes_pasta = f"{ano}-{mes}"
-                            elif formato_mes == 'MM-AAAA':
-                                nova_mes_pasta = f"{mes}-{ano}"
-                            elif formato_mes == 'AAAA/MM':
-                                nova_mes_pasta = f"{ano}/{mes}"
-                            elif formato_mes == 'MM/AAAA':
-                                nova_mes_pasta = f"{mes}/{ano}"
-                        
-                        elif match_mm_aaaa:
-                            mes, ano = match_mm_aaaa.groups()
-                            if formato_mes == 'AAAA-MM':
-                                nova_mes_pasta = f"{ano}-{mes}"
-                            elif formato_mes == 'MM-AAAA':
-                                nova_mes_pasta = f"{mes}-{ano}"
-                            elif formato_mes == 'AAAA/MM':
-                                nova_mes_pasta = f"{ano}/{mes}"
-                            elif formato_mes == 'MM/AAAA':
-                                nova_mes_pasta = f"{mes}/{ano}"
-                        
-                        elif match_aaaa_slash_mm:
-                            ano, mes = match_aaaa_slash_mm.groups()
-                            if formato_mes == 'AAAA-MM':
-                                nova_mes_pasta = f"{ano}-{mes}"
-                            elif formato_mes == 'MM-AAAA':
-                                nova_mes_pasta = f"{mes}-{ano}"
-                            elif formato_mes == 'AAAA/MM':
-                                nova_mes_pasta = f"{ano}/{mes}"
-                            elif formato_mes == 'MM/AAAA':
-                                nova_mes_pasta = f"{mes}/{ano}"
-                        
-                        elif match_mm_slash_aaaa:
-                            mes, ano = match_mm_slash_aaaa.groups()
-                            if formato_mes == 'AAAA-MM':
-                                nova_mes_pasta = f"{ano}-{mes}"
-                            elif formato_mes == 'MM-AAAA':
-                                nova_mes_pasta = f"{mes}-{ano}"
-                            elif formato_mes == 'AAAA/MM':
-                                nova_mes_pasta = f"{ano}/{mes}"
-                            elif formato_mes == 'MM/AAAA':
-                                nova_mes_pasta = f"{mes}/{ano}"
-                        
-                        # Reconstrói o caminho com nome do certificado (se disponível) e novo formato
-                        novo_caminho_relativo = Path(nome_pasta_cert) / nova_mes_pasta / Path(*resto)
-                        arquivo_destino = destino / novo_caminho_relativo
+                        if caminho_salvo:
+                            copiados += 1
+                            
+                            # Copia PDF correspondente se existir
+                            pdf_original = arquivo_xml.with_suffix('.pdf')
+                            if pdf_original.exists():
+                                try:
+                                    pdf_destino = Path(caminho_salvo).with_suffix('.pdf')
+                                    if not pdf_destino.exists():
+                                        shutil.copy2(pdf_original, pdf_destino)
+                                except Exception as pdf_err:
+                                    print(f"[AVISO] Erro ao copiar PDF {pdf_original.name}: {pdf_err}")
+                        else:
+                            print(f"[AVISO] salvar_xml_por_certificado retornou None para {arquivo_xml.name}")
+                            ignorados += 1
                     else:
-                        # Se não tem estrutura esperada, mantém como está
-                        arquivo_destino = destino / caminho_relativo
-                    
-                    # Cria as pastas necessárias
-                    arquivo_destino.parent.mkdir(parents=True, exist_ok=True)
-                    
-                    # Copia o arquivo (não sobrescreve se já existir)
-                    if not arquivo_destino.exists():
-                        shutil.copy2(arquivo, arquivo_destino)
-                        copiados += 1
-                    else:
+                        print(f"[AVISO] Estrutura de pasta inválida para {arquivo_xml}")
                         ignorados += 1
                     
                     progress.setValue(idx + 1)
-                    progress.setLabelText(f"Copiando {idx + 1}/{total}: {arquivo.name}")
+                    progress.setLabelText(f"Reorganizando {idx + 1}/{total}: {arquivo_xml.name}")
                     QApplication.processEvents()
                     
                 except Exception as e:
-                    print(f"[ERRO] Ao copiar {arquivo}: {e}")
+                    print(f"[ERRO] Ao processar {arquivo_xml}: {e}")
+                    import traceback
+                    traceback.print_exc()
                     erros += 1
             
             progress.close()
