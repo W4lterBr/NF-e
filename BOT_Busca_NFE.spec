@@ -35,10 +35,12 @@ hidden_imports = [
     'reportlab.pdfgen',
     'reportlab.lib',
     'reportlab.platypus',
+    'argparse',  # Para argumentos de linha de comando
+    'winreg',    # Para gerenciar registro do Windows
 ]
 
 a = Analysis(
-    ['interface_pyqt5.py'],
+    ['Busca NF-e.py'],  # Arquivo principal atualizado
     pathex=[],
     binaries=[],
     datas=added_files,

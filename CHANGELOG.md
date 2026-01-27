@@ -1,5 +1,34 @@
 # Changelog - BOT Busca NFE
 
+## [1.0.90] - 2026-01-27
+
+### 🐛 Correção Crítica - Salvamento de XMLs
+
+#### ✅ Corrigido Bug na Função salvar_xml_por_certificado
+- **Problema identificado**: XMLs baixados com sucesso da SEFAZ (6746 bytes) não eram salvos no disco
+- **Causa raiz**: Parâmetros da função `salvar_xml_por_certificado` estavam na ordem errada em 2 lugares:
+  - Linha 4375: função `_baixar_xml_e_pdf` (menu "✅ XML Completo")
+  - Linha 10714: auto-verificação de resumos em massa
+- **Assinatura correta**: `salvar_xml_por_certificado(xml, cnpj_cpf, pasta_base="xmls", nome_certificado=None)`
+- **Estava sendo chamado**: `salvar_xml_por_certificado(xml_completo, chave, informante, 'NFe')`
+  - ❌ Passava `chave` (44 dígitos) onde deveria ser `cnpj_cpf`
+  - ❌ Passava `informante` onde deveria ser `pasta_base`
+  - ❌ Passava `'NFe'` onde deveria ser `nome_certificado`
+- **Correção aplicada**: Ambas as chamadas agora usam `salvar_xml_por_certificado(xml_completo, informante)`
+- **Impacto**: XMLs baixados via menu de contexto ou busca automática agora são salvos corretamente
+- **Status do banco**: Campo `xml_status` agora é atualizado corretamente de RESUMO para COMPLETO
+
+#### 📊 Funções Afetadas
+- `_baixar_xml_e_pdf()`: Menu "✅ XML Completo" → Agora salva XMLs corretamente
+- Auto-verificação de resumos em lote → Agora salva XMLs corretamente
+- Geração de PDF após download → Agora funciona (XML estava disponível na memória mas não no disco)
+
+#### ✅ Resultado Final
+- ✅ HTTP download de XMLs: Funcionando (sempre funcionou)
+- ✅ Salvamento no disco: CORRIGIDO
+- ✅ Atualização do banco (xml_status): CORRIGIDO
+- ✅ Geração de PDF automática: CORRIGIDO (depende do XML no disco)
+
 ## [1.0.89] - 2026-01-05
 
 ### 🐛 Correções de Interface

@@ -32,25 +32,36 @@ def generate_danfe_pdf(xml_text: str, out_path: str, tipo: str = "NFe") -> bool:
             if tipo.upper() == "CTE":
                 from brazilfiscalreport.dacte import Dacte
                 print("[PDF] Tentando gerar DACTE com BrazilFiscalReport...", file=sys.stderr)
-                doc = Dacte(xml=xml_bytes)
-                doc.output(str(out_path))
-                print(f"[PDF] DACTE completo gerado com sucesso: {out_path}", file=sys.stderr)
+                
+                try:
+                    doc = Dacte(xml=xml_bytes)
+                    doc.output(str(out_path))
+                    print(f"[PDF] DACTE completo gerado com sucesso: {out_path}", file=sys.stderr)
+                    return True
+                except TypeError as te:
+                    if "'NoneType' object is not iterable" in str(te):
+                        print(f"[PDF] CT-e sem infCarga detectado - tentando métodos alternativos", file=sys.stderr)
+                        # Não faz raise, permite continuar para os métodos de fallback
+                    else:
+                        raise
             else:  # NFe or default
                 from brazilfiscalreport.danfe import Danfe
                 print("[PDF] Tentando gerar DANFE com BrazilFiscalReport...", file=sys.stderr)
                 doc = Danfe(xml=xml_bytes)
                 doc.output(str(out_path))
                 print(f"[PDF] DANFE completo gerado com sucesso: {out_path}", file=sys.stderr)
+                return True
             
-            return True
         except ImportError as e:
             import sys
             print(f"[PDF] BrazilFiscalReport não disponível: {e}", file=sys.stderr)
         except Exception as e:
             import sys
-            print(f"[PDF] Erro ao usar BrazilFiscalReport: {e}", file=sys.stderr)
-            import traceback
-            traceback.print_exc()
+            # Suprime stack trace para TypeError conhecido (CT-e sem infCarga)
+            if not (isinstance(e, TypeError) and "'NoneType' object is not iterable" in str(e)):
+                print(f"[PDF] Erro ao usar BrazilFiscalReport: {e}", file=sys.stderr)
+                import traceback
+                traceback.print_exc()
         
         # Try using brazilnum-python (if available)
         try:

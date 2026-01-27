@@ -2,7 +2,7 @@
 ; Gera instalador profissional para Windows
 
 #define MyAppName "Busca XML"
-#define MyAppVersion "1.0.89"
+#define MyAppVersion "1.0.90"
 #define MyAppPublisher "DWM System Developer"
 #define MyAppURL "https://dwmsystems.up.railway.app/"
 #define MyAppExeName "Busca XML.exe"
@@ -43,6 +43,7 @@ Name: "brazilianportuguese"; MessagesFile: "compiler:Languages\BrazilianPortugue
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
 Name: "quicklaunchicon"; Description: "Criar ícone na Barra de Tarefas"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
+Name: "startup"; Description: "Iniciar automaticamente com o Windows"; GroupDescription: "Opções de Inicialização:"; Flags: unchecked
 
 [Files]
 ; Executável principal e toda a pasta dist (PyInstaller onedir mode)
@@ -86,6 +87,9 @@ end;
 
 // Após a instalação
 procedure CurStepChanged(CurStep: TSetupStep);
+var
+    StartupRegKey: string;
+    ExePath: string;
 begin
     if CurStep = ssPostInstall then
     begin
@@ -93,6 +97,14 @@ begin
         CreateDir(ExpandConstant('{userappdata}\BOT Busca NFE'));
         CreateDir(ExpandConstant('{userappdata}\BOT Busca NFE\xmls'));
         CreateDir(ExpandConstant('{userappdata}\BOT Busca NFE\logs'));
+        
+        // Adiciona ao registro de inicialização se selecionado
+        if IsTaskSelected('startup') then
+        begin
+            StartupRegKey := 'Software\Microsoft\Windows\CurrentVersion\Run';
+            ExePath := ExpandConstant('"{app}\{#MyAppExeName}" --startup');
+            RegWriteStringValue(HKEY_CURRENT_USER, StartupRegKey, '{#MyAppName}', ExePath);
+        end;
     end;
 end;
 
@@ -100,9 +112,14 @@ end;
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 var
     Response: Integer;
+    StartupRegKey: string;
 begin
     if CurUninstallStep = usUninstall then
     begin
+        // Remove entrada de inicialização automática
+        StartupRegKey := 'Software\Microsoft\Windows\CurrentVersion\Run';
+        RegDeleteValue(HKEY_CURRENT_USER, StartupRegKey, '{#MyAppName}');
+        
         Response := MsgBox('Deseja manter os dados e configurações do aplicativo?' + #13#10 + 
                           '(XMLs, certificados e banco de dados)' + #13#10#13#10 + 
                           'Clique Sim para MANTER os dados' + #13#10 + 

@@ -48,6 +48,15 @@ from requests.exceptions import RequestException
 import json
 from nuvem_fiscal_api import NuvemFiscalAPI
 
+# Importa sistema de criptografia
+sys.path.insert(0, str(Path(__file__).parent))
+try:
+    from modules.security import get_portable_crypto
+    CRYPTO_AVAILABLE = True
+except ImportError:
+    CRYPTO_AVAILABLE = False
+    logging.warning("Módulo de criptografia não disponível")
+
 # -------------------------------------------------------------------
 # Consulta de CNPJ
 # -------------------------------------------------------------------
@@ -191,7 +200,7 @@ def get_data_dir():
     return data_dir
 
 BASE_DIR = get_data_dir()
-DB_PATH = BASE_DIR / "notas.db"
+DB_PATH = BASE_DIR / "nfe_data.db"  # Banco principal do sistema
 
 # -------------------------------------------------------------------
 # Configuração de logs
@@ -320,19 +329,63 @@ class NFSeDatabase:
                 )
             ''')
             
+            # Tabela de controle de NSU para NFS-e
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS nsu_nfse (
+                    informante TEXT PRIMARY KEY,
+                    ult_nsu INTEGER DEFAULT 0,
+                    atualizado_em TEXT
+                )
+            ''')
+            
             conn.commit()
             logger.debug("✅ Tabelas NFS-e criadas/verificadas")
     
     def get_certificados(self):
-        """Busca certificados cadastrados no banco principal."""
+        """Busca certificados cadastrados no banco principal com senhas descriptografadas."""
         with self._connect() as conn:
+            # Tenta buscar da tabela certificados_sefaz primeiro (tabela mais recente)
             cursor = conn.execute('''
                 SELECT cnpj_cpf, caminho, senha, informante, cUF_autor 
-                FROM certificados
+                FROM certificados_sefaz
+                WHERE ativo = 1
             ''')
-            certificados = cursor.fetchall()
-            logger.info(f"📋 Encontrados {len(certificados)} certificado(s) cadastrado(s)")
-            return certificados
+            rows = cursor.fetchall()
+            
+            # Se não encontrar, tenta tabela antiga certificados
+            if not rows:
+                cursor = conn.execute('''
+                    SELECT cnpj_cpf, caminho, senha, informante, cUF_autor 
+                    FROM certificados
+                ''')
+                rows = cursor.fetchall()
+            
+            logger.info(f"📋 Encontrados {len(rows)} certificado(s) cadastrado(s)")
+            
+            # Descriptografa senhas se disponível
+            if CRYPTO_AVAILABLE and rows:
+                crypto = get_portable_crypto()
+                decrypted_rows = []
+                for row in rows:
+                    cnpj, caminho, senha, informante, cuf = row
+                    
+                    # Descriptografa senha
+                    if senha:
+                        try:
+                            # Verifica se está criptografada
+                            if crypto.is_encrypted(senha):
+                                senha = crypto.decrypt(senha)
+                                logger.debug(f"✅ Senha descriptografada para {informante}")
+                            else:
+                                logger.warning(f"⚠️  Senha do certificado {informante} está em texto plano")
+                        except Exception as e:
+                            logger.error(f"❌ Erro ao descriptografar senha de {informante}: {e}")
+                    
+                    decrypted_rows.append((cnpj, caminho, senha, informante, cuf))
+                
+                return decrypted_rows
+            
+            return rows
     
     def get_config_nfse(self, cnpj):
         """Busca configuração de NFS-e para um CNPJ."""
@@ -367,6 +420,25 @@ class NFSeDatabase:
                   datetime.now().isoformat()))
             conn.commit()
             logger.info(f"💾 NFS-e {numero} salva no banco")
+    
+    def get_last_nsu_nfse(self, informante):
+        """Retorna o ultimo NSU processado para NFS-e de um informante."""
+        with self._connect() as conn:
+            cursor = conn.execute('''
+                SELECT ult_nsu FROM nsu_nfse WHERE informante = ?
+            ''', (informante,))
+            row = cursor.fetchone()
+            return row[0] if row else 0
+    
+    def set_last_nsu_nfse(self, informante, nsu):
+        """Atualiza o ultimo NSU processado para NFS-e de um informante."""
+        with self._connect() as conn:
+            conn.execute('''
+                INSERT OR REPLACE INTO nsu_nfse (informante, ult_nsu, atualizado_em)
+                VALUES (?, ?, ?)
+            ''', (informante, nsu, datetime.now().isoformat()))
+            conn.commit()
+            logger.debug(f"✅ NSU NFS-e atualizado: {informante} -> {nsu}")
 
 # -------------------------------------------------------------------
 # Mapeamento de URLs por município

@@ -99,6 +99,10 @@ class DatabaseManager:
                 informante TEXT PRIMARY KEY,
                 ult_nsu TEXT
             )''')
+            conn.execute('''CREATE TABLE IF NOT EXISTS nsu_nfse (
+                informante TEXT PRIMARY KEY,
+                ult_nsu TEXT
+            )''')
             conn.execute('''CREATE TABLE IF NOT EXISTS erro_656 (
                 informante TEXT PRIMARY KEY,
                 ultimo_erro TIMESTAMP,
@@ -182,8 +186,15 @@ class DatabaseManager:
                     print("[MIGRAÇÃO] Adicionando coluna cnpj_destinatario...")
                     conn.execute("ALTER TABLE notas_detalhadas ADD COLUMN cnpj_destinatario TEXT")
                     print("[MIGRAÇÃO] Coluna cnpj_destinatario adicionada com sucesso")
+                
+                # Migração: Adiciona coluna pdf_path para cache de caminho do PDF
+                if 'pdf_path' not in columns:
+                    print("[MIGRAÇÃO] Adicionando coluna pdf_path para cache de PDFs...")
+                    conn.execute("ALTER TABLE notas_detalhadas ADD COLUMN pdf_path TEXT")
+                    print("[MIGRAÇÃO] ✅ Coluna pdf_path adicionada com sucesso")
+                    print("[INFO] PDFs serão indexados automaticamente conforme forem acessados")
             except Exception as e:
-                print(f"[MIGRAÇÃO] Erro ao adicionar colunas destinatário: {e}")
+                print(f"[MIGRAÇÃO] Erro ao adicionar colunas: {e}")
             
             conn.commit()
     
@@ -363,7 +374,11 @@ class DatabaseManager:
                 
                 if existing:
                     old_status = (existing[0] or 'RESUMO').upper()
-                    # Anti-downgrade: don't replace COMPLETO with RESUMO
+                    # Anti-downgrade: protege hierarquia EVENTO > COMPLETO > RESUMO
+                    # EVENTO nunca pode virar COMPLETO ou RESUMO (é evento, não nota)
+                    if old_status == 'EVENTO':
+                        return False  # Nunca sobrescreve EVENTO
+                    # COMPLETO não pode virar RESUMO (downgrade)
                     if old_status == 'COMPLETO' and new_status == 'RESUMO':
                         return False
                     
@@ -442,6 +457,32 @@ class DatabaseManager:
                 conn.commit()
                 return True
         except Exception:
+            return False
+    
+    def atualizar_pdf_path(self, chave: str, pdf_path: str) -> bool:
+        """
+        Update PDF path cache in notas_detalhadas table.
+        
+        This dramatically speeds up PDF opening by avoiding filesystem searches.
+        The system will auto-heal: when a PDF is found via search, the path is cached.
+        
+        Args:
+            chave: Document key (44 digits)
+            pdf_path: Absolute path to the PDF file
+        
+        Returns:
+            True if updated successfully
+        """
+        try:
+            with self._connect() as conn:
+                conn.execute(
+                    "UPDATE notas_detalhadas SET pdf_path = ?, atualizado_em = ? WHERE chave = ?",
+                    (pdf_path, datetime.now().isoformat(), chave)
+                )
+                conn.commit()
+                return True
+        except Exception as e:
+            print(f"[ERRO] Falha ao atualizar pdf_path para {chave}: {e}")
             return False
     
     def get_documento_por_chave(self, chave: str) -> Optional[Dict[str, Any]]:
@@ -658,6 +699,32 @@ class DatabaseManager:
             # Manifestação já existe (UNIQUE constraint violated)
             return False
     
+    def get_manifestacoes_by_chave(self, chave: str) -> list:
+        """
+        Busca todas as manifestações de uma chave específica.
+        
+        Args:
+            chave: Chave de acesso do documento (44 dígitos)
+        
+        Returns:
+            list: Lista de manifestações encontradas
+        """
+        try:
+            with self._connect() as conn:
+                conn.row_factory = sqlite3.Row
+                rows = conn.execute(
+                    '''SELECT tipo_evento, informante, data_manifestacao as enviado_em, 
+                              status, protocolo 
+                       FROM manifestacoes 
+                       WHERE chave = ? 
+                       ORDER BY data_manifestacao DESC''',
+                    (chave,)
+                ).fetchall()
+                return [dict(row) for row in rows]
+        except Exception as e:
+            print(f"[DEBUG] Erro ao buscar manifestações: {e}")
+            return []
+    
     def get_config(self, chave: str, default: str = None) -> Optional[str]:
         """Get a configuration value."""
         try:
@@ -693,6 +760,41 @@ class DatabaseManager:
             return int(valor)
         except Exception:
             return 60
+    
+    def get_config(self, chave: str, default=None) -> Optional[str]:
+        """Busca valor de configuração.
+        
+        Args:
+            chave: Chave da configuração
+            default: Valor padrão se não existir
+            
+        Returns:
+            Valor da configuração ou default
+        """
+        try:
+            with self._connect() as conn:
+                cursor = conn.execute("SELECT valor FROM config WHERE chave = ?", (chave,))
+                row = cursor.fetchone()
+                return row[0] if row else default
+        except Exception:
+            return default
+    
+    def set_config(self, chave: str, valor: str):
+        """Define valor de configuração.
+        
+        Args:
+            chave: Chave da configuração
+            valor: Valor a ser armazenado
+        """
+        try:
+            with self._connect() as conn:
+                conn.execute(
+                    "INSERT OR REPLACE INTO config (chave, valor) VALUES (?, ?)",
+                    (chave, valor)
+                )
+                conn.commit()
+        except Exception as e:
+            print(f"Erro ao salvar config: {e}")
     
     def get_cert_nome_by_informante(self, informante: str) -> Optional[str]:
         """Busca o nome personalizado do certificado pelo informante.
