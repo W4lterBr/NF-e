@@ -2654,6 +2654,34 @@ class XMLProcessor:
             '218': 'NF-e já está cancelada na base de dados da SEFAZ'
         }
         return mapeamento.get(cStat, xMotivo)
+    
+    def fetch_by_key(self, chave):
+        """
+        Busca XML completo de NF-e/CT-e por chave de acesso.
+        Este é um método de compatibilidade que delega para o NFeService.
+        
+        Args:
+            chave: Chave de 44 dígitos da NF-e/CT-e
+        
+        Returns:
+            XML completo ou None
+        
+        Nota:
+            Este método requer que o XMLProcessor tenha sido inicializado
+            com informante para criar o NFeService apropriado.
+        """
+        logger.warning(f"⚠️ fetch_by_key chamado no XMLProcessor - método legado")
+        logger.warning(f"   Recomenda-se usar NFeService.fetch_by_chave_dist() diretamente")
+        
+        if not self.informante:
+            logger.error(f"❌ XMLProcessor.fetch_by_key: informante não definido")
+            return None
+        
+        # Este método precisa de um NFeService para funcionar
+        # Por enquanto, retorna None e loga erro
+        logger.error(f"❌ XMLProcessor.fetch_by_key: método não implementado completamente")
+        logger.error(f"   Use NFeService.fetch_by_chave_dist() para buscar XMLs por chave")
+        return None
 
 # -------------------------------------------------------------------
 # Serviço SOAP

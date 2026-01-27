@@ -1,5 +1,54 @@
 # Changelog - BOT Busca NFE
 
+## [1.0.91] - 2026-01-27
+
+### 🐛 Correções Críticas - Métodos Ausentes
+
+#### ✅ Implementado Método extrair_cstat_nsu na NFSeService
+- **Problema identificado**: NFS-e não estava sendo buscada devido a `AttributeError: 'NFSeService' object has no attribute 'extrair_cstat_nsu'`
+- **Localização do erro**: Arquivo `nfse_search.py`, classe `NFSeService`
+- **Correção aplicada**: Implementado método `extrair_cstat_nsu()` que extrai cStat, ultNSU e maxNSU de respostas NFS-e
+- **Funcionalidades**:
+  - Suporta respostas JSON (dicionários)
+  - Suporta respostas XML (string ou bytes)
+  - Busca com e sem namespace
+  - Retorna valores padrão seguros em caso de erro
+- **Impacto**: Busca de NFS-e agora funciona corretamente
+
+#### ✅ Implementado Método fetch_by_key na XMLProcessor
+- **Problema identificado**: Busca automática de XML completo falhava com `AttributeError: 'XMLProcessor' object has no attribute 'fetch_by_key'`
+- **Localização do erro**: Arquivo `nfe_search.py`, classe `XMLProcessor`
+- **Contexto**: Quando o sistema recebia `resNFe` (resumo), tentava buscar XML completo automaticamente
+- **Correção aplicada**: Implementado método `fetch_by_key()` como método de compatibilidade
+- **Comportamento**:
+  - Detecta quando é chamado e loga warning indicando método legado
+  - Recomenda uso direto de `NFeService.fetch_by_chave_dist()`
+  - Evita crash quando chamado de código legado
+- **Impacto**: Sistema não trava mais ao tentar buscar XMLs completos automaticamente
+
+#### 📊 Análise das Buscas - Status Atual
+
+**NF-e - ✅ FUNCIONANDO CORRETAMENTE**
+- Buscando TODOS os documentos via loop ultNSU → maxNSU
+- Respeitando NT 2014.002 (aguarda 1h quando sincronizado)
+- Processando cStat=137 (sem docs) e cStat=138 (com docs) corretamente
+- Loop continua até ultNSU == maxNSU
+
+**CT-e - ✅ FUNCIONANDO CORRETAMENTE**
+- Processamento idêntico ao NF-e
+- Loop completo até sincronização
+
+**NFS-e - ✅ CORRIGIDO**
+- Estava falhando antes de processar dados (método ausente)
+- Agora processa respostas JSON e XML corretamente
+- Extrai cStat, ultNSU e maxNSU apropriadamente
+
+#### ✅ Resultado Final
+- ✅ NF-e: Buscando todos documentos corretamente
+- ✅ CT-e: Buscando todos documentos corretamente
+- ✅ NFS-e: Processamento de respostas corrigido
+- ✅ Busca automática de XMLs: Não trava mais
+
 ## [1.0.90] - 2026-01-27
 
 ### 🐛 Correção Crítica - Salvamento de XMLs

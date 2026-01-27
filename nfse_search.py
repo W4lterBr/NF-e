@@ -549,6 +549,46 @@ class NFSeService:
         self.cnpj = cnpj
         logger.debug(f"🔐 NFSeService inicializado para {cnpj}")
     
+    def extrair_cstat_nsu(self, xml_resposta):
+        """
+        Extrai cStat, ultNSU e maxNSU da resposta NFS-e.
+        
+        Args:
+            xml_resposta: String, bytes ou dict (JSON) com resposta da API
+        
+        Returns:
+            Tupla (cStat, ultNSU, maxNSU)
+        """
+        try:
+            # Se for dict (JSON), tenta extrair campos
+            if isinstance(xml_resposta, dict):
+                cstat = xml_resposta.get('cStat', '')
+                ult_nsu = xml_resposta.get('ultNSU', '000000000000000')
+                max_nsu = xml_resposta.get('maxNSU', '000000000000000')
+                logger.debug(f"[NFS-e] Extraido JSON: cStat={cstat}, ultNSU={ult_nsu}, maxNSU={max_nsu}")
+                return cstat, ult_nsu, max_nsu
+            
+            # Converte bytes para string se necessario
+            if isinstance(xml_resposta, bytes):
+                xml_resposta = xml_resposta.decode('utf-8')
+            
+            tree = etree.fromstring(xml_resposta.encode('utf-8'))
+            
+            # Busca com e sem namespace
+            NS_NFSE = 'http://www.portalfiscal.inf.br/nfse'
+            ns = {'nfse': NS_NFSE}
+            
+            cstat = tree.findtext('.//nfse:cStat', namespaces=ns) or tree.findtext('.//cStat') or ''
+            ult_nsu = tree.findtext('.//nfse:ultNSU', namespaces=ns) or tree.findtext('.//ultNSU') or '000000000000000'
+            max_nsu = tree.findtext('.//nfse:maxNSU', namespaces=ns) or tree.findtext('.//maxNSU') or '000000000000000'
+            
+            logger.debug(f"[NFS-e] Extraido XML: cStat={cstat}, ultNSU={ult_nsu}, maxNSU={max_nsu}")
+            return cstat, ult_nsu, max_nsu
+            
+        except Exception as e:
+            logger.error(f"❌ [NFS-e] Erro ao extrair cStat/NSU: {e}")
+            return '', '000000000000000', '000000000000000'
+    
     def _formatar_data(self, data_str):
         """Converte DD/MM/YYYY para YYYY-MM-DD"""
         try:
