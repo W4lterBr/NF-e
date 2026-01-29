@@ -280,6 +280,11 @@ class NFSeDatabase:
     
     def __init__(self, db_path=DB_PATH):
         self.db_path = db_path
+        # 🔧 CORREÇÃO: Importa DatabaseManager para reutilizar conexão do banco principal
+        from nfe_search import DatabaseManager
+        # 🔴 IMPORTANTE: Banco principal é 'notas.db', não 'nfe_data.db'
+        main_db_path = str(BASE_DIR / "notas.db")
+        self.main_db = DatabaseManager(main_db_path)
         self._criar_tabelas()
     
     def _connect(self):
@@ -342,54 +347,18 @@ class NFSeDatabase:
             logger.debug("✅ Tabelas NFS-e criadas/verificadas")
     
     def get_certificados(self):
-        """Busca certificados cadastrados no banco principal com senhas descriptografadas."""
-        with self._connect() as conn:
-            # Tenta buscar da tabela certificados_sefaz primeiro (tabela mais recente)
-            cursor = conn.execute('''
-                SELECT cnpj_cpf, caminho, senha, informante, cUF_autor 
-                FROM certificados_sefaz
-                WHERE ativo = 1
-            ''')
-            rows = cursor.fetchall()
-            
-            # Se não encontrar, tenta tabela antiga certificados
-            if not rows:
-                cursor = conn.execute('''
-                    SELECT cnpj_cpf, caminho, senha, informante, cUF_autor 
-                    FROM certificados
-                ''')
-                rows = cursor.fetchall()
-            
-            logger.info(f"📋 Encontrados {len(rows)} certificado(s) cadastrado(s)")
-            
-            # Descriptografa senhas se disponível
-            if CRYPTO_AVAILABLE and rows:
-                crypto = get_portable_crypto()
-                decrypted_rows = []
-                for row in rows:
-                    cnpj, caminho, senha, informante, cuf = row
-                    
-                    # Descriptografa senha
-                    if senha:
-                        try:
-                            # Verifica se está criptografada
-                            if crypto.is_encrypted(senha):
-                                senha = crypto.decrypt(senha)
-                                logger.debug(f"✅ Senha descriptografada para {informante}")
-                            else:
-                                logger.warning(f"⚠️  Senha do certificado {informante} está em texto plano")
-                        except Exception as e:
-                            logger.error(f"❌ Erro ao descriptografar senha de {informante}: {e}")
-                    
-                    decrypted_rows.append((cnpj, caminho, senha, informante, cuf))
-                
-                return decrypted_rows
-            
-            return rows
+        """Busca certificados cadastrados no banco principal usando DatabaseManager."""
+        # 🔧 CORREÇÃO: Usa DatabaseManager do banco principal
+        try:
+            return self.main_db.get_certificados()
+        except Exception as e:
+            logger.error(f"❌ Erro ao buscar certificados: {e}")
+            return []
     
     def get_config_nfse(self, cnpj):
-        """Busca configuração de NFS-e para um CNPJ."""
-        with self._connect() as conn:
+        """Busca configuração de NFS-e para um CNPJ no banco principal."""
+        # 🔧 CORREÇÃO: Busca no banco principal (notas.db), não no banco local
+        with self.main_db._connect() as conn:
             cursor = conn.execute('''
                 SELECT provedor, codigo_municipio, inscricao_municipal, url_customizada
                 FROM nfse_config

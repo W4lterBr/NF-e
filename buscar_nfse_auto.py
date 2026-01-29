@@ -20,6 +20,9 @@ from nfse_search import NFSeDatabase, logger, URLS_MUNICIPIOS, consultar_cnpj
 from modules.nfse_service import NFSeService, consultar_nfse_incremental
 from lxml import etree
 
+# Importa salvar_nfse_detalhada para salvar em notas_detalhadas (banco principal)
+from nfe_search import salvar_nfse_detalhada
+
 # Importa gerador profissional de DANFSe
 try:
     from gerar_danfse_profissional import gerar_danfse_profissional
@@ -52,11 +55,20 @@ def gerar_pdf_nfse(xml_content, pdf_path):
         return False
 
 
-def salvar_xml_nfse(cnpj, xml_content, numero_nfse, data_emissao):
+def salvar_xml_nfse(db, cnpj, xml_content, numero_nfse, data_emissao):
     """
-    Salva XML da NFS-e em arquivo local.
+    Salva XML da NFS-e em arquivo local seguindo o padrão de NF-e e CT-e.
+    
+    Estrutura: xmls/{CNPJ}/{ANO-MES}/NFSe/{NUMERO}-{FORNECEDOR}.xml
+    
+    O formato ANO-MES respeita a configuração storage_formato_mes do banco:
+    - AAAA-MM (padrão): 2026-01
+    - MM-AAAA: 01-2026
+    - AAAA/MM: 2026/01
+    - MM/AAAA: 01/2026
     
     Args:
+        db: Instância do banco de dados (NFSeDatabase)
         cnpj: CNPJ do prestador
         xml_content: Conteudo XML completo
         numero_nfse: Numero da NFS-e
@@ -66,6 +78,9 @@ def salvar_xml_nfse(cnpj, xml_content, numero_nfse, data_emissao):
         Caminho do arquivo salvo ou None se erro
     """
     try:
+        from lxml import etree
+        import re
+        
         # Parse da data
         if isinstance(data_emissao, str):
             # Tenta varios formatos
@@ -80,12 +95,46 @@ def salvar_xml_nfse(cnpj, xml_content, numero_nfse, data_emissao):
         else:
             dt = data_emissao
         
-        # Define estrutura de pastas: xmls/{CNPJ}/{MES-ANO}/NFSe/
-        pasta_base = Path(__file__).parent / "xmls" / cnpj / dt.strftime('%m-%Y') / "NFSe"
+        # Extrai ano e mês
+        ano = str(dt.year)
+        mes = f"{dt.month:02d}"
+        
+        # Lê formato de pasta do banco (mesmo padrão de NF-e/CT-e)
+        try:
+            formato_mes = db.get_config('storage_formato_mes', 'AAAA-MM')
+        except:
+            formato_mes = 'AAAA-MM'  # Padrão se não conseguir ler
+        
+        # Aplica formato configurado
+        if formato_mes == 'MM-AAAA':
+            ano_mes = f"{mes}-{ano}"
+        elif formato_mes == 'AAAA/MM':
+            ano_mes = f"{ano}/{mes}"
+        elif formato_mes == 'MM/AAAA':
+            ano_mes = f"{mes}/{ano}"
+        else:  # AAAA-MM (padrão)
+            ano_mes = f"{ano}-{mes}"
+        
+        # Extrai nome do prestador do XML para nomenclatura
+        xNome = "NFSe"  # Padrão
+        try:
+            root = etree.fromstring(xml_content.encode('utf-8') if isinstance(xml_content, str) else xml_content)
+            ns = '{http://www.sped.fazenda.gov.br/nfse}'
+            
+            # Tenta extrair RazaoSocial do Prestador
+            razao_social = root.findtext(f'.//{ns}PrestadorServico//{ns}RazaoSocial')
+            if razao_social:
+                # Sanitiza o nome (remove caracteres inválidos)
+                xNome = re.sub(r'[\\/*?:"<>|]', "_", razao_social).strip()[:50]  # Limita a 50 caracteres
+        except Exception as e:
+            logger.debug(f"   ⚠️ Não foi possível extrair razão social do XML: {e}")
+        
+        # Define estrutura de pastas: xmls/{CNPJ}/{ANO-MES}/NFSe/
+        pasta_base = Path(__file__).parent / "xmls" / cnpj / ano_mes / "NFSe"
         pasta_base.mkdir(parents=True, exist_ok=True)
         
-        # Nome do arquivo
-        nome_arquivo = f"NFSe_{numero_nfse}.xml"
+        # Nome do arquivo no padrão: {NUMERO}-{FORNECEDOR}.xml
+        nome_arquivo = f"{numero_nfse}-{xNome}.xml"
         caminho_completo = pasta_base / nome_arquivo
         
         # Salva XML
@@ -207,6 +256,7 @@ def buscar_nfse_ambiente_nacional(db, cert_data, config_nfse, busca_completa=Fal
                 
                 # Salva XML
                 caminho_xml = salvar_xml_nfse(
+                    db=db,
                     cnpj=cnpj,
                     xml_content=xml_content,
                     numero_nfse=numero_nfse,
@@ -214,7 +264,7 @@ def buscar_nfse_ambiente_nacional(db, cert_data, config_nfse, busca_completa=Fal
                 )
                 
                 if caminho_xml:
-                    # Salva no banco
+                    # Salva no banco local (nfse_baixadas)
                     db.salvar_nfse(
                         numero=numero_nfse,
                         cnpj_prestador=cnpj,
@@ -223,6 +273,14 @@ def buscar_nfse_ambiente_nacional(db, cert_data, config_nfse, busca_completa=Fal
                         valor=float(valor_servicos.replace(',', '.')),
                         xml=xml_content
                     )
+                    
+                    # 🔧 CORREÇÃO: Salva TAMBÉM em notas_detalhadas (banco principal)
+                    # Esta é a tabela que a interface busca!
+                    try:
+                        salvar_nfse_detalhada(xml_content, nsu, informante)
+                        logger.info(f"   ✅ NFS-e {numero_nfse}: R$ {valor_servicos} salva em notas_detalhadas")
+                    except Exception as e_det:
+                        logger.warning(f"   ⚠️  Erro ao salvar detalhes: {e_det}")
                     
                     notas_salvas += 1
                     logger.info(f"   ✅ NFS-e {numero_nfse}: R$ {valor_servicos} salva")

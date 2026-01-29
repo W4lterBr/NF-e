@@ -1,5 +1,44 @@
 # Changelog - BOT Busca NFE
 
+## [1.0.92] - 2026-01-29
+
+### 🔧 Otimizações NFS-e
+
+#### ✅ Removida Duplicação de Busca NFS-e
+- **Problema**: NFS-e era processada em 2 lugares simultaneamente:
+  1. Dentro do `nfe_search.py` (durante loop de certificados)
+  2. Via `buscar_nfse_auto.py` (script separado após conclusão)
+- **Sintoma**: Logs intercalados, consultas duplicadas à API, possível erro 429
+- **Correção**: Removidas chamadas `processar_nfse()` do `nfe_search.py`
+- **Resultado**: NFS-e executa apenas via `buscar_nfse_auto.py` após NF-e/CT-e
+- **Benefícios**:
+  - Sem duplicação de consultas
+  - Logs organizados e sequenciais
+  - NF-e/CT-e não esperam NFS-e (mais rápido)
+  - Controle independente (incremental vs completa)
+
+#### ✅ Estrutura de Pastas NFS-e Unificada
+- **Antes**: `xmls/{CNPJ}/MM-AAAA/NFSe/NFSe_123.xml`
+- **Agora**: `xmls/{CNPJ}/AAAA-MM/NFSe/123-PRESTADOR.xml`
+- **Mudanças**:
+  - Nomenclatura: `{NUMERO}-{PRESTADOR}.xml` (igual NF-e/CT-e)
+  - Formato pasta: Configurável via `storage_formato_mes` (AAAA-MM, MM-AAAA, etc)
+  - Nome do prestador extraído do XML (RazaoSocial)
+  - Sanitização de caracteres inválidos
+  - Limite de 50 caracteres no nome
+- **Compatibilidade**: Arquivos antigos continuam sendo lidos
+- **Arquivos modificados**:
+  - `buscar_nfse_auto.py`: Função `salvar_xml_nfse()` atualizada
+  - `testar_nfse_rapido.py`: Chamadas atualizadas
+  - `tests/examples/testar_nfse_rapido.py`: Chamadas atualizadas
+
+#### 📚 Documentação Atualizada
+- `docs/AJUSTE_NFSE_POS_SEFAZ.md`: Seção sobre remoção de duplicação
+- `docs/README_NFSE_USUARIO.md`: Estrutura de pastas e nomenclatura
+- `docs/GUIA_TECNICO_NFSE.md`: Nova seção "Estrutura de Armazenamento"
+
+---
+
 ## [1.0.91] - 2026-01-27
 
 ### 🐛 Correções Críticas - Métodos Ausentes

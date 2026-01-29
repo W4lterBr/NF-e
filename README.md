@@ -6,6 +6,49 @@
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Windows-lightgrey.svg)](https://www.microsoft.com/windows)
 
+---
+
+## 📂 Estrutura do Projeto
+
+```
+BOT - Busca NFE/
+├── 📄 Busca NF-e.py          # Aplicação principal (interface PyQt5)
+├── 📄 nfe_search.py           # Motor de busca (NF-e, CT-e, NFS-e)
+├── 📄 requirements.txt        # Dependências Python
+├── 📄 version.txt             # Versão atual
+├── 📄 CHANGELOG.md            # Histórico de mudanças
+├── 📄 README.md               # Este arquivo
+│
+├── 📁 modules/                # Módulos do sistema
+│   ├── nfse_service.py       # Serviço NFS-e (API REST)
+│   ├── theme_manager.py      # Gerenciador de temas
+│   └── ...
+│
+├── 📁 docs/                   # 📚 DOCUMENTAÇÃO
+│   ├── README.md             # Índice da documentação
+│   ├── instalacao/           # Guias de instalação
+│   ├── certificados/         # Gestão de certificados
+│   ├── nfse/                 # Documentação NFS-e
+│   ├── sistema/              # Arquitetura e técnicas
+│   └── troubleshooting/      # Solução de problemas
+│
+├── 📁 tests/                  # 🧪 TESTES E SCRIPTS
+│   ├── README.md             # Guia de testes
+│   ├── test_*.py             # Testes unitários
+│   ├── check_*.py            # Verificações
+│   ├── debug_*.py            # Scripts de debug
+│   └── ...
+│
+├── 📁 config/                 # Configurações
+├── 📁 logs/                   # Logs do sistema
+├── 📁 xmls/                   # XMLs baixados
+├── 📁 xml_extraidos/          # XMLs extraídos
+├── 📁 Output/                 # PDFs gerados
+└── 📁 Icone/                  # Ícones da interface
+```
+
+---
+
 ## 🎯 Sobre o Projeto
 
 O **BOT Busca NFE** é uma aplicação desktop desenvolvida para automatizar completamente o processo de busca, download e organização de documentos fiscais eletrônicos. Conecta-se diretamente aos webservices da SEFAZ utilizando certificados digitais A1, dispensando a necessidade de acessar portais manualmente.
@@ -13,7 +56,7 @@ O **BOT Busca NFE** é uma aplicação desktop desenvolvida para automatizar com
 ### 🌟 Principais Funcionalidades
 
 - 🔍 **Busca Automática na SEFAZ**
-  - Consulta distribuição de DFe (NFe e CT-e)
+  - Consulta distribuição de DFe (NFe, CT-e e NFS-e)
   - Busca por NSU (Número Sequencial Único)
   - Busca por chave de acesso individual ou em lote
   - Atualização automática em intervalos configuráveis
@@ -21,7 +64,7 @@ O **BOT Busca NFE** é uma aplicação desktop desenvolvida para automatizar com
 - 📁 **Organização Inteligente**
   - Estrutura hierárquica por certificado/CNPJ
   - Separação por ano-mês de emissão
-  - Categorização por tipo (NFe, CTe, Eventos, Resumos)
+  - Categorização por tipo (NFe, CTe, NFS-e, Eventos, Resumos)
   - Nomes personalizados para certificados
   - Duplo armazenamento (backup + pasta configurada)
 
@@ -154,17 +197,45 @@ O sistema mantém **dois locais de armazenamento**:
 2. **Pasta configurada** - Armazenamento principal (configurável)
 
 ```
-Estrutura de pastas:
-xmls/
-├── [Nome_Certificado ou CNPJ]/
-│   └── [ANO-MES]/
-│       ├── NFe/
-│       │   ├── 12345-EMPRESA_LTDA.xml
-│       │   └── 12345-EMPRESA_LTDA.pdf
-│       ├── CTe/
-│       ├── Eventos/
-│       └── Resumos/
-```
+## 🔍 Busca Avançada
+
+- **Por NSU:** Busca incremental desde último NSU processado
+- **Por Chave:** Digite ou cole chaves de 44/47 dígitos
+- **Em Lote:** Cole múltiplas chaves separadas por linha
+- **Automática:** Configure intervalo de busca automática
+
+### 3️⃣ Visualizando e Gerenciando
+
+- **Abrir PDF:** Duplo clique na nota para gerar/abrir PDF
+- **Buscar XML Completo:** Menu contexto → "Baixar XML Completo"
+- **Manifestar Documento:** Menu contexto → "Manifestar"
+- **Ver Eventos:** Menu contexto → "Ver Eventos"
+- **Exportar:** Menu **Ferramentas** → **Exportar para Excel**
+
+---
+
+## 📚 Documentação Completa
+
+Toda a documentação está organizada na pasta [`docs/`](./docs/):
+
+### 📖 Guias Essenciais
+- [🔧 Instalação Completa](./docs/instalacao/INSTALACAO.md)
+- [🔐 Gestão de Certificados](./docs/certificados/CERTIFICADOS_README.md)
+- [📄 NFS-e (Notas de Serviço)](./docs/nfse/NFSE_DOCUMENTACAO_COMPLETA.md)
+- [⚙️ Arquitetura do Sistema](./docs/sistema/DOCUMENTACAO_SISTEMA.md)
+
+### 🔍 Solução de Problemas
+- [❌ Erro 656 (Consumo Indevido)](./docs/troubleshooting/DIAGNOSTICO_ERRO_656.md)
+- [🔧 Certificados](./docs/certificados/CERTIFICADOS_TROUBLESHOOTING.md)
+- [📊 Análise de Logs](./docs/troubleshooting/)
+
+### 🧪 Desenvolvimento
+- [Testes e Scripts](./tests/README.md)
+- [Histórico de Mudanças](./CHANGELOG.md)
+
+**Ver índice completo:** [`docs/README.md`](./docs/README.md)
+
+---
 
 ## 🛠️ Tecnologias Utilizadas
 
@@ -174,35 +245,38 @@ xmls/
 | **PyQt5** | Interface gráfica |
 | **lxml** | Parsing de XML |
 | **Zeep** | Cliente SOAP para SEFAZ |
-| **requests-pkcs12** | Autenticação com certificado |
+| **requests-pkcs12** | Autenticação com certificado (mTLS) |
 | **cryptography** | Criptografia de senhas |
 | **ReportLab** | Geração de PDFs |
 | **SQLite** | Banco de dados local |
 
-## 📂 Estrutura do Projeto
+---
+
+## 📁 Organização de Arquivos
+
+### Estrutura de Armazenamento
 
 ```
-BOT-Busca-NFE/
-├── interface_pyqt5.py          # Interface principal (PyQt5)
-├── nfe_search.py               # Lógica de busca SEFAZ
-├── requirements.txt            # Dependências Python
-├── version.txt                 # Versão atual (1.0.21)
-├── BOT_Busca_NFE.spec         # Config PyInstaller
-├── installer.iss               # Config Inno Setup
-├── build.bat                   # Script de compilação
-│
-├── modules/                    # Módulos do sistema
-│   ├── database.py            # Gerenciamento de banco
-│   ├── cte_service.py         # Serviço de CT-e
-│   ├── updater.py             # Sistema de atualização
-│   ├── pdf_simple.py          # Geração de PDF
-│   └── ...
-│
-├── Arquivo_xsd/               # Schemas XSD SEFAZ
-├── Icone/                     # Ícones da interface
-├── xmls/                      # Armazenamento local (backup)
-└── logs/                      # Logs de execução
+xmls/
+├── [Nome_Certificado ou CNPJ]/
+│   └── [ANO-MES]/
+│       ├── NFe/
+│       │   ├── 12345-EMPRESA_LTDA.xml
+│       │   └── 12345-EMPRESA_LTDA.pdf
+│       ├── CTe/
+│       ├── NFS-e/
+│       ├── Eventos/
+│       └── Resumos/
 ```
+
+**Características:**
+- ✅ Organização hierárquica por certificado
+- ✅ Separação por ano-mês de emissão
+- ✅ XMLs e PDFs no mesmo local
+- ✅ Backup automático em `xmls/`
+- ✅ Pasta configurável adicional
+
+---
 
 ## 🔄 Atualizações Automáticas
 

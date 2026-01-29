@@ -24,6 +24,7 @@ cryptography>=41.0.7
 pyOpenSSL>=23.3.0
 wincertstore>=0.2  # Para acessar certificados do Windows
 signxml>=3.2.2  # Para assinatura XMLDSIG conforme padrão SEFAZ
+pynfe>=0.6.0  # Biblioteca Python para NF-e e eventos de manifestação
 
 # PDF Generation
 reportlab>=4.0.7

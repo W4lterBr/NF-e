@@ -273,6 +273,85 @@ class NFSeService:
         except Exception as e:
             logger.error(f"❌ [NFS-e] Erro ao extrair cStat/NSU: {e}")
             return '', '000000000000000', '000000000000000'
+    
+    def extrair_documentos(self, resultado):
+        """
+        Extrai documentos do resultado da consulta NSU.
+        
+        Args:
+            resultado: dict (JSON) ou bytes (XML) retornado por consultar_nsu()
+        
+        Yields:
+            Tupla (nsu, xml_content, tipo_documento)
+        """
+        import base64
+        import gzip
+        
+        if not resultado:
+            return
+        
+        try:
+            # Processa resultado JSON (formato API REST)
+            if isinstance(resultado, dict):
+                lote_dfe = resultado.get('LoteDFe', [])
+                
+                if not lote_dfe:
+                    logger.debug(f"📭 Resposta sem documentos no lote")
+                    return
+                
+                # Processa cada documento do lote
+                for doc in lote_dfe:
+                    try:
+                        doc_nsu = str(doc.get('NSU', '')).zfill(15)  # Padroniza para 15 dígitos
+                        xml_base64 = doc.get('ArquivoXml', '')
+                        
+                        if not xml_base64:
+                            logger.warning(f"⚠️  NSU {doc_nsu}: sem ArquivoXml")
+                            continue
+                        
+                        # Decodifica Base64 e descomprime gzip
+                        xml_comprimido = base64.b64decode(xml_base64)
+                        xml = gzip.decompress(xml_comprimido).decode('utf-8')
+                        
+                        # Determina tipo de documento
+                        if '<Nfse' in xml or '<NFSe' in xml or '<nfse' in xml or '<CompNfse' in xml:
+                            tipo = 'NFS-e'
+                        elif '<eventoCancelamento' in xml:
+                            tipo = 'Cancelamento'
+                        elif '<eventoSubstituicao' in xml:
+                            tipo = 'Substituicao'
+                        else:
+                            tipo = 'Desconhecido'
+                        
+                        yield (doc_nsu, xml, tipo)
+                        
+                    except Exception as e:
+                        logger.warning(f"⚠️  Erro ao processar documento do lote: {e}")
+                        continue
+            
+            # Processa resultado XML direto (formato legado)
+            elif isinstance(resultado, bytes):
+                try:
+                    xml = resultado.decode('utf-8')
+                    
+                    # Determina tipo de documento
+                    if '<Nfse' in xml or '<NFSe' in xml or '<nfse' in xml or '<CompNfse' in xml:
+                        tipo = 'NFS-e'
+                    elif '<eventoCancelamento' in xml:
+                        tipo = 'Cancelamento'
+                    elif '<eventoSubstituicao' in xml:
+                        tipo = 'Substituicao'
+                    else:
+                        tipo = 'Desconhecido'
+                    
+                    # NSU não vem na resposta XML direta
+                    yield ('000000000000000', xml, tipo)
+                    
+                except Exception as e:
+                    logger.warning(f"⚠️  Erro ao processar XML direto: {e}")
+            
+        except Exception as e:
+            logger.error(f"❌ Erro ao extrair documentos: {e}")
 
 
 def consultar_nfse_incremental(db, cert_path, senha, informante, cuf, ambiente='producao', busca_completa=False):

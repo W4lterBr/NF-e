@@ -28,12 +28,12 @@ def main():
     
     # Dados de teste
     cnpj = "33251845000109"
-    chave = "50260129506480000149550010001498511002767460"
+    chave = "50251042263870000101550010009997851162320151"  # ✅ NF-e modelo 55 (44 dígitos)
     tipo_evento = "210210"  # Ciência da Operação
     
     # Carregar certificado do banco usando a classe DatabaseManager
     print("\nBuscando certificado no banco de dados...")
-    db_path = BASE_DIR / "notas_test.db"
+    db_path = BASE_DIR / "notas.db"  # 🔧 MUDANÇA: Usar banco real
     db = DatabaseManager(db_path)
     certs = db.load_certificates()
     

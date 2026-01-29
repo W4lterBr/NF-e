@@ -501,6 +501,26 @@ class DatabaseManager:
         except Exception:
             return None
     
+    def get_nf_status(self, chave: str) -> Optional[tuple]:
+        """
+        Busca status de uma NF-e/CT-e pelo chave na tabela nf_status.
+        
+        Args:
+            chave: Chave de 44 dígitos do documento
+            
+        Returns:
+            tuple(cStat, xMotivo) ou None se não encontrado
+        """
+        try:
+            with self._connect() as conn:
+                cursor = conn.execute(
+                    "SELECT cStat, xMotivo FROM nf_status WHERE chNFe = ?",
+                    (chave,)
+                )
+                return cursor.fetchone()
+        except Exception:
+            return None
+    
     def register_xml_download(self, chave: str, caminho: str, cnpj_cpf: str = "") -> bool:
         """Register downloaded XML in xmls_baixados table."""
         try:
