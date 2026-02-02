@@ -1254,8 +1254,15 @@ URL_CONSULTA_FALLBACK = (
 class DatabaseManager:
     def __init__(self, db_path: Path):
         self.db_path = db_path
+        logger.info(f"🔧 Inicializando banco de dados: {db_path}")
         self._initialize()
-        logger.debug(f"Banco inicializado em {db_path}")
+        logger.info("🔧 _initialize() concluído")
+        # 🔒 CRÍTICO: Garante que notas_detalhadas existe com TODAS as colunas
+        self.criar_tabela_detalhada()
+        logger.info("🔧 criar_tabela_detalhada() concluído")
+        # Verifica se a tabela foi criada corretamente
+        self._verify_nsu_column()
+        logger.info(f"✅ Banco inicializado com sucesso em {db_path}")
 
     def get_nf_status(self, chave):
         with self._connect() as conn:
@@ -1403,76 +1410,114 @@ class DatabaseManager:
         
         🔒 CRÍTICO: Inclui coluna NSU para rastreamento de documentos baixados.
         """
-        with self._connect() as conn:
-            # Cria a tabela com todos os campos necessários
-            conn.execute('''
-            CREATE TABLE IF NOT EXISTS notas_detalhadas (
-                chave TEXT PRIMARY KEY,
-                ie_tomador TEXT,
-                nome_emitente TEXT,
-                cnpj_emitente TEXT,
-                numero TEXT,
-                data_emissao TEXT,
-                tipo TEXT,
-                valor TEXT,
-                cfop TEXT,
-                vencimento TEXT,
-                ncm TEXT,
-                status TEXT DEFAULT 'Autorizado o uso da NF-e',
-                natureza TEXT,
-                uf TEXT,
-                base_icms TEXT,
-                valor_icms TEXT,
-                informante TEXT,
-                xml_status TEXT DEFAULT 'COMPLETO',
-                atualizado_em DATETIME,
-                cnpj_destinatario TEXT,
-                nsu TEXT
-            )
-            ''')
-            # 🔒 MIGRAÇÃO CRÍTICA: Garante que as colunas existem (caso o banco seja antigo)
-            columns_to_add = [
-                ("cnpj_destinatario", "TEXT"),
-                ("xml_status", "TEXT DEFAULT 'COMPLETO'"),
-                ("ncm", "TEXT"),
-                ("base_icms", "TEXT"),
-                ("valor_icms", "TEXT"),
-                ("informante", "TEXT"),
-                ("nsu", "TEXT")  # 🔒 NSU CRÍTICO para rastreamento
-            ]
-            for col_name, col_type in columns_to_add:
+        logger.info("🔧 Criando/verificando tabela notas_detalhadas...")
+        try:
+            with self._connect() as conn:
+                # Cria a tabela com todos os campos necessários
+                conn.execute('''
+                CREATE TABLE IF NOT EXISTS notas_detalhadas (
+                    chave TEXT PRIMARY KEY,
+                    ie_tomador TEXT,
+                    nome_emitente TEXT,
+                    cnpj_emitente TEXT,
+                    numero TEXT,
+                    data_emissao TEXT,
+                    tipo TEXT,
+                    valor TEXT,
+                    cfop TEXT,
+                    vencimento TEXT,
+                    ncm TEXT,
+                    status TEXT DEFAULT 'Autorizado o uso da NF-e',
+                    natureza TEXT,
+                    uf TEXT,
+                    base_icms TEXT,
+                    valor_icms TEXT,
+                    informante TEXT,
+                    xml_status TEXT DEFAULT 'COMPLETO',
+                    atualizado_em DATETIME,
+                    cnpj_destinatario TEXT,
+                    nsu TEXT
+                )
+                ''')
+                conn.commit()
+                logger.info("✅ Tabela notas_detalhadas criada/verificada")
+                
+                # 🔒 MIGRAÇÃO CRÍTICA: Garante que as colunas existem (caso o banco seja antigo)
+                columns_to_add = [
+                    ("cnpj_destinatario", "TEXT"),
+                    ("xml_status", "TEXT DEFAULT 'COMPLETO'"),
+                    ("ncm", "TEXT"),
+                    ("base_icms", "TEXT"),
+                    ("valor_icms", "TEXT"),
+                    ("informante", "TEXT"),
+                    ("nsu", "TEXT")  # 🔒 NSU CRÍTICO para rastreamento
+                ]
+                for col_name, col_type in columns_to_add:
+                    try:
+                        conn.execute(f"ALTER TABLE notas_detalhadas ADD COLUMN {col_name} {col_type};")
+                        logger.info(f"✅ Coluna '{col_name}' adicionada à tabela notas_detalhadas")
+                    except sqlite3.OperationalError as e:
+                        # Já existe, ignora o erro
+                        logger.debug(f"Coluna '{col_name}' já existe: {e}")
+                        pass
+                conn.commit()
+                
+                # 🔒 ÍNDICES CRÍTICOS para performance de consultas NSU
+                # Índice composto para buscar último NSU por informante
                 try:
-                    conn.execute(f"ALTER TABLE notas_detalhadas ADD COLUMN {col_name} {col_type};")
-                    logger.info(f"✅ Coluna '{col_name}' adicionada à tabela notas_detalhadas")
-                except sqlite3.OperationalError:
-                    # Já existe, ignora o erro
-                    pass
-            conn.commit()
-            
-            # 🔒 ÍNDICES CRÍTICOS para performance de consultas NSU
-            # Índice composto para buscar último NSU por informante
-            try:
-                conn.execute("CREATE INDEX IF NOT EXISTS idx_nsu_informante ON notas_detalhadas(informante, nsu)")
-                logger.debug("✅ Índice idx_nsu_informante criado")
-            except Exception as e:
-                logger.debug(f"Índice idx_nsu_informante já existe: {e}")
-            
-            # Índice para buscar por NSU específico
-            try:
-                conn.execute("CREATE INDEX IF NOT EXISTS idx_nsu ON notas_detalhadas(nsu)")
-                logger.debug("✅ Índice idx_nsu criado")
-            except Exception as e:
-                logger.debug(f"Índice idx_nsu já existe: {e}")
-            
-            # Índice para buscar por data de emissão (útil para auditoria)
-            try:
-                conn.execute("CREATE INDEX IF NOT EXISTS idx_data_emissao ON notas_detalhadas(data_emissao)")
-                logger.debug("✅ Índice idx_data_emissao criado")
-            except Exception as e:
-                logger.debug(f"Índice idx_data_emissao já existe: {e}")
-            
-            conn.commit()
-            logger.debug("Tabela notas_detalhadas verificada/criada com sucesso")
+                    conn.execute("CREATE INDEX IF NOT EXISTS idx_nsu_informante ON notas_detalhadas(informante, nsu)")
+                    logger.debug("✅ Índice idx_nsu_informante criado")
+                except Exception as e:
+                    logger.debug(f"Índice idx_nsu_informante já existe: {e}")
+                
+                # Índice para buscar por NSU específico
+                try:
+                    conn.execute("CREATE INDEX IF NOT EXISTS idx_nsu ON notas_detalhadas(nsu)")
+                    logger.debug("✅ Índice idx_nsu criado")
+                except Exception as e:
+                    logger.debug(f"Índice idx_nsu já existe: {e}")
+                
+                # Índice para buscar por data de emissão (útil para auditoria)
+                try:
+                    conn.execute("CREATE INDEX IF NOT EXISTS idx_data_emissao ON notas_detalhadas(data_emissao)")
+                    logger.debug("✅ Índice idx_data_emissao criado")
+                except Exception as e:
+                    logger.debug(f"Índice idx_data_emissao já existe: {e}")
+                
+                conn.commit()
+                logger.info("✅ Tabela notas_detalhadas verificada/criada com sucesso")
+        except Exception as e:
+            logger.error(f"❌ ERRO CRÍTICO ao criar tabela notas_detalhadas: {e}")
+            import traceback
+            logger.error(f"Traceback: {traceback.format_exc()}")
+            raise
+    
+    def _verify_nsu_column(self):
+        """Verifica se a coluna NSU existe na tabela notas_detalhadas."""
+        try:
+            with self._connect() as conn:
+                cursor = conn.cursor()
+                cursor.execute("PRAGMA table_info(notas_detalhadas)")
+                columns = [row[1] for row in cursor.fetchall()]
+                logger.info(f"🔍 Colunas encontradas em notas_detalhadas: {columns}")
+                if 'nsu' not in columns:
+                    logger.error("❌ CRÍTICO: Coluna 'nsu' não encontrada! Recriando tabela...")
+                    # Força recriação
+                    self.criar_tabela_detalhada()
+                    # Verifica novamente
+                    cursor.execute("PRAGMA table_info(notas_detalhadas)")
+                    columns_after = [row[1] for row in cursor.fetchall()]
+                    logger.info(f"🔍 Colunas após recriar: {columns_after}")
+                    if 'nsu' not in columns_after:
+                        logger.error("❌ FALHA CRÍTICA: Coluna 'nsu' AINDA não existe após recriar!")
+                    else:
+                        logger.info("✅ Coluna 'nsu' criada com sucesso")
+                else:
+                    logger.info("✅ Coluna 'nsu' verificada com sucesso")
+        except Exception as e:
+            logger.error(f"❌ Erro ao verificar coluna nsu: {e}")
+            import traceback
+            logger.error(f"Traceback: {traceback.format_exc()}")
 
     def salvar_nota_detalhada(self, nota):
         """
@@ -1620,6 +1665,18 @@ class DatabaseManager:
         Returns:
             str: NSU de 15 dígitos (ex: '000000000001234')
         """
+        # 🔒 ÚLTIMA LINHA DE DEFESA: Verifica se coluna nsu existe ANTES de qualquer query
+        try:
+            with self._connect() as check_conn:
+                cursor = check_conn.cursor()
+                cursor.execute("PRAGMA table_info(notas_detalhadas)")
+                columns = [row[1] for row in cursor.fetchall()]
+                if 'nsu' not in columns:
+                    logger.error(f"❌ EMERGÊNCIA: Coluna 'nsu' não existe em get_last_nsu! Forçando criação...")
+                    self.criar_tabela_detalhada()
+        except Exception as e:
+            logger.error(f"❌ Erro na verificação de emergência: {e}")
+        
         with self._connect() as conn:
             # 1️⃣ Busca NSU oficial na tabela de controle
             row = conn.execute(
@@ -1628,14 +1685,36 @@ class DatabaseManager:
             nsu_tabela = row[0] if row else "000000000000000"
             
             # 2️⃣ 🔒 VALIDAÇÃO CRUZADA: Busca maior NSU gravado em notas_detalhadas
-            row_notas = conn.execute("""
-                SELECT MAX(nsu) 
-                FROM notas_detalhadas 
-                WHERE informante=? 
-                AND nsu IS NOT NULL 
-                AND nsu != ''
-            """, (informante,)).fetchone()
-            nsu_notas = row_notas[0] if (row_notas and row_notas[0]) else "000000000000000"
+            try:
+                row_notas = conn.execute("""
+                    SELECT MAX(nsu) 
+                    FROM notas_detalhadas 
+                    WHERE informante=? 
+                    AND nsu IS NOT NULL 
+                    AND nsu != ''
+                """, (informante,)).fetchone()
+                nsu_notas = row_notas[0] if (row_notas and row_notas[0]) else "000000000000000"
+            except sqlite3.OperationalError as e:
+                if "no such column: nsu" in str(e):
+                    logger.error(f"❌ CRÍTICO: Coluna 'nsu' não existe! Erro: {e}")
+                    # Força recriação da tabela
+                    logger.info("🔄 Tentando criar/atualizar tabela notas_detalhadas...")
+                    self.criar_tabela_detalhada()
+                    # Tenta novamente após criar
+                    try:
+                        row_notas = conn.execute("""
+                            SELECT MAX(nsu) 
+                            FROM notas_detalhadas 
+                            WHERE informante=? 
+                            AND nsu IS NOT NULL 
+                            AND nsu != ''
+                        """, (informante,)).fetchone()
+                        nsu_notas = row_notas[0] if (row_notas and row_notas[0]) else "000000000000000"
+                    except:
+                        logger.error("❌ Falha ao acessar notas_detalhadas mesmo após recriar. Usando apenas tabela nsu.")
+                        nsu_notas = "000000000000000"
+                else:
+                    raise
             
             # 3️⃣ 🔒 ESTRATÉGIA CONSERVADORA: Sempre usa tabela 'nsu' como fonte da verdade
             # Isso evita pular documentos não processados
