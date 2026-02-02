@@ -106,7 +106,7 @@ def setup_logger():
     try:
         log_filename.touch(exist_ok=True)
     except Exception as e:
-        print(f"⚠️ Erro ao criar arquivo de log: {e}")
+        print(f"[AVISO] Erro ao criar arquivo de log: {e}")
         print(f"   Caminho tentado: {log_filename}")
     
     logger = logging.getLogger(__name__)
@@ -132,10 +132,10 @@ def setup_logger():
         logger.setLevel(logging.DEBUG)
         
         # Log de confirmação
-        print(f"✅ Logger configurado: {log_filename}")
+        print(f"[OK] Logger configurado: {log_filename}")
         
     except Exception as e:
-        print(f"❌ ERRO ao configurar logger: {e}")
+        print(f"[ERRO] ERRO ao configurar logger: {e}")
         print(f"   LOGS_DIR: {LOGS_DIR}")
         print(f"   log_filename: {log_filename}")
         # Logger básico apenas no console se falhar
@@ -147,7 +147,7 @@ def setup_logger():
     return logger
 
 logger = setup_logger()
-logger.info(f"✅ nfe_search.py iniciado - Logs em: {BASE / 'logs'}")
+logger.info(f"[OK] nfe_search.py iniciado - Logs em: {BASE / 'logs'}")
 # -------------------------------------------------------------------
 # Fluxo NSU
 # -------------------------------------------------------------------
@@ -1442,6 +1442,12 @@ class DatabaseManager:
                 conn.commit()
                 logger.info("✅ Tabela notas_detalhadas criada/verificada")
                 
+                # 🔒 MIGRAÇÃO FORÇADA: Verifica colunas existentes ANTES de tentar adicionar
+                cursor = conn.cursor()
+                cursor.execute("PRAGMA table_info(notas_detalhadas)")
+                existing_columns = {row[1] for row in cursor.fetchall()}
+                logger.info(f"🔍 Colunas existentes em notas_detalhadas: {existing_columns}")
+                
                 # 🔒 MIGRAÇÃO CRÍTICA: Garante que as colunas existem (caso o banco seja antigo)
                 columns_to_add = [
                     ("cnpj_destinatario", "TEXT"),
@@ -1452,15 +1458,31 @@ class DatabaseManager:
                     ("informante", "TEXT"),
                     ("nsu", "TEXT")  # 🔒 NSU CRÍTICO para rastreamento
                 ]
+                
                 for col_name, col_type in columns_to_add:
-                    try:
-                        conn.execute(f"ALTER TABLE notas_detalhadas ADD COLUMN {col_name} {col_type};")
-                        logger.info(f"✅ Coluna '{col_name}' adicionada à tabela notas_detalhadas")
-                    except sqlite3.OperationalError as e:
-                        # Já existe, ignora o erro
-                        logger.debug(f"Coluna '{col_name}' já existe: {e}")
-                        pass
-                conn.commit()
+                    if col_name not in existing_columns:
+                        try:
+                            # Remove DEFAULT da string para ALTER TABLE (SQLite não suporta DEFAULT no ALTER TABLE)
+                            col_type_clean = col_type.replace(" DEFAULT 'COMPLETO'", "")
+                            conn.execute(f"ALTER TABLE notas_detalhadas ADD COLUMN {col_name} {col_type_clean}")
+                            logger.info(f"✅ Coluna '{col_name}' adicionada à tabela notas_detalhadas")
+                            conn.commit()
+                        except sqlite3.OperationalError as e:
+                            logger.error(f"❌ Erro ao adicionar coluna '{col_name}': {e}")
+                    else:
+                        logger.debug(f"✓ Coluna '{col_name}' já existe")
+                
+                # Verifica novamente após adicionar
+                cursor.execute("PRAGMA table_info(notas_detalhadas)")
+                final_columns = {row[1] for row in cursor.fetchall()}
+                logger.info(f"🔍 Colunas finais em notas_detalhadas: {final_columns}")
+                
+                # Valida colunas críticas
+                if 'nsu' not in final_columns:
+                    logger.error("🚨 CRÍTICO: Coluna 'nsu' AINDA NÃO EXISTE após migração!")
+                    raise Exception("FALHA CRÍTICA: Não foi possível adicionar coluna 'nsu'")
+                else:
+                    logger.info("✅ Coluna 'nsu' confirmada!")
                 
                 # 🔒 ÍNDICES CRÍTICOS para performance de consultas NSU
                 # Índice composto para buscar último NSU por informante
@@ -1665,19 +1687,29 @@ class DatabaseManager:
         Returns:
             str: NSU de 15 dígitos (ex: '000000000001234')
         """
-        # 🔒 ÚLTIMA LINHA DE DEFESA: Verifica se coluna nsu existe ANTES de qualquer query
-        try:
-            with self._connect() as check_conn:
-                cursor = check_conn.cursor()
+        with self._connect() as conn:
+            # 🔒 PRIMEIRA COISA: Verifica se coluna nsu existe ANTES de qualquer query
+            try:
+                cursor = conn.cursor()
                 cursor.execute("PRAGMA table_info(notas_detalhadas)")
                 columns = [row[1] for row in cursor.fetchall()]
+                logger.debug(f"🔍 [get_last_nsu] Colunas encontradas: {columns}")
+                
                 if 'nsu' not in columns:
-                    logger.error(f"❌ EMERGÊNCIA: Coluna 'nsu' não existe em get_last_nsu! Forçando criação...")
+                    logger.error(f"❌ CRÍTICO: Coluna 'nsu' NÃO EXISTE em get_last_nsu! Forçando criação imediata...")
+                    # Fecha conexão atual para evitar locks
+                    conn.close()
+                    # Força criação da coluna
                     self.criar_tabela_detalhada()
-        except Exception as e:
-            logger.error(f"❌ Erro na verificação de emergência: {e}")
-        
-        with self._connect() as conn:
+                    logger.info(f"✅ criar_tabela_detalhada() executado de get_last_nsu")
+                    # IMPORTANTE: Retorna valor padrão e deixa próxima chamada usar coluna criada
+                    logger.warning(f"⚠️ Retornando NSU zero devido à recriação de estrutura")
+                    return "000000000000000"
+            except Exception as e:
+                logger.error(f"❌ Erro na verificação de coluna nsu: {e}")
+                logger.warning(f"⚠️ Retornando NSU zero devido a erro de verificação")
+                return "000000000000000"
+            
             # 1️⃣ Busca NSU oficial na tabela de controle
             row = conn.execute(
                 "SELECT ult_nsu FROM nsu WHERE informante=?", (informante,)

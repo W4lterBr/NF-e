@@ -1,8 +1,8 @@
 @echo off
 echo ============================================================
-echo  Busca XML - Compilador de Aplicativo
+echo  Busca XML - Compilador de Aplicativo v1.0.95
 echo  Desenvolvido por: DWM System Developer
-echo  Site: https://dwmsystems.up.railway.app/
+echo  GitHub: https://github.com/W4lterBr/NF-e
 echo ============================================================
 echo.
 
@@ -80,6 +80,7 @@ xcopy /E /I /Y "Icone" "dist\Busca XML\Icone" >nul 2>&1
 xcopy /E /I /Y "Arquivo_xsd" "dist\Busca XML\Arquivo_xsd" >nul 2>&1
 copy /Y "Logo.ico" "dist\Busca XML\Logo.ico" >nul 2>&1
 copy /Y "Logo.png" "dist\Busca XML\Logo.png" >nul 2>&1
+copy /Y "version.txt" "dist\Busca XML\version.txt" >nul 2>&1
 echo   Recursos copiados com sucesso!
 
 echo.

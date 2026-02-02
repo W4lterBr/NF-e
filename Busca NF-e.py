@@ -126,11 +126,64 @@ def ensure_logs_dir():
         pass
 
 
+def ensure_xml_dirs():
+    """Garante que todos os diretórios de XML necessários existam."""
+    try:
+        required_dirs = [
+            DATA_DIR / "xmls",
+            DATA_DIR / "xmls_chave",
+            DATA_DIR / "xmls_nfce",
+            DATA_DIR / "xml_NFs",
+            DATA_DIR / "xml_envio",
+            DATA_DIR / "xml_extraidos",
+            DATA_DIR / "xml_resposta_sefaz",
+        ]
+        for dir_path in required_dirs:
+            dir_path.mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        print(f"[WARNING] Erro ao criar diretórios XML: {e}")
+
+
 def run_search(progress_cb: Optional[Callable[[str], None]] = None) -> Dict[str, Any]:
     """Executa a busca de NFe/CTe na SEFAZ."""
-    # Usa sys.__stdout__ que é garantido ser o stdout original
+    # ✅ FORÇA ENCODING UTF-8 NO STDOUT (Windows usa cp1252 por padrão)
+    import io
+    import sys
+    
+    # Salva stdout/stderr originais ANTES de qualquer modificação
     original_stdout = sys.__stdout__ if hasattr(sys, '__stdout__') else sys.stdout
+    original_stderr = sys.__stderr__ if hasattr(sys, '__stderr__') else sys.stderr
     old_stdout = sys.stdout
+    old_stderr = sys.stderr
+    
+    # Reconfigura stdout para UTF-8 com tratamento de erros
+    # PROTEÇÃO: Verifica se buffer existe, está aberto e não foi fechado
+    try:
+        if hasattr(sys.stdout, 'buffer') and hasattr(sys.stdout.buffer, 'closed'):
+            if not sys.stdout.buffer.closed:
+                sys.stdout = io.TextIOWrapper(
+                    sys.stdout.buffer, 
+                    encoding='utf-8', 
+                    errors='replace', 
+                    line_buffering=True
+                )
+    except (ValueError, AttributeError, OSError) as e:
+        # Se falhar, mantém stdout original
+        print(f"[WARN] Não foi possível reconfigurar stdout: {e}")
+        sys.stdout = original_stdout
+    
+    try:
+        if hasattr(sys.stderr, 'buffer') and hasattr(sys.stderr.buffer, 'closed'):
+            if not sys.stderr.buffer.closed:
+                sys.stderr = io.TextIOWrapper(
+                    sys.stderr.buffer, 
+                    encoding='utf-8', 
+                    errors='replace', 
+                    line_buffering=True
+                )
+    except (ValueError, AttributeError, OSError) as e:
+        # Se falhar, mantém stderr original
+        sys.stderr = original_stderr
     
     try:
         # Adiciona BASE_DIR ao sys.path para importação
@@ -225,24 +278,58 @@ def run_search(progress_cb: Optional[Callable[[str], None]] = None) -> Dict[str,
             sys.stdout = old_stdout if old_stdout else original_stdout
             return {"ok": False, "error": error_msg}
         
-        # Restaura stdout
-        sys.stdout = old_stdout if old_stdout else original_stdout
+        # Restaura stdout/stderr de forma segura
+        try:
+            sys.stdout = old_stdout if old_stdout else original_stdout
+        except:
+            sys.stdout = original_stdout
+        
+        try:
+            sys.stderr = old_stderr if old_stderr else original_stderr
+        except:
+            sys.stderr = original_stderr
         
         return {"ok": True, "message": "Busca concluída"}
         
     except Exception as e:
-        sys.stdout = old_stdout if old_stdout else original_stdout
+        # Restaura stdout/stderr em caso de erro
+        try:
+            sys.stdout = old_stdout if old_stdout else original_stdout
+        except:
+            sys.stdout = original_stdout
+        
+        try:
+            sys.stderr = old_stderr if old_stderr else original_stderr
+        except:
+            sys.stderr = original_stderr
+        
         import traceback
         error_msg = f"Erro na busca: {str(e)}\n{traceback.format_exc()}"
         print(error_msg)  # Log no console
         return {"ok": False, "error": error_msg}
     finally:
-        # Garante que stdout sempre será restaurado
+        # Garante que stdout/stderr sempre serão restaurados
         try:
-            sys.stdout = old_stdout if old_stdout else original_stdout
+            if old_stdout:
+                sys.stdout = old_stdout
+            elif original_stdout:
+                sys.stdout = original_stdout
         except:
-            sys.stdout = original_stdout
-        sys.stdout = old_stdout
+            try:
+                sys.stdout = original_stdout
+            except:
+                pass  # Último recurso: ignora se não conseguir restaurar
+        
+        try:
+            if old_stderr:
+                sys.stderr = old_stderr
+            elif original_stderr:
+                sys.stderr = original_stderr
+        except:
+            try:
+                sys.stderr = original_stderr
+            except:
+                pass
 
 
 def resolve_xml_text(item: Dict[str, Any]) -> Optional[str]:
@@ -287,7 +374,8 @@ def resolve_xml_text(item: Dict[str, Any]) -> Optional[str]:
             numero = item.get('nNF') or item.get('numero')  # Campo pode variar
             if numero:
                 print(f"[DEBUG XML] NFS-e detectada - Buscando por número: {numero}")
-                search_pattern = f"NFSe_{numero}.xml"
+                # ⚠️ CORREÇÃO v1.0.96: Padrão real é {NUMERO}-{NOME}.xml (não NFSe_{numero}.xml)
+                search_pattern = f"{numero}-*.xml"
             else:
                 print(f"[DEBUG XML] ⚠️ NFS-e sem número definido, tentando busca por chave")
                 search_pattern = f"*{chave}*.xml"
@@ -552,6 +640,7 @@ class MainWindow(QMainWindow):
             self.setWindowIcon(QIcon(str(icon_path)))
         
         ensure_logs_dir()
+        ensure_xml_dirs()  # Garante que todas as pastas de XML existam
 
         self.db = UIDB(DB_PATH)
         
@@ -4142,12 +4231,103 @@ class MainWindow(QMainWindow):
         # Cria menu
         menu = QMenu(self)
         
+        # ⭐ VERIFICA SELEÇÕES MÚLTIPLAS
+        selected_rows = set()
+        for item_sel in self.table.selectedItems():
+            selected_rows.add(item_sel.row())
+        
+        print(f"[DEBUG LOTE] Total de linhas selecionadas: {len(selected_rows)}")
+        
+        # Conta quantas notas RESUMO estão selecionadas
+        resumo_count = 0
+        if len(selected_rows) > 1:
+            # Encontra índice da coluna Status (0) e Chave
+            chave_col = None
+            status_col = 0  # Status sempre na coluna 0
+            
+            for col in range(self.table.columnCount()):
+                header = self.table.horizontalHeaderItem(col)
+                if header and header.text() == "Chave":
+                    chave_col = col
+                    print(f"[DEBUG LOTE] Coluna 'Chave' encontrada na posição: {chave_col}")
+                    break
+            
+            if not chave_col:
+                print(f"[DEBUG LOTE] ❌ ERRO: Coluna 'Chave' não encontrada!")
+                print(f"[DEBUG LOTE] Colunas disponíveis: {[self.table.horizontalHeaderItem(i).text() for i in range(self.table.columnCount())]}")
+            
+            if chave_col:
+                import sqlite3
+                conn = sqlite3.connect(str(DATA_DIR / 'notas.db'))
+                conn.row_factory = sqlite3.Row
+                
+                for row in selected_rows:
+                    try:
+                        # Pega o status visual da célula
+                        status_item = self.table.item(row, status_col)
+                        status_text = status_item.text() if status_item else "?"
+                        
+                        # Pega a chave da linha
+                        chave_item = self.table.item(row, chave_col)
+                        if chave_item:
+                            chave = chave_item.text()
+                            print(f"[DEBUG LOTE] Linha {row}: status_visual='{status_text}' chave={chave[:10]}...")
+                            
+                            # Busca no banco para verificar TODOS os campos importantes
+                            nota = conn.execute(
+                                'SELECT xml_status, numero, data_emissao, nome_emitente FROM notas_detalhadas WHERE chave = ?',
+                                (chave,)
+                            ).fetchone()
+                            
+                            if nota:
+                                xml_status_db = (nota['xml_status'] or '').upper()
+                                numero_db = nota['numero'] or ''
+                                data_db = nota['data_emissao'] or ''
+                                emitente_db = nota['nome_emitente'] or ''
+                                
+                                print(f"[DEBUG LOTE]   -> DB: xml_status='{xml_status_db}' numero='{numero_db}' data={bool(data_db)} emitente={bool(emitente_db)}")
+                                
+                                # ⭐ Considera RESUMO se:
+                                # 1. xml_status == 'RESUMO' OU
+                                # 2. Faltam dados essenciais (número, data ou emitente vazios)
+                                is_resumo_real = (
+                                    xml_status_db == 'RESUMO' or 
+                                    not numero_db or 
+                                    not data_db or 
+                                    not emitente_db
+                                )
+                                
+                                if is_resumo_real:
+                                    resumo_count += 1
+                                    print(f"[DEBUG LOTE]   -> ✅ É RESUMO (faltam dados), adicionado ao lote")
+                                else:
+                                    print(f"[DEBUG LOTE]   -> ❌ NÃO é RESUMO (nota completa com dados)")
+                            else:
+                                print(f"[DEBUG LOTE]   -> ⚠️ Nota não encontrada no banco!")
+                        else:
+                            print(f"[DEBUG LOTE] Linha {row}: ⚠️ Sem item de chave")
+                    except Exception as e:
+                        print(f"[DEBUG LOTE] Erro ao verificar linha {row}: {e}")
+                        import traceback
+                        traceback.print_exc()
+                
+                conn.close()
+        
+        print(f"[DEBUG LOTE] ========================================")
+        print(f"[DEBUG LOTE] Total RESUMO encontradas: {resumo_count}")
+        print(f"[DEBUG LOTE] ========================================")
+        
         # ⭐ OPÇÃO NO TOPO: XML Completo (só para RESUMO ou dados incompletos)
         if is_resumo:
-            action_xml_completo = menu.addAction("✅ Baixar XML Completo")
-            action_xml_completo.setToolTip("Manifestar, baixar XML completo da SEFAZ e gerar PDF")
+            if resumo_count > 1:
+                action_xml_completo = menu.addAction(f"✅ Baixar XML Completo ({resumo_count} notas)")
+                action_xml_completo.setToolTip(f"Manifestar e baixar XML completo de {resumo_count} notas selecionadas em lote")
+                print(f"[DEBUG MENU] ✅ Botão 'Baixar XML Completo' em LOTE: {resumo_count} notas")
+            else:
+                action_xml_completo = menu.addAction("✅ Baixar XML Completo")
+                action_xml_completo.setToolTip("Manifestar, baixar XML completo da SEFAZ e gerar PDF")
+                print(f"[DEBUG MENU] ✅ Botão 'Baixar XML Completo' adicionado ao menu")
             menu.addSeparator()
-            print(f"[DEBUG MENU] ✅ Botão 'Baixar XML Completo' adicionado ao menu")
         else:
             action_xml_completo = None
             print(f"[DEBUG MENU] ⚠️ Botão 'Baixar XML Completo' NÃO adicionado (nota completa)")
@@ -4175,7 +4355,11 @@ class MainWindow(QMainWindow):
         action = menu.exec_(self.table.viewport().mapToGlobal(pos))
         
         if action == action_xml_completo:
-            self._baixar_xml_e_pdf(item)  # Novo método direto
+            # Se múltiplas notas RESUMO selecionadas, processa em lote
+            if resumo_count > 1:
+                self._baixar_xml_e_pdf_lote(selected_rows)
+            else:
+                self._baixar_xml_e_pdf(item)  # Novo método direto
         elif action == action_detalhes:
             self._mostrar_detalhes_nota(item)
         elif action == action_eventos:
@@ -4523,16 +4707,216 @@ class MainWindow(QMainWindow):
             self.set_status(f"Erro: {str(e)}", 5000)
             QMessageBox.critical(self, "Erro", f"Erro ao buscar XML completo:\n\n{str(e)}")
     
-    def _baixar_xml_e_pdf(self, item: Dict[str, Any]):
+    def _baixar_xml_e_pdf_lote(self, selected_rows: set):
         """
-        Manifesta Ciência da Operação, baixa XML completo da SEFAZ, 
-        atualiza interface para verde e gera PDF automaticamente.
-        Método otimizado para ação direta sem diálogos intermediários.
+        Baixa XML completo e gera PDF para múltiplas notas selecionadas em lote.
+        Processa apenas notas com xml_status = RESUMO ou dados incompletos.
+        
+        Args:
+            selected_rows: Set de números de linhas selecionadas na tabela
+        """
+        from PyQt5.QtCore import QTimer
+        import sqlite3
+        
+        print(f"[LOTE PROCESSA] Iniciando com {len(selected_rows)} linhas selecionadas")
+        
+        # Encontra coluna da Chave
+        chave_col = None
+        for col in range(self.table.columnCount()):
+            header = self.table.horizontalHeaderItem(col)
+            if header and header.text() == "Chave":
+                chave_col = col
+                break
+        
+        if not chave_col:
+            QMessageBox.warning(self, "Erro", "Coluna 'Chave' não encontrada na tabela!")
+            return
+        
+        # Coleta todas as notas RESUMO/incompletas selecionadas
+        notas_para_processar = []
+        
+        conn = sqlite3.connect(str(DATA_DIR / 'notas.db'))
+        conn.row_factory = sqlite3.Row
+        
+        for row in sorted(selected_rows):
+            try:
+                # Pega a chave da linha
+                chave_item = self.table.item(row, chave_col)
+                if chave_item:
+                    chave = chave_item.text()
+                    
+                    # Busca no banco
+                    nota = conn.execute(
+                        'SELECT * FROM notas_detalhadas WHERE chave = ?',
+                        (chave,)
+                    ).fetchone()
+                    
+                    if nota:
+                        # Converte para dict
+                        item_data = dict(nota)
+                        
+                        # Verifica se é RESUMO ou dados incompletos
+                        xml_status = (item_data.get('xml_status') or '').upper()
+                        numero = item_data.get('numero') or ''
+                        data = item_data.get('data_emissao') or ''
+                        emitente = item_data.get('nome_emitente') or ''
+                        
+                        is_resumo = (
+                            xml_status == 'RESUMO' or 
+                            not numero or 
+                            not data or 
+                            not emitente
+                        )
+                        
+                        if is_resumo and len(chave) == 44:
+                            notas_para_processar.append({
+                                'item': item_data,
+                                'chave': chave,
+                                'numero': numero if numero else 'S/N'
+                            })
+                            print(f"[LOTE PROCESSA] Adicionada: chave={chave[:10]}... numero={numero}")
+            except Exception as e:
+                print(f"[LOTE PROCESSA] Erro ao coletar linha {row}: {e}")
+                import traceback
+                traceback.print_exc()
+                continue
+        
+        conn.close()
+        
+        print(f"[LOTE PROCESSA] Total de notas coletadas: {len(notas_para_processar)}")
+        
+        if not notas_para_processar:
+            QMessageBox.warning(
+                self,
+                "Nenhuma Nota RESUMO",
+                "Nenhuma nota com status RESUMO encontrada nas seleções."
+            )
+            return
+        
+        total = len(notas_para_processar)
+        
+        # Confirma operação
+        reply = QMessageBox.question(
+            self,
+            "Baixar XMLs em Lote",
+            f"Deseja baixar XML completo de {total} nota(s) selecionada(s)?\n\n"
+            f"• Manifestação automática (se NF-e)\n"
+            f"• Download do XML da SEFAZ\n"
+            f"• Geração de PDF\n"
+            f"• Atualização da interface\n\n"
+            f"⏱️ Isso pode levar alguns minutos.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No
+        )
+        
+        if reply != QMessageBox.Yes:
+            print(f"[LOTE PROCESSA] Usuário cancelou a operação")
+            return
+        
+        print(f"[LOTE PROCESSA] Usuário confirmou! Iniciando processamento...")
+        
+        # Cria diálogo de progresso
+        progress = QProgressDialog(
+            f"Processando XMLs em lote...",
+            "Cancelar",
+            0,
+            total,
+            self
+        )
+        progress.setWindowTitle("Download em Lote")
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setValue(0)
+        
+        # Contadores
+        sucesso_count = 0
+        erro_count = 0
+        erros_detalhes = []
+        
+        # Processa cada nota
+        for idx, nota_info in enumerate(notas_para_processar):
+            if progress.wasCanceled():
+                print(f"[LOTE PROCESSA] Cancelado pelo usuário após {idx} notas")
+                break
+            
+            item = nota_info['item']
+            chave = nota_info['chave']
+            numero = nota_info['numero']
+            
+            print(f"[LOTE PROCESSA] === Processando {idx+1}/{total}: chave={chave[:10]}... ===")
+            
+            progress.setLabelText(
+                f"Processando nota {idx + 1}/{total}\n"
+                f"Número: {numero}\n"
+                f"Chave: {chave[:10]}...\n"
+                f"✅ Sucesso: {sucesso_count} | ❌ Erros: {erro_count}"
+            )
+            progress.setValue(idx)
+            QApplication.processEvents()
+            
+            try:
+                # Chama o método individual de download SEM mostrar mensagem
+                self._baixar_xml_e_pdf(item, show_message=False)
+                sucesso_count += 1
+                print(f"[LOTE PROCESSA] ✅ Sucesso {idx+1}/{total}")
+                
+                # Pequeno delay entre requisições (evita sobrecarga SEFAZ)
+                import time
+                time.sleep(1)
+                
+            except Exception as e:
+                erro_count += 1
+                erro_msg = str(e)[:100]  # Limita tamanho
+                # Determina tipo de documento para erro
+                tipo_doc = item.get('tipo', 'Doc').upper().replace('-', '')
+                if tipo_doc in ['CTE', 'CT-E']:
+                    doc_label = f"CT-e {numero}"
+                elif tipo_doc in ['NFCE', 'NFC-E']:
+                    doc_label = f"NFC-e {numero}"
+                elif tipo_doc in ['NFSE', 'NFS-E']:
+                    doc_label = f"NFS-e {numero}"
+                else:
+                    doc_label = f"NF-e {numero}"
+                erros_detalhes.append(f"{doc_label}: {erro_msg}")
+                print(f"[LOTE] ❌ Erro ao processar {doc_label} ({chave[:10]}): {e}")
+                import traceback
+                traceback.print_exc()
+        
+        progress.setValue(total)
+        progress.close()
+        
+        # Atualiza interface
+        self.refresh_table()
+        self.refresh_emitidos_table()
+        
+        # Mostra resultado final
+        resultado_msg = f"✅ Download em lote concluído!\n\n"
+        resultado_msg += f"📊 Resumo:\n"
+        resultado_msg += f"   • Total processado: {total}\n"
+        resultado_msg += f"   • Sucesso: {sucesso_count}\n"
+        resultado_msg += f"   • Erros: {erro_count}\n"
+        
+        if erros_detalhes:
+            resultado_msg += f"\n❌ Detalhes dos erros:\n"
+            # Mostra apenas os primeiros 5 erros para não sobrecarregar
+            for erro in erros_detalhes[:5]:
+                resultado_msg += f"   • {erro}\n"
+            if len(erros_detalhes) > 5:
+                resultado_msg += f"   ... e mais {len(erros_detalhes) - 5} erro(s)\n"
+        
+        if erro_count == 0:
+            QMessageBox.information(self, "Sucesso!", resultado_msg)
+        else:
+            QMessageBox.warning(self, "Concluído com Erros", resultado_msg)
+    
+    def _baixar_xml_e_pdf_silencioso(self, item: Dict[str, Any]):
+        """
+        Versão silenciosa de _baixar_xml_e_pdf (sem mensagens de sucesso).
+        Usada para processamento em lote.
         """
         chave = item.get('chave')
         if not chave or len(chave) != 44:
-            QMessageBox.warning(self, "Erro", "Chave de acesso inválida!")
-            return
+            raise ValueError("Chave de acesso inválida!")
         
         # Determina certificado
         informante = item.get('informante')
@@ -4549,8 +4933,175 @@ class MainWindow(QMainWindow):
             cert_to_use = certs[0]
         
         if not cert_to_use:
-            QMessageBox.warning(self, "Erro", "Nenhum certificado disponível!")
-            return
+            raise ValueError("Nenhum certificado disponível!")
+        
+        cert_path = cert_to_use.get('caminho')
+        cert_senha = cert_to_use.get('senha')
+        cert_cnpj = cert_to_use.get('cnpj_cpf')
+        
+        # Detecta tipo de documento (modelo)
+        modelo = chave[20:22]
+        is_nfe = modelo == '55'
+        is_cte = modelo == '57'
+        
+        from nfe_search import NFeService, salvar_xml_por_certificado, extrair_nota_detalhada
+        from modules.manifestacao_service import ManifestacaoService
+        import time
+        
+        # 0️⃣ MANIFESTAR CIÊNCIA (SOMENTE PARA NF-e)
+        if is_nfe:
+            # Verifica se já foi manifestado
+            eventos_existentes = self.db.get_manifestacoes_by_chave(chave)
+            ja_manifestado = any(e.get('tipo_evento') == '210200' for e in eventos_existentes)
+            
+            if not ja_manifestado:
+                try:
+                    manifesta_service = ManifestacaoService(cert_path, cert_senha)
+                    sucesso, protocolo, mensagem, xml_resposta = manifesta_service.enviar_manifestacao(
+                        chave=chave,
+                        tipo_evento='210200',
+                        cnpj_destinatario=cert_cnpj,
+                        justificativa=None
+                    )
+                    
+                    if sucesso:
+                        self.db.register_manifestacao(
+                            chave=chave,
+                            tipo_evento='210200',
+                            informante=informante or cert_cnpj,
+                            status="REGISTRADA",
+                            protocolo=protocolo
+                        )
+                        time.sleep(3)  # Aguarda SEFAZ processar
+                except Exception as e:
+                    print(f"[LOTE] Erro ao manifestar {chave[:10]}: {e}")
+        
+        # 1️⃣ BUSCAR XML NO SEFAZ
+        svc = NFeService(cert_path, cert_senha, cert_cnpj, cert_to_use.get('cUF_autor'))
+        
+        xml_completo = None
+        try:
+            resposta_sefaz = svc.fetch_by_chave_dist(chave)
+            if resposta_sefaz:
+                if '<nfeProc' in resposta_sefaz or '<procNFe' in resposta_sefaz:
+                    xml_completo = resposta_sefaz
+                else:
+                    # Tenta descompactar documentos zipados
+                    from lxml import etree
+                    import base64
+                    import gzip
+                    
+                    try:
+                        root = etree.fromstring(resposta_sefaz.encode('utf-8'))
+                        ns = {'nfe': 'http://www.portalfiscal.inf.br/nfe'}
+                        docZips = root.findall('.//nfe:docZip', namespaces=ns) or root.findall('.//docZip')
+                        
+                        for docZip in docZips:
+                            try:
+                                zip_b64 = docZip.text
+                                if zip_b64:
+                                    zip_bytes = base64.b64decode(zip_b64)
+                                    xml_bytes = gzip.decompress(zip_bytes)
+                                    xml_descompactado = xml_bytes.decode('utf-8')
+                                    
+                                    if '<procNFe' in xml_descompactado or '<nfeProc' in xml_descompactado:
+                                        xml_completo = xml_descompactado
+                                        break
+                            except:
+                                continue
+                    except:
+                        pass
+        except Exception as e:
+            print(f"[LOTE] Erro ao buscar XML {chave[:10]}: {e}")
+        
+        if not xml_completo:
+            raise ValueError("XML não disponível no SEFAZ")
+        
+        # 2️⃣ SALVAR XML
+        salvar_xml_por_certificado(xml_completo, informante or cert_to_use.get('cnpj_cpf'))
+        
+        # 3️⃣ ATUALIZAR BANCO
+        with self.db._connect() as conn:
+            existing = conn.execute("SELECT * FROM notas_detalhadas WHERE chave = ?", (chave,)).fetchone()
+            
+            if existing:
+                columns = [desc[0] for desc in conn.execute("SELECT * FROM notas_detalhadas LIMIT 0").description]
+                nota_update = dict(zip(columns, existing))
+                
+                old_xml_status = nota_update.get('xml_status', 'RESUMO').upper()
+                if old_xml_status == 'EVENTO':
+                    return  # Não atualiza eventos
+                
+                nota_update['xml_status'] = 'COMPLETO'
+                
+                from nfe_search import XMLProcessor
+                parser = XMLProcessor()
+                nota_detalhada = extrair_nota_detalhada(
+                    xml_txt=xml_completo,
+                    parser=parser,
+                    db=self.db,
+                    chave=chave,
+                    informante=informante or cert_cnpj,
+                    nsu_documento=None
+                )
+                if nota_detalhada:
+                    for key, value in nota_detalhada.items():
+                        if value and value != '':
+                            nota_update[key] = value
+                
+                self.db.save_note(nota_update)
+            else:
+                from nfe_search import XMLProcessor
+                parser = XMLProcessor()
+                nota_detalhada = extrair_nota_detalhada(
+                    xml_txt=xml_completo,
+                    parser=parser,
+                    db=self.db,
+                    chave=chave,
+                    informante=informante or cert_cnpj,
+                    nsu_documento=None
+                )
+                if nota_detalhada:
+                    self.db.save_note(nota_detalhada)
+    
+    def _baixar_xml_e_pdf(self, item: Dict[str, Any], show_message: bool = True):
+        """
+        Manifesta Ciência da Operação, baixa XML completo da SEFAZ, 
+        atualiza interface para verde e gera PDF automaticamente.
+        Método otimizado para ação direta sem diálogos intermediários.
+        
+        Args:
+            item: Dicionário com dados da nota
+            show_message: Se True, mostra mensagem de sucesso ao final
+        """
+        chave = item.get('chave')
+        if not chave or len(chave) != 44:
+            if show_message:
+                QMessageBox.warning(self, "Erro", "Chave de acesso inválida!")
+                return
+            else:
+                raise ValueError("Chave de acesso inválida!")
+        
+        # Determina certificado
+        informante = item.get('informante')
+        certs = self.db.load_certificates()
+        
+        cert_to_use = None
+        if informante:
+            for c in certs:
+                if c.get('informante') == informante:
+                    cert_to_use = c
+                    break
+        
+        if not cert_to_use and certs:
+            cert_to_use = certs[0]
+        
+        if not cert_to_use:
+            if show_message:
+                QMessageBox.warning(self, "Erro", "Nenhum certificado disponível!")
+                return
+            else:
+                raise ValueError("Nenhum certificado disponível!")
         
         cert_path = cert_to_use.get('caminho')
         cert_senha = cert_to_use.get('senha')
@@ -4589,12 +5140,15 @@ class MainWindow(QMainWindow):
                         
                         if not sucesso:
                             self.set_status("❌ Falha na manifestação", 3000)
-                            QMessageBox.warning(
-                                self,
-                                "Erro de Manifestação",
-                                f"A SEFAZ rejeitou a manifestação:\n\n{mensagem}\n\n"
-                                f"Tentando baixar XML mesmo assim..."
-                            )
+                            if show_message:
+                                QMessageBox.warning(
+                                    self,
+                                    "Erro de Manifestação",
+                                    f"A SEFAZ rejeitou a manifestação:\n\n{mensagem}\n\n"
+                                    f"Tentando baixar XML mesmo assim..."
+                                )
+                            else:
+                                print(f"[AVISO] Manifestação falhou: {mensagem}")
                             # Continua tentando baixar mesmo com erro
                         else:
                             # ✅ NÃO salva retEnvEvento (apenas confirmação, não contém nota)
@@ -4717,12 +5271,15 @@ class MainWindow(QMainWindow):
                 msg_detalhes += "   • Acesso negado pelo certificado\n"
                 msg_detalhes += "   • Problema de conexão"
                 
-                QMessageBox.warning(
-                    self,
-                    "XML Não Disponível",
-                    msg_detalhes
-                )
-                return
+                if show_message:
+                    QMessageBox.warning(
+                        self,
+                        "XML Não Disponível",
+                        msg_detalhes
+                    )
+                    return
+                else:
+                    raise ValueError(f"XML não disponível: {cstat_sefaz} - {motivo_sefaz}")
             
             self.set_status("💾 Salvando XML...", 0)
             QApplication.processEvents()
@@ -4816,27 +5373,48 @@ class MainWindow(QMainWindow):
                     logger.warning(f"[XML COMPLETO] ⚠️ Erro ao verificar PDF: {e}")
             
             # 5️⃣ ATUALIZAR INTERFACE (CINZA → VERDE)
-            self.set_status("✅ XML completo baixado e PDF gerado!", 3000)
+            # Determina tipo do documento
+            tipo_doc = item.get('tipo', 'NFe').upper().replace('-', '')
+            numero_doc = item.get('numero', 'S/N')
+            
+            # Mostra status apropriado
+            if tipo_doc in ['CTE', 'CT-E']:
+                doc_label = f"CT-e {numero_doc}"
+            elif tipo_doc in ['NFCE', 'NFC-E']:
+                doc_label = f"NFC-e {numero_doc}"
+            elif tipo_doc in ['NFSE', 'NFS-E']:
+                doc_label = f"NFS-e {numero_doc}"
+            else:
+                doc_label = f"NF-e {numero_doc}"
+            
+            self.set_status(f"✅ {doc_label} - XML completo baixado e PDF gerado!", 3000)
             self.refresh_table()
             self.refresh_emitidos_table()
             
-            QMessageBox.information(
-                self,
-                "Sucesso!",
-                f"✅ XML completo baixado com sucesso!\n"
-                f"📄 PDF gerado automaticamente\n"
-                f"🟢 Interface atualizada\n\n"
-                f"Nota: {item.get('numero')}\n"
-                f"Pasta: {xmls_root.name if xmls_root.exists() else 'xmls'}"
-            )
+            # Mostra mensagem de sucesso apenas se show_message=True (download individual)
+            if show_message:
+                QMessageBox.information(
+                    self,
+                    "Sucesso!",
+                    f"✅ XML completo baixado com sucesso!\n"
+                    f"📄 PDF gerado automaticamente\n"
+                    f"🟢 Interface atualizada\n\n"
+                    f"Documento: {doc_label}\n"
+                    f"Chave: {chave[:10]}...\n"
+                    f"Pasta: {xmls_root.name if xmls_root.exists() else 'xmls'}"
+                )
             
         except Exception as e:
             self.set_status(f"❌ Erro: {str(e)}", 5000)
-            QMessageBox.critical(
-                self,
-                "Erro",
-                f"Erro ao baixar XML completo:\n\n{str(e)}"
-            )
+            if show_message:
+                QMessageBox.critical(
+                    self,
+                    "Erro",
+                    f"Erro ao baixar XML completo:\n\n{str(e)}"
+                )
+            else:
+                # Re-lança exceção para o lote capturar
+                raise
             import traceback
             traceback.print_exc()
     
@@ -6753,11 +7331,15 @@ class MainWindow(QMainWindow):
         # Extrai informante do item
         informante = item.get('informante', '')
         
-        # Para NFS-e, busca pelo padrão NFSe_{numero}.pdf
+        # Para NFS-e, busca pelo padrão {NUMERO}-{NOME}.pdf
         if is_nfse:
             numero = item.get('nNF') or item.get('numero')
+            emitente = item.get('emit_nome') or item.get('nome_emitente') or ''
             if numero:
-                print(f"[DEBUG PDF] NFS-e detectada - Buscando NFSe_{numero}.pdf")
+                print(f"[DEBUG PDF] NFS-e detectada - Buscando {numero}-*.pdf")
+                # ⚠️ CORREÇÃO v1.0.96: Padrão real é {NUMERO}-{NOME}.pdf (não NFSe_{numero}.pdf)
+                search_patterns.append(f"{numero}-*.pdf")
+                # Fallback: também tenta NFSe_{numero}.pdf (padrão antigo)
                 search_patterns.append(f"NFSe_{numero}.pdf")
         else:
             # Para NF-e e CT-e, busca por VÁRIOS padrões possíveis

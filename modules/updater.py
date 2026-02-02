@@ -331,9 +331,9 @@ class GitHubUpdater:
                     if Path(pythonw).exists():
                         python_exe = pythonw
                 
-                # Inicia o launcher em background
+                # Inicia o launcher em background com a nova versão
                 subprocess.Popen(
-                    [python_exe, str(launcher_script), str(novo_exe), str(exe_atual)],
+                    [python_exe, str(launcher_script), str(novo_exe), str(exe_atual), remote],
                     cwd=str(launcher_script.parent),
                     creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0,
                     close_fds=True

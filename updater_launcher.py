@@ -39,11 +39,12 @@ def wait_for_process_to_close(process_name: str, timeout: int = 30):
 
 def main():
     if len(sys.argv) < 3:
-        print("❌ Uso: updater_launcher.py <novo_exe> <exe_destino>")
+        print("❌ Uso: updater_launcher.py <novo_exe> <exe_destino> [nova_versao]")
         sys.exit(1)
     
     novo_exe = Path(sys.argv[1])
     exe_destino = Path(sys.argv[2])
+    nova_versao = sys.argv[3] if len(sys.argv) > 3 else None
     
     print("=" * 60)
     print("🚀 UPDATER LAUNCHER - Atualização Automática")
@@ -72,6 +73,16 @@ def main():
         if novo_exe.exists():
             shutil.move(str(novo_exe), str(exe_destino))
             print("✅ Executável atualizado com sucesso!")
+            
+            # Atualiza version.txt se nova versão foi fornecida
+            if nova_versao:
+                version_file = exe_destino.parent / 'version.txt'
+                print(f"📝 Atualizando version.txt para {nova_versao}...")
+                try:
+                    version_file.write_text(nova_versao, encoding='utf-8')
+                    print("✅ version.txt atualizado!")
+                except Exception as e:
+                    print(f"⚠️ Erro ao atualizar version.txt: {e}")
         else:
             print(f"❌ Erro: Arquivo {novo_exe} não encontrado!")
             sys.exit(1)

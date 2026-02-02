@@ -2,9 +2,9 @@
 ; Gera instalador profissional para Windows
 
 #define MyAppName "Busca XML"
-#define MyAppVersion "1.0.91"
+#define MyAppVersion "1.0.95"
 #define MyAppPublisher "DWM System Developer"
-#define MyAppURL "https://dwmsystems.up.railway.app/"
+#define MyAppURL "https://github.com/W4lterBr/NF-e"
 #define MyAppExeName "Busca XML.exe"
 
 [Setup]
@@ -58,6 +58,16 @@ Name: "{group}\{cm:UninstallProgram,{#MyAppName}}"; Filename: "{uninstallexe}"
 Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
 Name: "{userappdata}\Microsoft\Internet Explorer\Quick Launch\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: quicklaunchicon
 
+[UninstallDelete]
+; Remove TODOS os dados do usuário durante a desinstalação
+Type: filesandordirs; Name: "{userappdata}\Busca XML"
+Type: filesandordirs; Name: "{userappdata}\BOT Busca NFE"
+Type: filesandordirs; Name: "{localappdata}\Busca XML"
+Type: dirifempty; Name: "{userappdata}\Busca XML"
+Type: dirifempty; Name: "{userappdata}\BOT Busca NFE"
+; Remove pasta de instalação (Program Files)
+Type: filesandordirs; Name: "{app}"
+
 [Run]
 Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Flags: nowait postinstall skipifsilent shellexec
 
@@ -93,10 +103,11 @@ var
 begin
     if CurStep = ssPostInstall then
     begin
-        // Cria diretórios de dados se necessário
-        CreateDir(ExpandConstant('{userappdata}\BOT Busca NFE'));
-        CreateDir(ExpandConstant('{userappdata}\BOT Busca NFE\xmls'));
-        CreateDir(ExpandConstant('{userappdata}\BOT Busca NFE\logs'));
+        // Cria diretórios de dados se necessário (novo padrão: Busca XML)
+        CreateDir(ExpandConstant('{userappdata}\Busca XML'));
+        CreateDir(ExpandConstant('{userappdata}\Busca XML\xmls'));
+        CreateDir(ExpandConstant('{userappdata}\Busca XML\logs'));
+        CreateDir(ExpandConstant('{userappdata}\Busca XML\backups'));
         
         // Adiciona ao registro de inicialização se selecionado
         if IsTaskSelected('startup') then
@@ -108,11 +119,11 @@ begin
     end;
 end;
 
-// Antes de desinstalar
+// Antes de desinstalar - REMOÇÃO AUTOMÁTICA SILENCIOSA
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 var
-    Response: Integer;
     StartupRegKey: string;
+    DataDir1, DataDir2, AppDir: string;
 begin
     if CurUninstallStep = usUninstall then
     begin
@@ -120,16 +131,20 @@ begin
         StartupRegKey := 'Software\Microsoft\Windows\CurrentVersion\Run';
         RegDeleteValue(HKEY_CURRENT_USER, StartupRegKey, '{#MyAppName}');
         
-        Response := MsgBox('Deseja manter os dados e configurações do aplicativo?' + #13#10 + 
-                          '(XMLs, certificados e banco de dados)' + #13#10#13#10 + 
-                          'Clique Sim para MANTER os dados' + #13#10 + 
-                          'Clique Não para REMOVER TUDO', 
-                          mbConfirmation, MB_YESNO);
+        // Define caminhos das pastas
+        DataDir1 := ExpandConstant('{userappdata}\Busca XML');
+        DataDir2 := ExpandConstant('{userappdata}\BOT Busca NFE');
+        AppDir := ExpandConstant('{app}');
         
-        if Response = IDNO then
-        begin
-            // Remove dados do usuário
-            DelTree(ExpandConstant('{userappdata}\BOT Busca NFE'), True, True, True);
-        end;
+        // Remove TODOS os dados SILENCIOSAMENTE (sem mensagens)
+        // Força remoção com parâmetros: (Path, DeleteSubdirs, DeleteReadOnly, DeleteSelf)
+        if DirExists(DataDir1) then
+            DelTree(DataDir1, True, True, True);
+        if DirExists(DataDir2) then
+            DelTree(DataDir2, True, True, True);
+        
+        // FORÇA remoção completa da pasta Program Files
+        if DirExists(AppDir) then
+            DelTree(AppDir, True, True, True);
     end;
 end;

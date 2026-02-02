@@ -1,7 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
-# Busca XML - PyInstaller Spec File
+# Busca XML - PyInstaller Spec File v1.0.95
 # Desenvolvido por: DWM System Developer
-# Site: https://dwmsystems.up.railway.app/
+# GitHub: https://github.com/W4lterBr/NF-e
 
 import os
 
@@ -11,10 +11,10 @@ block_cipher = None
 added_files = [
     ('Icone', 'Icone'),           # Ícones da interface
     ('Arquivo_xsd', 'Arquivo_xsd'), # Schemas XML para validação
-    ('version.txt', '.'),         # Arquivo de versão
+    ('version.txt', '.'),         # Arquivo de versão (1.0.95)
     ('updater_launcher.py', '.'), # Script de atualização automática
     # CÓDIGO-FONTE (.py) NÃO É INCLUÍDO - apenas executável compilado
-    # Dados do usuário (xmls/, notas.db) são criados em runtime no AppData
+    # Dados do usuário (xmls/, notas.db, backups/) são criados em runtime no AppData
 ]
 
 # Imports ocultos necessários
