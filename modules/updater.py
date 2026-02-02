@@ -12,6 +12,7 @@ import logging
 import sys
 import subprocess
 import tempfile
+import os
 
 logger = logging.getLogger(__name__)
 
@@ -152,6 +153,215 @@ class GitHubUpdater:
             logger.error(f"Erro ao baixar instalador: {e}")
             log_progress(f"❌ Erro: {str(e)}")
             return None
+    
+    def download_executable_from_release(self, progress_callback=None) -> Optional[Path]:
+        """
+        Baixa o executável principal (.exe) da última release do GitHub.
+        Busca por "Busca XML.exe" nos assets da release.
+        
+        Args:
+            progress_callback: Função callback(message: str) para reportar progresso
+            
+        Returns:
+            Path do executável baixado ou None se falhar
+        """
+        def log_progress(msg):
+            if progress_callback:
+                progress_callback(msg)
+            logger.info(msg)
+        
+        try:
+            log_progress("🔍 Buscando última release...")
+            release = self.get_latest_release()
+            
+            if not release:
+                log_progress("❌ Não foi possível buscar informações da release")
+                return None
+            
+            # Procura asset do executável principal
+            assets = release.get('assets', [])
+            exe_asset = None
+            
+            for asset in assets:
+                name = asset.get('name', '')
+                # Busca exatamente "Busca XML.exe" (o executável principal, não o instalador)
+                if name == 'Busca XML.exe' or (name.endswith('.exe') and 'busca' in name.lower() and 'xml' in name.lower() and 'setup' not in name.lower() and 'install' not in name.lower()):
+                    exe_asset = asset
+                    break
+            
+            if not exe_asset:
+                log_progress("❌ Executável não encontrado na release")
+                log_progress("💡 Certifique-se de que a release contém 'Busca XML.exe'")
+                return None
+            
+            download_url = exe_asset.get('browser_download_url')
+            file_size = exe_asset.get('size', 0)
+            file_name = exe_asset.get('name', 'Busca XML.exe')
+            
+            log_progress(f"📥 Baixando executável: {file_name}...")
+            
+            # Baixa executável
+            response = requests.get(download_url, stream=True, timeout=60)
+            response.raise_for_status()
+            
+            # Salva em diretório temporário
+            temp_dir = Path(tempfile.gettempdir())
+            exe_path = temp_dir / file_name
+            
+            downloaded = 0
+            last_percent = -1
+            with open(exe_path, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    if chunk:
+                        f.write(chunk)
+                        downloaded += len(chunk)
+                        if file_size > 0:
+                            percent = int((downloaded / file_size) * 100)
+                            if percent != last_percent:
+                                log_progress(f"📥 Baixando executável: {percent}%")
+                                last_percent = percent
+            
+            log_progress(f"✅ Executável baixado com sucesso!")
+            return exe_path
+            
+        except Exception as e:
+            logger.error(f"Erro ao baixar executável: {e}")
+            log_progress(f"❌ Erro: {str(e)}")
+            return None
+    
+    def update_executable(self, progress_callback=None) -> Dict[str, any]:
+        """
+        Atualiza o executável principal usando o updater_launcher.
+        Este método baixa o novo exe e inicia o launcher para substituí-lo.
+        
+        Args:
+            progress_callback: Função callback(message: str) para reportar progresso
+            
+        Returns:
+            Dict com resultado: {'success': bool, 'message': str, 'restart_required': bool}
+        """
+        def log_progress(msg):
+            if progress_callback:
+                progress_callback(msg)
+            logger.info(msg)
+        
+        try:
+            # Verifica se está rodando como executável
+            if not getattr(sys, 'frozen', False):
+                return {
+                    'success': False,
+                    'message': 'Atualização de executável só funciona quando compilado com PyInstaller',
+                    'restart_required': False
+                }
+            
+            # Verifica se há atualizações
+            has_update, current, remote = self.check_for_updates()
+            
+            if not has_update:
+                return {
+                    'success': False,
+                    'message': f'Você já está na versão mais recente ({current})',
+                    'restart_required': False
+                }
+            
+            log_progress(f"🔄 Atualizando de {current} para {remote}...")
+            
+            # Baixa novo executável
+            log_progress("📥 Baixando nova versão...")
+            novo_exe = self.download_executable_from_release(progress_callback)
+            
+            if not novo_exe or not novo_exe.exists():
+                return {
+                    'success': False,
+                    'message': 'Falha ao baixar o executável atualizado',
+                    'restart_required': False
+                }
+            
+            # Localiza o executável atual
+            exe_atual = Path(sys.executable)
+            log_progress(f"📍 Executável atual: {exe_atual}")
+            
+            # Localiza o updater launcher
+            # Quando compilado com PyInstaller, arquivos de dados ficam em _internal ou no mesmo diretório
+            if hasattr(sys, '_MEIPASS'):
+                # Modo executável
+                launcher_locations = [
+                    Path(sys._MEIPASS) / 'updater_launcher.py',
+                    exe_atual.parent / '_internal' / 'updater_launcher.py',
+                    exe_atual.parent / 'updater_launcher.py',
+                ]
+            else:
+                # Modo desenvolvimento
+                launcher_locations = [self.base_dir / 'updater_launcher.py']
+            
+            launcher_script = None
+            for loc in launcher_locations:
+                if loc.exists():
+                    launcher_script = loc
+                    break
+            
+            if not launcher_script:
+                log_progress("⚠️ updater_launcher.py não encontrado")
+                log_progress("💡 Tentando copiar launcher para temp...")
+                
+                # Cria launcher temporário
+                temp_launcher = Path(tempfile.gettempdir()) / 'updater_launcher.py'
+                
+                # Código do launcher embutido (fallback)
+                launcher_code = Path(__file__).parent.parent / 'updater_launcher.py'
+                if launcher_code.exists():
+                    shutil.copy2(launcher_code, temp_launcher)
+                    launcher_script = temp_launcher
+                else:
+                    return {
+                        'success': False,
+                        'message': 'updater_launcher.py não encontrado no pacote',
+                        'restart_required': False
+                    }
+            
+            log_progress("🚀 Preparando para atualizar...")
+            
+            # Executa o updater launcher
+            # Ele aguardará o app fechar, substituirá o exe e reiniciará
+            try:
+                # Usa pythonw.exe se disponível (não mostra console)
+                python_exe = sys.executable
+                if 'python.exe' in python_exe.lower():
+                    pythonw = python_exe.replace('python.exe', 'pythonw.exe')
+                    if Path(pythonw).exists():
+                        python_exe = pythonw
+                
+                # Inicia o launcher em background
+                subprocess.Popen(
+                    [python_exe, str(launcher_script), str(novo_exe), str(exe_atual)],
+                    cwd=str(launcher_script.parent),
+                    creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0,
+                    close_fds=True
+                )
+                
+                log_progress("✅ Updater iniciado!")
+                
+                return {
+                    'success': True,
+                    'message': f'✅ Atualização iniciada!\n\nO aplicativo será fechado e atualizado automaticamente.\n\nVersão: {current} → {remote}',
+                    'restart_required': True
+                }
+                
+            except Exception as e:
+                logger.error(f"Erro ao iniciar updater launcher: {e}")
+                return {
+                    'success': False,
+                    'message': f'Erro ao iniciar processo de atualização: {str(e)}',
+                    'restart_required': False
+                }
+                
+        except Exception as e:
+            logger.error(f"Erro ao atualizar executável: {e}")
+            return {
+                'success': False,
+                'message': f'Erro durante atualização: {str(e)}',
+                'restart_required': False
+            }
     
     def get_file_list(self) -> List[str]:
         """

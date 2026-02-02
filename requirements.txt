@@ -37,6 +37,7 @@ python-dateutil>=2.8.2
 # Utilitários
 python-dotenv>=1.0.0
 pathlib>=1.0.1
+psutil>=5.9.0  # Para gerenciamento de processos (updater)
 
 # ====================================
 # OPCIONAL - Para desenvolvimento

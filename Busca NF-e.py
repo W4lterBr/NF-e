@@ -9842,7 +9842,7 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Logs", f"Erro ao abrir pasta de logs: {e}")
 
     def check_updates(self):
-        """Verifica e aplica atualizações do GitHub."""
+        """Verifica e aplica atualizações do GitHub com auto-update TRUE."""
         from modules.updater import GitHubUpdater
         from PyQt5.QtWidgets import QProgressDialog, QMessageBox
         from PyQt5.QtCore import Qt
@@ -9879,7 +9879,7 @@ class MainWindow(QMainWindow):
                 f"Versão atual: {current}\n"
                 f"Nova versão: {remote}\n\n"
                 f"Deseja atualizar agora?\n\n"
-                f"⚠️ O aplicativo será reiniciado após a atualização.",
+                f"⚠️ O aplicativo será fechado e atualizado automaticamente.",
                 QMessageBox.Yes | QMessageBox.No,
                 QMessageBox.Yes
             )
@@ -9900,54 +9900,83 @@ class MainWindow(QMainWindow):
                 progress.setLabelText(msg)
                 QApplication.processEvents()
             
-            # Aplica atualização
-            result = updater.apply_update(progress_callback=update_progress)
-            
-            progress.close()
-            
-            if result['success']:
-                msg_box = QMessageBox(self)
-                msg_box.setIcon(QMessageBox.Information)
-                msg_box.setWindowTitle("Atualização Concluída")
-                msg_box.setText(result['message'])
+            # MODO EXECUTÁVEL: Usa auto-update TRUE (substitui o .exe)
+            if getattr(sys, 'frozen', False):
+                logger.info("🚀 Modo executável: usando auto-update TRUE")
+                result = updater.update_executable(progress_callback=update_progress)
                 
-                if result['updated_files']:
-                    details = "Arquivos atualizados:\n" + "\n".join(f"• {f}" for f in result['updated_files'])
-                    msg_box.setDetailedText(details)
+                progress.close()
                 
-                msg_box.setStandardButtons(QMessageBox.Ok)
-                msg_box.exec_()
-                
-                # Pergunta se deseja reiniciar
-                reply = QMessageBox.question(
-                    self,
-                    "Reiniciar Aplicativo",
-                    "✅ Atualização concluída!\n\nDeseja reiniciar o aplicativo agora?",
-                    QMessageBox.Yes | QMessageBox.No,
-                    QMessageBox.Yes
-                )
-                
-                if reply == QMessageBox.Yes:
-                    # Atualiza o título antes de reiniciar (caso usuário cancele)
-                    self._update_window_title()
-                    QApplication.quit()
-                    if getattr(sys, 'frozen', False):
-                        # Executável compilado
-                        os.startfile(sys.executable)
+                if result['success']:
+                    if result.get('restart_required'):
+                        # Mostra mensagem e fecha o app para o launcher substituir
+                        QMessageBox.information(
+                            self,
+                            "Atualização Automática",
+                            result['message'] + "\n\n🔄 O aplicativo será fechado agora..."
+                        )
+                        # Fecha o aplicativo - o launcher fará o resto
+                        QApplication.quit()
+                        sys.exit(0)
                     else:
-                        # Desenvolvimento
-                        os.execl(sys.executable, sys.executable, *sys.argv)
+                        QMessageBox.information(
+                            self,
+                            "Atualização",
+                            result['message']
+                        )
                 else:
-                    # Usuário não quer reiniciar agora - atualiza título mesmo assim
-                    self._update_window_title()
+                    QMessageBox.warning(
+                        self,
+                        "Erro na Atualização",
+                        f"❌ {result['message']}\n\n💡 Tente baixar o instalador manualmente do GitHub."
+                    )
             else:
-                QMessageBox.warning(
-                    self,
-                    "Erro na Atualização",
-                    f"❌ Erro ao aplicar atualização:\n\n{result['message']}"
-                )
+                # MODO DESENVOLVIMENTO: Atualiza arquivos .py individuais
+                logger.info("🔧 Modo desenvolvimento: atualizando arquivos Python")
+                result = updater.apply_update(progress_callback=update_progress)
+                
+                progress.close()
+                
+                if result['success']:
+                    msg_box = QMessageBox(self)
+                    msg_box.setIcon(QMessageBox.Information)
+                    msg_box.setWindowTitle("Atualização Concluída")
+                    msg_box.setText(result['message'])
+                    
+                    if result['updated_files']:
+                        details = "Arquivos atualizados:\n" + "\n".join(f"• {f}" for f in result['updated_files'])
+                        msg_box.setDetailedText(details)
+                    
+                    msg_box.setStandardButtons(QMessageBox.Ok)
+                    msg_box.exec_()
+                    
+                    # Pergunta se deseja reiniciar
+                    reply = QMessageBox.question(
+                        self,
+                        "Reiniciar Aplicativo",
+                        "✅ Atualização concluída!\n\nDeseja reiniciar o aplicativo agora?",
+                        QMessageBox.Yes | QMessageBox.No,
+                        QMessageBox.Yes
+                    )
+                    
+                    if reply == QMessageBox.Yes:
+                        # Atualiza o título antes de reiniciar (caso usuário cancele)
+                        self._update_window_title()
+                        QApplication.quit()
+                        # Desenvolvimento: reinicia com Python
+                        os.execl(sys.executable, sys.executable, *sys.argv)
+                    else:
+                        # Usuário não quer reiniciar agora - atualiza título mesmo assim
+                        self._update_window_title()
+                else:
+                    QMessageBox.warning(
+                        self,
+                        "Erro na Atualização",
+                        f"❌ Erro ao aplicar atualização:\n\n{result['message']}"
+                    )
         
         except Exception as e:
+            logger.exception("Erro ao verificar atualizações")
             QMessageBox.critical(
                 self,
                 "Erro",
