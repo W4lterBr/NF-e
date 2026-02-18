@@ -193,6 +193,16 @@ class DatabaseManager:
                     conn.execute("ALTER TABLE notas_detalhadas ADD COLUMN pdf_path TEXT")
                     print("[MIGRAÇÃO] ✅ Coluna pdf_path adicionada com sucesso")
                     print("[INFO] PDFs serão indexados automaticamente conforme forem acessados")
+                
+                # Migração: Adiciona colunas IBS e CBS (Reforma Tributária)
+                if 'v_ibs' not in columns:
+                    print("[MIGRAÇÃO] Adicionando coluna v_ibs (Imposto sobre Bens e Serviços)...")
+                    conn.execute("ALTER TABLE notas_detalhadas ADD COLUMN v_ibs TEXT")
+                    print("[MIGRAÇÃO] ✅ Coluna v_ibs adicionada com sucesso")
+                if 'v_cbs' not in columns:
+                    print("[MIGRAÇÃO] Adicionando coluna v_cbs (Contribuição sobre Bens e Serviços)...")
+                    conn.execute("ALTER TABLE notas_detalhadas ADD COLUMN v_cbs TEXT")
+                    print("[MIGRAÇÃO] ✅ Coluna v_cbs adicionada com sucesso")
             except Exception as e:
                 print(f"[MIGRAÇÃO] Erro ao adicionar colunas: {e}")
             
