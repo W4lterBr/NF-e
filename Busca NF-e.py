@@ -13598,6 +13598,9 @@ class GerenciadorTrabalhosDialog(QDialog):
                 f"Intervalo: {f'{spin_intervalo.value()}h' if check_intervalo.isChecked() else 'Não'}"
             )
             
+            # 🔧 CORREÇÃO: Atualiza lista de tarefas após salvar
+            self._atualizar_lista()
+            
             dialog.accept()
         
         btn_salvar.clicked.connect(salvar_configuracao)
