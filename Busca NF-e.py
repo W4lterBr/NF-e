@@ -17325,7 +17325,7 @@ class StorageConfigDialog(QDialog):
             progress.setValue(0)
             
             # Pastas a ignorar
-            pastas_ignorar = ['Debug de notas', 'Resumos', 'debug', 'resumos']
+            pastas_ignorar = ['Debug de notas', 'Resumos', 'Eventos', 'Outros', 'debug', 'resumos', 'eventos', 'outros']
             
             # Lista arquivos XML
             arquivos_xml = []
@@ -17370,6 +17370,16 @@ class StorageConfigDialog(QDialog):
                     return
                 
                 try:
+                    # 🚫 FILTRO CRÍTICO: Verifica nome do arquivo ANTES de processar
+                    # APENAS NF-e, CT-e e NFS-e completas devem ser copiadas
+                    nome_arquivo = arquivo_xml.name.upper()
+                    palavras_evento = ['EVENTO', 'CIENCIA', 'CONFIRMACAO', 'DESCONHECIMENTO', 
+                                      'NAO_REALIZADA', 'CANCELAMENTO', 'CARTA_CORRECAO']
+                    
+                    if any(palavra in nome_arquivo for palavra in palavras_evento):
+                        print(f"[IGNORADO] Evento não copiado para perfil: {arquivo_xml.name}")
+                        continue
+                    
                     # Extrai CNPJ da estrutura de pastas
                     caminho_relativo = arquivo_xml.relative_to(origem)
                     partes = list(caminho_relativo.parts)
@@ -17379,6 +17389,11 @@ class StorageConfigDialog(QDialog):
                     
                     cnpj_pasta = partes[0]
                     tipo_pasta = partes[2]  # NFe, CTe, etc.
+                    
+                    # 🚫 FILTRO ADICIONAL: Verifica se a pasta é de Eventos
+                    if "Eventos" in tipo_pasta or "Eventos" in str(arquivo_xml):
+                        print(f"[IGNORADO] Arquivo em pasta de eventos: {arquivo_xml.name}")
+                        continue
                     
                     # Normaliza CNPJ (remove caracteres especiais)
                     cnpj_normalizado = ''.join(c for c in cnpj_pasta if c.isdigit())
@@ -17471,18 +17486,6 @@ class StorageConfigDialog(QDialog):
                     if organizacao_tipo == 'TIPO_CERTIFICADO':
                         # Novo formato: Tipo/Certificado/mmaaaa
                         # Exemplo: NFe/61-MATPARCG/012026/
-                        
-                        # ⚠️ IGNORA EVENTOS: verifica se o nome do arquivo contém palavras de evento
-                        nome_arquivo = arquivo_xml.name.upper()
-                        if any(palavra in nome_arquivo for palavra in ['EVENTO', 'CANCELAMENTO', 'CARTA_CORRECAO', 'CONFIRMACAO', 'CIENCIA', 'DESCONHECIMENTO']):
-                            print(f"[IGNORADO] Evento não copiado no modo TIPO_CERTIFICADO: {arquivo_xml.name}")
-                            continue
-                        
-                        # Ignora também pastas de eventos na estrutura original
-                        if "Eventos" in tipo_pasta or "/" in tipo_pasta:
-                            print(f"[IGNORADO] Pasta de eventos ignorada: {tipo_pasta}")
-                            continue
-                        
                         pasta_dest = destino / tipo_pasta / pasta_cert / ano_mes
                     else:
                         # Formato padrão: Certificado/mmaaaa/Tipo
