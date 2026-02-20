@@ -17398,6 +17398,12 @@ class StorageConfigDialog(QDialog):
                     # Normaliza CNPJ (remove caracteres especiais)
                     cnpj_normalizado = ''.join(c for c in cnpj_pasta if c.isdigit())
                     
+                    # 🚫 FILTRO CRÍTICO: Valida CNPJ antes de processar
+                    # Pastas legadas antigas (ex: "99-JL COMERCIO") têm CNPJ incompleto
+                    if len(cnpj_normalizado) != 14:
+                        print(f"[IGNORADO] Pasta com CNPJ inválido (len={len(cnpj_normalizado)}): {cnpj_pasta} - pulando...")
+                        continue
+                    
                     # Busca nome do certificado (SEMPRE usa nome, nunca CNPJ)
                     nome_cert = mapeamento_nomes.get(cnpj_normalizado)
                     if not nome_cert:
