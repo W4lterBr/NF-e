@@ -1032,6 +1032,13 @@ def _salvar_xml_single_profile(xml, cnpj_cpf, pasta_base="xmls", nome_certificad
             tipo_pasta = "Outros"
             tipo_doc = "Outro"
         
+        # 🚫 FILTRO CRÍTICO: Perfis de armazenamento APENAS para documentos fiscais completos
+        # Eventos, Resumos, Ciências e Outros NÃO devem ser salvos nos perfis
+        # Apenas NF-e, CT-e e NFS-e completas devem ir para os perfis de armazenamento
+        if pasta_base != "xmls" and tipo_doc not in ["NFe", "CTe", "NFS-e"]:
+            logger.debug(f"🚫 [IGNORADO] {tipo_doc} não será salvo no perfil de armazenamento (apenas backup local)")
+            return None
+        
         # ⚠️ EXTRAÇÃO DA CHAVE (PADRÃO v1.0.86)
         # Chave é extraída aqui para ser usada como nome do arquivo
         chave = None
