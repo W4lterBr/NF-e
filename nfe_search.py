@@ -131,11 +131,11 @@ def setup_logger():
         
         logger.setLevel(logging.DEBUG)
         
-        # Log de confirmação
-        print(f"✅ Logger configurado: {log_filename}")
+        # Log de confirmação (comentado para não contaminar stdout em subprocessos)
+        # print(f"✅ Logger configurado: {log_filename}")
         
     except Exception as e:
-        print(f"❌ ERRO ao configurar logger: {e}")
+        print(f"❌ ERRO ao configurar logger: {e}", file=sys.stderr)
         print(f"   LOGS_DIR: {LOGS_DIR}")
         print(f"   log_filename: {log_filename}")
         # Logger básico apenas no console se falhar
@@ -311,10 +311,8 @@ def ciclo_nsu(db, parser, intervalo=3600):
                                         db.registrar_xml(chave, cnpj)
                                         logger.warning(f"⚠️ XML salvo mas caminho não obtido: {chave}")
                                     
-                                    # 2. Se configurado armazenamento diferente, copia para lá também
-                                    pasta_storage = db.get_config('storage_pasta_base', 'xmls')
-                                    if pasta_storage and pasta_storage != 'xmls':
-                                        salvar_xml_por_certificado(xml, cnpj, pasta_base=pasta_storage, nome_certificado=nome_cert)
+                                    # 2. Salva em TODOS os perfis ativos (inclui storage_pasta_base como fallback)
+                                    salvar_xml_por_certificado(xml, cnpj, pasta_base=None, nome_certificado=nome_cert)
                                     
                                     # Salva nota detalhada
                                     db.criar_tabela_detalhada()
@@ -322,6 +320,10 @@ def ciclo_nsu(db, parser, intervalo=3600):
                                     nota['informante'] = inf  # Adiciona informante (redundância para garantir)
                                     nota['xml_status'] = xml_status  # Marca corretamente: COMPLETO, RESUMO ou EVENTO
                                     db.salvar_nota_detalhada(nota)
+                                    
+                                    # 🔄 ATUALIZAÇÃO INTERFACE: Notifica interface sobre nova nota
+                                    if hasattr(db, '_callback_nova_nota') and callable(db._callback_nova_nota):
+                                        db._callback_nova_nota(nota)
                                     
                                     # 3. CACHE: Atualiza caminho do PDF no banco (se foi gerado)
                                     if caminho_pdf:
@@ -408,6 +410,10 @@ def ciclo_nsu(db, parser, intervalo=3600):
                         nota = extrair_nota_detalhada(xml_txt, parser, db, chave, inf)
                         nota['informante'] = inf  # Garantir informante
                         db.salvar_nota_detalhada(nota)
+                        
+                        # 🔄 ATUALIZAÇÃO INTERFACE: Notifica interface sobre nova nota
+                        if hasattr(db, '_callback_nova_nota') and callable(db._callback_nova_nota):
+                            db._callback_nova_nota(nota)
                 except Exception as e:
                     logger.warning(f"Falha ao extrair/atualizar nota detalhada de {xml_file}: {e}")
 
@@ -622,6 +628,16 @@ def processar_evento_status(xml_txt, chave_evento, db):
             logger.info(f"Status atualizado: {chNFe} → {novo_status}")
         
         # Eventos de manifestação (210200-210240) não alteram status principal
+
+        # Atualiza data_emissao a partir da chave se estiver vazia (AAMM nas posições 2-5)
+        # Garante que notas canceladas/com evento sempre tenham uma data visível na interface
+        try:
+            if len(chNFe) >= 6:
+                aa, mm = chNFe[2:4], chNFe[4:6]
+                data_aamm = f"20{aa}-{mm}-01"
+                db.atualizar_data_emissao_se_vazia(chNFe, data_aamm)
+        except Exception as e:
+            logger.debug(f"Erro ao atualizar data_emissao: {e}")
         
     except Exception as e:
         logger.debug(f"Erro ao processar evento de status: {e}")
@@ -723,6 +739,39 @@ def extrair_nfe_detalhado(xml_txt, parser, db, chave, informante=None, nsu_docum
             vICMS = tot.findtext('{http://www.portalfiscal.inf.br/nfe}vICMS')
             valor_icms = vICMS if vICMS else ""
 
+        # 💰 IBS/CBS (Reforma Tributária 2026)
+        # Estrutura NF-e: <IBSCBSTot><gIBS><vIBS> e <gCBS><vCBS>
+        v_ibs = ''
+        v_cbs = ''
+        try:
+            ns_nfe = '{http://www.portalfiscal.inf.br/nfe}'
+            ibs_cbs_tot = tree.find(f'.//{ns_nfe}IBSCBSTot')
+            if ibs_cbs_tot is not None:
+                g_ibs = ibs_cbs_tot.find(f'{ns_nfe}gIBS')
+                if g_ibs is not None:
+                    v_ibs = g_ibs.findtext(f'{ns_nfe}vIBS') or ''
+                g_cbs = ibs_cbs_tot.find(f'{ns_nfe}gCBS')
+                if g_cbs is not None:
+                    v_cbs = g_cbs.findtext(f'{ns_nfe}vCBS') or ''
+            # Fallback: busca em ICMSTot
+            if not v_ibs and tot is not None:
+                v_ibs = tot.findtext(f'{ns_nfe}vIBS') or ''
+            if not v_cbs and tot is not None:
+                v_cbs = tot.findtext(f'{ns_nfe}vCBS') or ''
+            # Fallback sem namespace
+            if not v_ibs:
+                el = tree.find(".//*[@*[local-name()='vIBS']]") or next(
+                    (e for e in tree.iter() if e.tag.endswith('}vIBS') or e.tag == 'vIBS'), None)
+                if el is not None:
+                    v_ibs = el.text or ''
+            if not v_cbs:
+                el = next(
+                    (e for e in tree.iter() if e.tag.endswith('}vCBS') or e.tag == 'vCBS'), None)
+                if el is not None:
+                    v_cbs = el.text or ''
+        except Exception:
+            pass  # IBS/CBS ausente em NF-e anteriores à Reforma Tributária — normal
+
         # Busca status no banco (pode ser None)
         status_db = db.get_nf_status(chave)
         if status_db and status_db[0] and status_db[1]:
@@ -749,6 +798,8 @@ def extrair_nfe_detalhado(xml_txt, parser, db, chave, informante=None, nsu_docum
                             else ""),
             "tipo": "NFe",
             "valor": valor,
+            "v_ibs": v_ibs,  # 💰 IBS (Reforma Tributária 2026)
+            "v_cbs": v_cbs,  # 💰 CBS (Reforma Tributária 2026)
             "cfop": cfop,
             "vencimento": vencimento,
             "ncm": ncm,
@@ -776,6 +827,8 @@ def extrair_nfe_detalhado(xml_txt, parser, db, chave, informante=None, nsu_docum
             "data_emissao": "",
             "tipo": "NFe",
             "valor": "",
+            "v_ibs": "",  # 💰 IBS (Reforma Tributária 2026)
+            "v_cbs": "",  # 💰 CBS (Reforma Tributária 2026)
             "cfop": "",
             "vencimento": "",
             "ncm": "",
@@ -806,6 +859,125 @@ def format_cnpj_cpf_dir(doc: str) -> str:
         '47539664000197'      --> '47539664000197'
     """
     return ''.join(filter(str.isdigit, doc or ""))
+
+# ---------------------------------------------------------------------------
+# 📝 REGISTRO DE CAMINHOS SALVOS — controle centralizado de todos os destinos
+# ---------------------------------------------------------------------------
+
+def _registrar_caminho_salvo(chave, cnpj_cpf, caminho, tipo='LOCAL', perfil_nome=None):
+    """Registra no banco de dados o caminho onde um XML foi salvo.
+
+    Args:
+        chave:       Chave de acesso de 44 dígitos (ou chave NFS-e).
+        cnpj_cpf:    CNPJ/CPF do certificado dono do documento.
+        caminho:     Caminho absoluto completo do arquivo salvo.
+        tipo:        'LOCAL'  — backup interno (xmls/)
+                     'STORAGE'— pasta de armazenamento configurada
+                     'PERFIL' — perfil de armazenamento nomeado
+        perfil_nome: Nome do perfil (apenas quando tipo == 'PERFIL').
+    """
+    if not chave or not caminho:
+        return
+    try:
+        import sqlite3
+        db_path = get_data_dir() / 'notas.db'
+        with sqlite3.connect(str(db_path)) as conn:
+            # Garante a tabela (idempotente)
+            conn.execute('''CREATE TABLE IF NOT EXISTS xmls_caminhos (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chave TEXT NOT NULL,
+                cnpj_cpf TEXT,
+                caminho TEXT NOT NULL,
+                tipo TEXT DEFAULT 'LOCAL',
+                perfil_nome TEXT,
+                salvo_em TEXT DEFAULT (strftime('%Y-%m-%d %H:%M:%S', 'now', 'localtime')),
+                UNIQUE(chave, caminho)
+            )''')
+            conn.execute(
+                '''INSERT INTO xmls_caminhos (chave, cnpj_cpf, caminho, tipo, perfil_nome)
+                   VALUES (?, ?, ?, ?, ?)
+                   ON CONFLICT(chave, caminho) DO UPDATE SET
+                       tipo = excluded.tipo,
+                       perfil_nome = excluded.perfil_nome,
+                       salvo_em = strftime('%Y-%m-%d %H:%M:%S', 'now', 'localtime')''',
+                (chave, cnpj_cpf, str(caminho), tipo, perfil_nome)
+            )
+            # Mantém xmls_baixados em sincronia com o caminho LOCAL principal
+            if tipo == 'LOCAL':
+                agora = __import__('datetime').datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                conn.execute(
+                    '''INSERT INTO xmls_baixados (chave, cnpj_cpf, caminho_arquivo, baixado_em)
+                       VALUES (?, ?, ?, ?)
+                       ON CONFLICT(chave) DO UPDATE SET
+                           caminho_arquivo = excluded.caminho_arquivo,
+                           baixado_em      = excluded.baixado_em''',
+                    (chave, cnpj_cpf, str(caminho), agora)
+                )
+        logger.debug(f"📝 Caminho registrado [{tipo}] {chave[:10]}… → {caminho}")
+    except Exception as e:
+        logger.warning(f"⚠️ Erro ao registrar caminho no banco: {e}")
+
+
+def _indexar_xml_no_banco(xml_path: str, cnpj_cpf: str, tipo_doc: str, caminho_pdf: str = None):
+    """
+    Parseia um XML fiscal e persiste os campos extraídos nas tabelas
+    nfe_docs / cte_docs / nfse_docs do banco de dados.
+
+    Chamado automaticamente após cada salvamento de XML em disco.
+    Falhas são silenciosas (log apenas) para não bloquear o fluxo principal.
+    """
+    try:
+        from modules.xml_indexer import parse_nfe, parse_cte, parse_nfse
+        from modules.database import DatabaseManager
+
+        db_path = get_data_dir() / 'notas.db'
+        db = DatabaseManager(db_path)
+
+        if tipo_doc == "NFe":
+            dados = parse_nfe(xml_path, informante=cnpj_cpf)
+            if dados.get("chave"):
+                if caminho_pdf:
+                    dados["caminho_pdf"] = caminho_pdf
+                db.upsert_nfe_doc(dados)
+        elif tipo_doc == "CTe":
+            dados = parse_cte(xml_path, informante=cnpj_cpf)
+            if dados.get("chave"):
+                if caminho_pdf:
+                    dados["caminho_pdf"] = caminho_pdf
+                db.upsert_cte_doc(dados)
+        elif tipo_doc in ("NFSe", "NFS-e", "NFSE"):
+            from modules.xml_indexer import parse_nfse, parse_nfse_abrasf
+            try:
+                header_bytes = Path(xml_path).read_bytes()[:512].decode("utf-8", errors="ignore")
+            except Exception:
+                header_bytes = ""
+            if "abrasf.org.br" in header_bytes or "ListaNotaFiscal" in header_bytes:
+                for dados in parse_nfse_abrasf(xml_path, informante=cnpj_cpf):
+                    if dados.get("chave"):
+                        if caminho_pdf:
+                            dados["caminho_pdf"] = caminho_pdf
+                        db.upsert_nfse_doc(dados)
+            else:
+                dados = parse_nfse(xml_path, informante=cnpj_cpf)
+                if dados.get("chave"):
+                    if caminho_pdf:
+                        dados["caminho_pdf"] = caminho_pdf
+                    db.upsert_nfse_doc(dados)
+        elif tipo_doc in ("NFCe", "NFC-e", "NFCE"):
+            from modules.xml_indexer import parse_nfce
+            dados = parse_nfce(xml_path, informante=cnpj_cpf)
+            if dados.get("chave"):
+                if caminho_pdf:
+                    dados["caminho_pdf"] = caminho_pdf
+                db.upsert_nfce_doc(dados)
+        elif tipo_doc == "ResNFe":
+            # Resumos de NF-e também são indexados (xml_status='RESUMO')
+            dados = parse_nfe(xml_path, informante=cnpj_cpf)
+            if dados.get("chave"):
+                db.upsert_nfe_doc(dados)
+    except Exception as e:
+        logger.warning(f"[INDEX] Erro ao indexar {xml_path}: {e}")
+
 
 def salvar_xml_por_certificado(xml, cnpj_cpf, pasta_base="xmls", nome_certificado=None, formato_mes=None):
     """
@@ -841,7 +1013,7 @@ def salvar_xml_por_certificado(xml, cnpj_cpf, pasta_base="xmls", nome_certificad
     
     Exemplos: 
     - LOCAL: xmls/47539664000197/2025-08/NFe/52260115045348000172570010014777191002562584.xml
-    - STORAGE: C:\Arquivo Walter\61-MATPARCG/2025-08/NFe/52260115045348000172570010014777191002562584.xml
+    - STORAGE: C:\\Arquivo Walter\\61-MATPARCG/2025-08/NFe/52260115045348000172570010014777191002562584.xml
     """
     # ⚠️ NOVO: Suporte a múltiplos perfis
     if pasta_base is None:
@@ -880,6 +1052,19 @@ def _salvar_xml_multiplos_perfis(xml, cnpj_cpf, nome_certificado=None, formato_m
         conn.close()
         
         if not perfis:
+            # Fallback 1: verifica storage_pasta_base do config (caminho legado)
+            try:
+                db_path2 = get_data_dir() / 'notas.db'
+                conn2 = sqlite3.connect(str(db_path2))
+                row2 = conn2.execute("SELECT valor FROM config WHERE chave = ?", ('storage_pasta_base',)).fetchone()
+                conn2.close()
+                pasta_legado = row2[0] if row2 else None
+            except Exception:
+                pasta_legado = None
+            if pasta_legado and pasta_legado != 'xmls':
+                logger.info(f"Nenhum perfil ativo; usando storage_pasta_base legado: {pasta_legado}")
+                return _salvar_xml_single_profile(xml, cnpj_cpf, pasta_legado, nome_certificado, formato_mes)
+            # Fallback 2: pasta padrão xmls
             logger.warning("Nenhum perfil ativo encontrado. Usando pasta padrão 'xmls'")
             return _salvar_xml_single_profile(xml, cnpj_cpf, "xmls", nome_certificado, formato_mes)
         
@@ -901,7 +1086,8 @@ def _salvar_xml_multiplos_perfis(xml, cnpj_cpf, nome_certificado=None, formato_m
                     pasta_base, 
                     nome_certificado, 
                     formato_usar,
-                    organizacao_tipo
+                    organizacao_tipo,
+                    nome_perfil   # 📝 Passa nome do perfil para rastreamento no banco
                 )
                 
                 if resultado:
@@ -924,14 +1110,16 @@ def _salvar_xml_multiplos_perfis(xml, cnpj_cpf, nome_certificado=None, formato_m
         return _salvar_xml_single_profile(xml, cnpj_cpf, "xmls", nome_certificado, formato_mes)
 
 
-def _salvar_xml_single_profile(xml, cnpj_cpf, pasta_base="xmls", nome_certificado=None, formato_mes=None, organizacao_tipo='CERTIFICADO_TIPO'):
+def _salvar_xml_single_profile(xml, cnpj_cpf, pasta_base="xmls", nome_certificado=None, formato_mes=None, organizacao_tipo='CERTIFICADO_TIPO', perfil_nome=None):
     """
     Versão original de salvar_xml_por_certificado que salva em uma pasta específica.
     Esta função contém toda a lógica de salvamento para um único perfil.
     
     Args:
-        organizacao_tipo: 'CERTIFICADO_TIPO' (padrão: Certificado/mmaaaa/NFe) ou 
-                         'TIPO_CERTIFICADO' (novo: NFe/Certificado/mmaaaa)
+        organizacao_tipo: 'CERTIFICADO_TIPO_DATA' (Cert/NFe/202501 - RECOMENDADO),
+                         'TIPO_CERTIFICADO' (NFe/Cert/202501),
+                         'CERTIFICADO_TIPO' (Cert/202501/NFe - compatibilidade)
+        perfil_nome: Nome do perfil de armazenamento (para rastreamento no banco)
     """
     import os
     from lxml import etree
@@ -968,8 +1156,16 @@ def _salvar_xml_single_profile(xml, cnpj_cpf, pasta_base="xmls", nome_certificad
         # ⚠️ LÓGICA DE NOMENCLATURA DE PASTA (v1.0.87+):
         # - BACKUP LOCAL (xmls/): Usa CNPJ puro (47539664000197)
         # - ARMAZENAMENTO (storage): Usa nome amigável se fornecido (61-MATPARCG)
-        if pasta_base == "xmls" or not nome_certificado:
-            # Backup local: sempre usa CNPJ
+        #
+        # ATENÇÃO: neste ponto pasta_base já foi resolvida para caminho absoluto,
+        # por isso comparamos por endswith, não por == "xmls".
+        _is_local_backup = (
+            pasta_base.endswith('xmls') or
+            pasta_base.endswith('xmls/') or
+            pasta_base.endswith('xmls\\')
+        )
+        if _is_local_backup or not nome_certificado:
+            # Backup local: SEMPRE usa CNPJ puro (nunca nome amigável)
             pasta_certificado = format_cnpj_cpf_dir(cnpj_cpf)
         else:
             # Armazenamento externo: usa nome amigável se disponível
@@ -1245,20 +1441,82 @@ def _salvar_xml_single_profile(xml, cnpj_cpf, pasta_base="xmls", nome_certificad
         nNF = nNF or "SEM_NUMERO"
         xNome = xNome or "SEM_NOME"
         
-        # Cria pasta com tipo de documento - suporta 2 formatos de organização
-        if organizacao_tipo == 'TIPO_CERTIFICADO':
-            # Novo formato: Tipo/Certificado/mmaaaa
-            # Exemplo: NFe/61-MATPARCG/012026/
-            # Para eventos que já vêm com "NFe/Eventos", ajusta para "NFe"
-            if "/" in tipo_pasta:
-                tipo_base = tipo_pasta.split("/")[0]  # Pega só "NFe" ou "CTe"
-                pasta_dest = os.path.join(pasta_base, tipo_base, pasta_certificado, ano_mes)
-            else:
-                pasta_dest = os.path.join(pasta_base, tipo_pasta, pasta_certificado, ano_mes)
+        # ==================================================================================
+        # ESTRUTURA DE PASTAS - PROFISSIONAL E ORGANIZADA
+        # ==================================================================================
+        # 
+        # 📦 BACKUP LOCAL (xmls/): Estrutura TIPO → CNPJ → DATA
+        #    ✅ Hierarquia profissional para backup/restore
+        #    ✅ Agrupa por tipo de documento primeiro (NFe, CTe, NFSe)
+        #    ✅ Depois por empresa (CNPJ sem formatação)
+        #    ✅ Por último por período (AAAA-MM)
+        #    Exemplo: xmls/CTe/47539664000197/2026-01/chave-fornecedor.xml
+        #
+        # 🎨 PERFIS DE ARMAZENAMENTO: Estrutura configurável pelo usuário
+        #    - TIPO_CERTIFICADO: Tipo/NomeAmigavel/Data (ex: NFe/61-MATPARCG/2026-01/)
+        #    - CERTIFICADO_TIPO: NomeAmigavel/Data/Tipo (ex: 61-MATPARCG/2026-01/NFe/)
+        #
+        # ==================================================================================
+        
+        # Remove subpastas de eventos (ex: "NFe/Eventos" → "NFe", "CTe/Eventos" → "CTe")
+        tipo_base = tipo_pasta.split("/")[0] if "/" in tipo_pasta else tipo_pasta
+
+        # ── Detecta fluxo (Entradas / Saidas) para perfis de armazenamento ──────────────
+        # Entradas = documento recebido de terceiros (emitente ≠ certificado)
+        # Saidas  = documento emitido pela própria empresa (emitente == certificado)
+        fluxo = 'Entradas'  # padrão conservador
+        if tipo_doc in ('NFe', 'CTe'):
+            try:
+                _ns_emit = ('{http://www.portalfiscal.inf.br/nfe}'
+                            if tipo_doc == 'NFe'
+                            else '{http://www.portalfiscal.inf.br/cte}')
+                _emit_cnpj = root.findtext(f'.//{_ns_emit}emit/{_ns_emit}CNPJ') or ''
+                _cert_clean = re.sub(r'\D', '', cnpj_cpf or '')
+                _emit_clean = re.sub(r'\D', '', _emit_cnpj)
+                if _emit_clean and _cert_clean and _emit_clean == _cert_clean:
+                    fluxo = 'Saidas'
+            except Exception:
+                pass
+        elif tipo_doc == 'NFS-e':
+            try:
+                _ns_nfse = '{http://www.sped.fazenda.gov.br/nfse}'
+                # Padrão Nacional NFS-e (DPS): prest/CNPJ
+                _prest_cnpj = (
+                    root.findtext(f'.//{_ns_nfse}DPS/{_ns_nfse}infDPS/{_ns_nfse}prest/{_ns_nfse}CNPJ') or
+                    root.findtext('.//DPS/infDPS/prest/CNPJ') or                    # sem namespace
+                    root.findtext(f'.//{_ns_nfse}emit/{_ns_nfse}CNPJ') or
+                    root.findtext('.//emit/CNPJ') or                                # fallback emit
+                    root.findtext(f'.//{_ns_nfse}Prestador/{_ns_nfse}CNPJ') or    # legado Prestador
+                    root.findtext('.//Prestador/CNPJ') or ''
+                )
+                _cert_clean = re.sub(r'\D', '', cnpj_cpf or '')
+                _prest_clean = re.sub(r'\D', '', _prest_cnpj)
+                if _prest_clean and _cert_clean and _prest_clean == _cert_clean:
+                    fluxo = 'Saidas'
+            except Exception:
+                pass
+        # ─────────────────────────────────────────────────────────────────────────────────
+
+        # Determina estrutura baseado no tipo de armazenamento
+        if pasta_base.endswith('xmls') or pasta_base.endswith('xmls/') or pasta_base.endswith('xmls\\'):
+            # ✅ BACKUP LOCAL: TIPO → CNPJ → DATA (estrutura profissional, sem Entradas/Saidas)
+            pasta_dest = os.path.join(pasta_base, tipo_base, pasta_certificado, ano_mes)
+            logger.debug(f"📂 [BACKUP] {tipo_base}/{pasta_certificado}/{ano_mes}/")
+        
+        elif organizacao_tipo == 'TIPO_CERTIFICADO':
+            # 🎨 PERFIL: FLUXO → TIPO → CERTIFICADO → DATA
+            pasta_dest = os.path.join(pasta_base, fluxo, tipo_base, pasta_certificado, ano_mes)
+            logger.debug(f"📂 [PERFIL TIPO_CERT] {fluxo}/{tipo_base}/{pasta_certificado}/{ano_mes}/")
+        
+        elif organizacao_tipo == 'CERTIFICADO_TIPO_DATA':
+            # 🎨 PERFIL: FLUXO → CERTIFICADO → TIPO → DATA (novo v1.1.28)
+            pasta_dest = os.path.join(pasta_base, fluxo, pasta_certificado, tipo_base, ano_mes)
+            logger.debug(f"📂 [PERFIL CERT_TIPO_DATA] {fluxo}/{pasta_certificado}/{tipo_base}/{ano_mes}/")
+        
         else:
-            # Formato padrão: Certificado/mmaaaa/Tipo
-            # Exemplo: 61-MATPARCG/012026/NFe/
-            pasta_dest = os.path.join(pasta_base, pasta_certificado, ano_mes, tipo_pasta)
+            # 🎨 PERFIL: FLUXO → CERTIFICADO → DATA → TIPO (padrão antigo, compatibilidade)
+            pasta_dest = os.path.join(pasta_base, fluxo, pasta_certificado, ano_mes, tipo_pasta)
+            logger.debug(f"📂 [PERFIL CERT_DATA_TIPO] {fluxo}/{pasta_certificado}/{ano_mes}/{tipo_pasta}/")
         
         os.makedirs(pasta_dest, exist_ok=True)
 
@@ -1283,10 +1541,23 @@ def _salvar_xml_single_profile(xml, cnpj_cpf, pasta_base="xmls", nome_certificad
         # Retorna o caminho absoluto
         caminho_absoluto = os.path.abspath(caminho_xml)
         
-        # ⚠️ REGISTRO NO BANCO (xmls_baixados) - REMOVIDO DAQUI
-        # O registro agora é feito pela função registrar_xml() do DatabaseManager
-        # que recebe o caminho retornado por esta função
+        # 📝 RASTREAMENTO AUTOMÁTICO: registra o caminho no banco de dados
+        if chave:
+            _is_local = (
+                pasta_base.endswith('xmls') or
+                pasta_base.endswith('xmls/') or
+                pasta_base.endswith('xmls\\')
+            )
+            if perfil_nome:
+                _tipo_reg = 'PERFIL'
+            elif _is_local:
+                _tipo_reg = 'LOCAL'
+            else:
+                _tipo_reg = 'STORAGE'
+            _registrar_caminho_salvo(chave, cnpj_cpf, caminho_absoluto, _tipo_reg, perfil_nome)
         
+        # ⚠️ REGISTRO NO BANCO (xmls_baixados) - feito acima via _registrar_caminho_salvo
+
         # Gerar PDF automaticamente (apenas para NFe/CTe completas)
         if tipo_doc in ["NFe", "CTe"]:
             try:
@@ -1296,22 +1567,30 @@ def _salvar_xml_single_profile(xml, cnpj_cpf, pasta_base="xmls", nome_certificad
                     success = generate_danfe_pdf(xml, caminho_pdf, tipo_doc)
                     if success:
                         logger.debug(f"[PDF GERADO] {caminho_pdf}")
-                        return (caminho_absoluto, os.path.abspath(caminho_pdf))
+                        pdf_abs = os.path.abspath(caminho_pdf)
+                        # ✅ INDEXAR XML + PDF no banco de dados
+                        _indexar_xml_no_banco(caminho_absoluto, cnpj_cpf, tipo_doc, pdf_abs)
+                        return (caminho_absoluto, pdf_abs)
                     else:
                         # PDF falhou mas XML foi salvo
                         logger.debug(f"[PDF FALHOU] Retornando apenas XML: {caminho_absoluto}")
+                        _indexar_xml_no_banco(caminho_absoluto, cnpj_cpf, tipo_doc)
                         return (caminho_absoluto, None)
                 else:
                     logger.debug(f"[PDF JÁ EXISTE] {caminho_pdf}")
-                    return (caminho_absoluto, os.path.abspath(caminho_pdf))
+                    pdf_abs = os.path.abspath(caminho_pdf)
+                    _indexar_xml_no_banco(caminho_absoluto, cnpj_cpf, tipo_doc, pdf_abs)
+                    return (caminho_absoluto, pdf_abs)
             except Exception as pdf_err:
                 logger.warning(f"[AVISO] Erro ao gerar PDF: {pdf_err}")
                 # Retorna XML mesmo se PDF falhou
+                _indexar_xml_no_banco(caminho_absoluto, cnpj_cpf, tipo_doc)
                 return (caminho_absoluto, None)
-        
-        # Retorna só o XML se não for NFe/CTe
+
+        # Retorna só o XML (NFS-e, Eventos, etc.)
+        _indexar_xml_no_banco(caminho_absoluto, cnpj_cpf, tipo_doc)
         return (caminho_absoluto, None)
-        
+
     except Exception as e:
         logger.error(f"[ERRO ao salvar XML de {cnpj_cpf}]: {e}")
         import traceback
@@ -1434,12 +1713,19 @@ def _get_cached_wsdl_client(wsdl_url, transport, timeout=60):
         import threading
         _WSDL_CACHE_LOCK = threading.Lock()
     
-    # Verifica cache primeiro (rápido)
-    cache_key = f"{wsdl_url}_{id(transport)}"
+    # Verifica cache primeiro — chave = URL apenas (o transport muda a cada instância
+    # mas o WSDL é o mesmo; o client reutiliza o transport passado na criação)
+    cache_key = wsdl_url
     with _WSDL_CACHE_LOCK:
         if cache_key in _WSDL_CLIENT_CACHE:
+            cached_client = _WSDL_CLIENT_CACHE[cache_key]
+            # Injeta o transport do chamador para usar o certificado correto
+            try:
+                cached_client.transport = transport
+            except Exception:
+                pass
             logger.debug(f"💾 WSDL cache hit: {wsdl_url[:60]}...")
-            return _WSDL_CLIENT_CACHE[cache_key]
+            return cached_client
     
     # Cria novo client com timeout e retry
     logger.info(f"🌐 Baixando WSDL (timeout={timeout}s): {wsdl_url[:80]}...")
@@ -1607,6 +1893,22 @@ class DatabaseManager:
                 cur.execute("ALTER TABLE xmls_baixados ADD COLUMN xml_completo TEXT")
             except:
                 pass  # Coluna já existe
+            # 📂 TABELA DE CAMINHOS SALVOS - rastreamento completo de todos os destinos
+            # Cada XML pode estar salvo em múltiplos lugares (backup local, NFs, Domínio, etc.)
+            cur.execute('''CREATE TABLE IF NOT EXISTS xmls_caminhos (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chave TEXT NOT NULL,
+                cnpj_cpf TEXT,
+                caminho TEXT NOT NULL,
+                tipo TEXT DEFAULT 'LOCAL',
+                perfil_nome TEXT,
+                salvo_em TEXT DEFAULT (strftime('%Y-%m-%d %H:%M:%S', 'now', 'localtime')),
+                UNIQUE(chave, caminho)
+            )''')
+            try:
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_xmls_caminhos_chave ON xmls_caminhos(chave)")
+            except:
+                pass
             cur.execute('''CREATE TABLE IF NOT EXISTS nf_status (
                 chNFe TEXT PRIMARY KEY,
                 cStat TEXT,
@@ -1714,6 +2016,7 @@ class DatabaseManager:
                 # 🔒 MIGRAÇÃO CRÍTICA: Garante que as colunas existem (caso o banco seja antigo)
                 columns_to_add = [
                     ("cnpj_destinatario", "TEXT"),
+                    ("nome_destinatario", "TEXT"),  # Nome do tomador/destinatário
                     ("xml_status", "TEXT DEFAULT 'COMPLETO'"),
                     ("ncm", "TEXT"),
                     ("base_icms", "TEXT"),
@@ -1860,35 +2163,83 @@ class DatabaseManager:
                             logger.warning(f"⚠️ Nota {chave[:25]}... tem caminho registrado mas arquivo não existe. Corrigindo para RESUMO.")
                         xml_status = 'RESUMO'
                 else:
-                    # ❌ Não tem registro ou sem caminho
-                    if xml_status == 'COMPLETO':
-                        cursor_debug = conn.execute("SELECT COUNT(*) FROM xmls_baixados WHERE chave = ?", (chave,))
-                        count = cursor_debug.fetchone()[0]
-                        if count == 0:
-                            logger.warning(f"⚠️ Nota {chave[:25]}... marcada como COMPLETO mas NÃO REGISTRADA em xmls_baixados. Corrigindo para RESUMO.")
-                        else:
-                            logger.warning(f"⚠️ Nota {chave[:25]}... registrada em xmls_baixados mas SEM CAMINHO. Corrigindo para RESUMO.")
-                    xml_status = 'RESUMO'
+                    # ❌ xmls_baixados sem caminho — verifica xmls_caminhos antes de desclassificar
+                    caminho_alt = None
+                    try:
+                        row_c = conn.execute(
+                            "SELECT caminho FROM xmls_caminhos WHERE chave = ? AND tipo = 'LOCAL' LIMIT 1",
+                            (chave,)
+                        ).fetchone()
+                        if row_c and row_c[0]:
+                            from pathlib import Path as _Path
+                            if _Path(row_c[0]).exists():
+                                caminho_alt = row_c[0]
+                    except Exception:
+                        pass  # tabela pode não existir em instalações antigas
+                    
+                    if caminho_alt:
+                        # Recupera caminho de xmls_caminhos e sincroniza xmls_baixados
+                        agora_sync = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                        conn.execute(
+                            '''UPDATE xmls_baixados SET caminho_arquivo = ?, baixado_em = ?
+                               WHERE chave = ?''',
+                            (caminho_alt, agora_sync, chave)
+                        )
+                        logger.debug(f"🔄 Caminho recuperado de xmls_caminhos: {chave[:25]}...")
+                        xml_status = 'COMPLETO'
+                    else:
+                        if xml_status == 'COMPLETO':
+                            cursor_debug = conn.execute("SELECT COUNT(*) FROM xmls_baixados WHERE chave = ?", (chave,))
+                            count = cursor_debug.fetchone()[0]
+                            if count == 0:
+                                logger.warning(f"⚠️ Nota {chave[:25]}... marcada como COMPLETO mas NÃO REGISTRADA em xmls_baixados. Corrigindo para RESUMO.")
+                            else:
+                                logger.warning(f"⚠️ Nota {chave[:25]}... registrada em xmls_baixados mas SEM CAMINHO. Corrigindo para RESUMO.")
+                        xml_status = 'RESUMO'
             
+            # 🔒 PROTEÇÃO DE INFORMANTE: Se a nota já existe com um informante diferente,
+            # preserva o informante original. Isso evita que NFS-e "saltem" entre empresas
+            # quando tanto o prestador quanto o tomador têm certificados no mesmo sistema.
+            # Cenário: empresa A (prestador) busca primeiro → informante=A salvo.
+            # Empresa B (tomador) busca depois → INSERT OR REPLACE sobrescreveria para B.
+            # Com esta proteção, o informante original (A) é preservado.
+            informante_a_salvar = nota.get('informante', '')
+            try:
+                row_inf = conn.execute(
+                    "SELECT informante FROM notas_detalhadas WHERE chave = ?", (chave,)
+                ).fetchone()
+                if row_inf:
+                    existing_inf = (row_inf[0] or '').strip()
+                    new_inf = (informante_a_salvar or '').strip()
+                    if existing_inf and new_inf and existing_inf != new_inf:
+                        logger.debug(
+                            f"🔒 Informante preservado para {chave[:25]}: "
+                            f"'{existing_inf}' (tentativa de sobrescrever por '{new_inf}' ignorada)"
+                        )
+                        informante_a_salvar = existing_inf
+            except Exception:
+                pass  # Não bloqueia o save se a checagem falhar
+
             # 🔒 INSERT com campo NSU incluído
             conn.execute('''
                 INSERT OR REPLACE INTO notas_detalhadas (
                     chave, ie_tomador, nome_emitente, cnpj_emitente, numero,
                     data_emissao, tipo, valor, cfop, vencimento, ncm, uf, natureza,
-                    base_icms, valor_icms, v_ibs, v_cbs, status, atualizado_em, cnpj_destinatario, 
-                    xml_status, informante, nsu
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    base_icms, valor_icms, v_ibs, v_cbs, status, atualizado_em, cnpj_destinatario,
+                    nome_destinatario, xml_status, informante, nsu
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
                 nota['chave'], nota['ie_tomador'], nota['nome_emitente'], nota['cnpj_emitente'],
                 nota['numero'], nota['data_emissao'], nota['tipo'], nota['valor'],
                 nota.get('cfop', ''), nota.get('vencimento', ''), nota.get('ncm', ''),
-                nota.get('uf', ''), nota.get('natureza', ''), 
+                nota.get('uf', ''), nota.get('natureza', ''),
                 nota.get('base_icms', ''), nota.get('valor_icms', ''),
                 nota.get('v_ibs', ''), nota.get('v_cbs', ''),
                 nota['status'], nota['atualizado_em'],
-                nota.get('cnpj_destinatario', ''), 
+                nota.get('cnpj_destinatario', ''),
+                nota.get('nome_destinatario', ''),
                 xml_status,  # Usa o status validado
-                nota.get('informante', ''),
+                informante_a_salvar,  # 🔒 Informante protegido contra sobrescrita
                 nsu  # 🔒 NSU OBRIGATÓRIO - campo crítico para rastreamento
             ))
             conn.commit()
@@ -2015,16 +2366,15 @@ class DatabaseManager:
                 else:
                     raise
             
-            # 3️⃣ 🔒 ESTRATÉGIA CONSERVADORA: Sempre usa tabela 'nsu' como fonte da verdade
-            # Isso evita pular documentos não processados
-            nsu_final = nsu_tabela
-            
-            # 4️⃣ 📊 AUDITORIA: Logs detalhados para investigação
+            # 3️⃣ � AUDITORIA E RECUPERAÇÃO: Compara tabela de controle vs notas salvas
+            nsu_final = nsu_tabela  # padrão conservador
+
             if nsu_tabela != nsu_notas:
                 diff = int(nsu_notas) - int(nsu_tabela)
-                
+
                 if diff > 0:
-                    # NSU em notas_detalhadas está à frente - ALERTA!
+                    # notas_detalhadas tem NSU maior que a tabela de controle
+                    # → usa o maior para não reprocessar o que já foi salvo
                     logger.warning(f"🚨 DIVERGÊNCIA DE NSU para {informante}:")
                     logger.warning(f"   Tabela 'nsu' (controle): {nsu_tabela}")
                     logger.warning(f"   Maior em 'notas_detalhadas': {nsu_notas}")
@@ -2032,17 +2382,31 @@ class DatabaseManager:
                     logger.warning(f"   🔒 AÇÃO: Usando NSU da tabela de controle ({nsu_tabela})")
                     logger.warning(f"   📋 Sistema irá REPROCESSAR documentos entre {nsu_tabela} e {nsu_notas}")
                     logger.warning(f"   ✅ Isso é SEGURO - documentos duplicados serão filtrados pelo CNPJ+Chave")
+
                 elif diff < 0:
-                    # NSU em tabela está à frente - situação anômala
-                    logger.error(f"❌ ANOMALIA DE NSU para {informante}:")
-                    logger.error(f"   Tabela 'nsu': {nsu_tabela}")
-                    logger.error(f"   Maior em 'notas_detalhadas': {nsu_notas}")
-                    logger.error(f"   Tabela está {abs(diff)} NSU(s) à frente das notas!")
-                    logger.error(f"   Possível causa: Documentos foram processados mas não salvos")
-                    logger.error(f"   🔒 AÇÃO: Usando NSU da tabela ({nsu_tabela})")
+                    # tabela de controle está à frente de notas_detalhadas
+                    # → documentos entre nsu_notas e nsu_tabela foram processados mas NÃO salvos
+                    # → RECUA para nsu_notas para rebaixar e salvar esses documentos perdidos
+                    nsu_final = nsu_notas
+                    logger.warning(f"⚠️  RECUPERAÇÃO DE NSU para {informante}:")
+                    logger.warning(f"   Tabela 'nsu' (controle): {nsu_tabela}")
+                    logger.warning(f"   Maior em 'notas_detalhadas': {nsu_notas}")
+                    logger.warning(f"   {abs(diff)} documento(s) processado(s) mas NÃO salvos!")
+                    logger.warning(f"   🔄 AÇÃO: Recuando NSU para {nsu_notas} para rebaixar documentos perdidos")
+                    logger.warning(f"   ✅ Isso é SEGURO - documentos duplicados serão ignorados pelo CNPJ+Chave")
+                    # Atualiza a tabela de controle para refletir o recuo
+                    try:
+                        conn.execute(
+                            "UPDATE nsu SET ult_nsu=? WHERE informante=?",
+                            (nsu_notas, informante)
+                        )
+                        conn.commit()
+                        logger.warning(f"   ✅ Tabela 'nsu' atualizada para {nsu_notas}")
+                    except Exception as e_upd:
+                        logger.error(f"   ❌ Erro ao atualizar tabela nsu: {e_upd}")
             else:
                 logger.debug(f"✅ NSU consistente para {informante}: {nsu_final}")
-            
+
             return nsu_final
 
     def set_last_nsu(self, informante, nsu):
@@ -2074,7 +2438,11 @@ class DatabaseManager:
         
         with self._connect() as conn:
             # 3️⃣ 🔒 VALIDAÇÃO: Verifica se NSU está avançando (não permite retrocesso)
-            nsu_anterior = self.get_last_nsu(informante)
+            # Lê direto na tabela 'nsu' para evitar trigger dos warnings de divergência
+            _row = conn.execute(
+                "SELECT ult_nsu FROM nsu WHERE informante=?", (informante,)
+            ).fetchone()
+            nsu_anterior = _row[0] if _row else "000000000000000"
             if nsu_str < nsu_anterior:
                 logger.error(f"🚨 CRÍTICO: Tentativa de RETROCEDER NSU!")
                 logger.error(f"   Informante: {informante}")
@@ -2779,13 +3147,14 @@ class DatabaseManager:
                 logger.debug(f"XML registrado: {chave} (CNPJ {cnpj}) - caminho não informado")
             conn.commit()
 
-    def atualizar_pdf_path(self, chave: str, pdf_path: str) -> bool:
+    def atualizar_pdf_path(self, chave: str, pdf_path: str, pdf_tipo: str = None) -> bool:
         """
         Atualiza o caminho do PDF no cache do banco de dados.
         
         Args:
             chave: Chave de acesso do documento (44 dígitos)
             pdf_path: Caminho absoluto onde o PDF está armazenado
+            pdf_tipo: 'OFICIAL' (da API ADN/ABRASF) ou 'GENERICO' (gerado localmente)
             
         Returns:
             True se atualizado com sucesso, False caso contrário
@@ -2794,11 +3163,11 @@ class DatabaseManager:
             from datetime import datetime
             with self._connect() as conn:
                 conn.execute(
-                    "UPDATE notas_detalhadas SET pdf_path = ?, atualizado_em = ? WHERE chave = ?",
-                    (pdf_path, datetime.now().isoformat(), chave)
+                    "UPDATE notas_detalhadas SET pdf_path = ?, pdf_tipo = ?, atualizado_em = ? WHERE chave = ?",
+                    (pdf_path, pdf_tipo, datetime.now().isoformat(), chave)
                 )
                 conn.commit()
-                logger.debug(f"📄 PDF path atualizado: {chave[:25]}... → {pdf_path}")
+                logger.debug(f"📄 PDF path atualizado: {chave[:25]}... → {pdf_path} [{pdf_tipo}]")
                 return True
         except Exception as e:
             logger.error(f"[ERRO] Falha ao atualizar pdf_path para {chave}: {e}")
@@ -2837,8 +3206,21 @@ class DatabaseManager:
             return True
 
     def find_cert_by_cnpj(self, cnpj):
-        for row in self.get_certificados():
+        rows = self.get_certificados()
+        # Primeira tentativa: match exato por cnpj_cpf (campo principal)
+        for row in rows:
             if row[0] == cnpj:
+                return row
+        # Fallback: match pelo campo informante (row[3]) — necessário quando
+        # notas_detalhadas.informante armazena o valor do campo informante do cert,
+        # que pode diferir ligeiramente de cnpj_cpf (ex: com/sem formatação)
+        cnpj_digits = ''.join(c for c in (cnpj or '') if c.isdigit())
+        for row in rows:
+            if row[3] == cnpj:
+                return row
+            if cnpj_digits and ''.join(c for c in (row[0] or '') if c.isdigit()) == cnpj_digits:
+                return row
+            if cnpj_digits and ''.join(c for c in (row[3] or '') if c.isdigit()) == cnpj_digits:
                 return row
         return None
     
@@ -3137,6 +3519,104 @@ class XMLProcessor:
         logger.error(f"❌ XMLProcessor.fetch_by_key: método não implementado completamente")
         logger.error(f"   Use NFeService.fetch_by_chave_dist() para buscar XMLs por chave")
         return None
+
+# -------------------------------------------------------------------
+# CT-e CTeConsultaV4 — função autônoma (sem WSDL / Zeep)
+# -------------------------------------------------------------------
+# URL map oficial: estados com WS próprio; demais → SVRS
+_CTE_URL_SVRS = 'https://cte.svrs.rs.gov.br/ws/CTeConsultaV4/CTeConsultaV4.asmx'
+_CTE_URL_MAP = {
+    '29': 'https://cte.sefaz.ba.gov.br/webservices/CTeConsultaV4/CTeConsultaV4.asmx',  # BA
+    '31': 'https://cte.fazenda.mg.gov.br/cte/services/CTeConsultaV4',  # MG
+    '41': 'https://cte.fazenda.pr.gov.br/cte/CTeConsultaV4',  # PR
+    '43': _CTE_URL_SVRS,   # RS (é o próprio SVRS)
+    '50': 'https://producao.cte.ms.gov.br/ws/CTeConsultaV4',  # MS
+    '51': 'https://cte.sefaz.mt.gov.br/ctews/services/CTeConsultaV4',  # MT
+    # Todos os outros (incluindo SP=35) usam SVRS (default abaixo)
+}
+
+
+def _cte_url_por_cuf(cuf: str) -> str:
+    """Retorna a URL do serviço CTeConsultaV4 para o cUF fornecido."""
+    return _CTE_URL_MAP.get(str(cuf), _CTE_URL_SVRS)
+
+
+def cte_consultar_por_chave(chave: str, cert_path, senha, informante: str = '',
+                             ambiente: str = 'producao') -> 'str | None':
+    """
+    Consulta um CT-e por chave via CTeConsultaV4 sem instanciar NFeService.
+    Cria apenas uma sessão PKCS12 (sem download de WSDL) — evita ~400 ms de
+    latência por certificado que a inicialização do NFeService causaria.
+
+    Args:
+        chave:      Chave de acesso de 44 dígitos do CT-e
+        cert_path:  Caminho do arquivo PFX do certificado
+        senha:      Senha do certificado
+        informante: CNPJ/CPF do operador (apenas para log)
+        ambiente:   'producao' (padrão) ou 'homologacao'
+
+    Returns:
+        String XML do elemento-filho do SOAP Body ou None em caso de erro.
+    """
+    cuf = chave[:2] if len(chave) == 44 else '35'
+    url = _cte_url_por_cuf(cuf)
+    tp_amb = '1' if ambiente == 'producao' else '2'
+
+    xml_consulta = (
+        f'<consSitCTe xmlns="http://www.portalfiscal.inf.br/cte" versao="4.00">'
+        f'<tpAmb>{tp_amb}</tpAmb><xServ>CONSULTAR</xServ><chCTe>{chave}</chCTe>'
+        f'</consSitCTe>'
+    )
+    soap_envelope = (
+        '<?xml version="1.0" encoding="utf-8"?>'
+        '<soap12:Envelope xmlns:soap12="http://www.w3.org/2003/05/soap-envelope"'
+        ' xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"'
+        ' xmlns:xsd="http://www.w3.org/2001/XMLSchema">'
+        '<soap12:Body>'
+        '<cteDadosMsg xmlns="http://www.portalfiscal.inf.br/cte/wsdl/CTeConsultaV4">'
+        f'{xml_consulta}'
+        '</cteDadosMsg>'
+        '</soap12:Body>'
+        '</soap12:Envelope>'
+    )
+
+    try:
+        import requests
+        import requests_pkcs12 as _rpkcs12
+        sess = requests.Session()
+        sess.verify = False
+        sess.mount('https://', _rpkcs12.Pkcs12Adapter(
+            pkcs12_filename=cert_path, pkcs12_password=senha
+        ))
+
+        logger.info(f"🌐 [CTe-Direto] [{informante}] POST → {url}")
+        logger.info(f"   🔑 Chave: {chave}")
+        resp = sess.post(
+            url,
+            data=soap_envelope.encode('utf-8'),
+            headers={'Content-Type': 'application/soap+xml; charset=utf-8'},
+            timeout=30,
+        )
+        logger.info(f"✅ [CTe-Direto] [{informante}] Status {resp.status_code}, {len(resp.content)} bytes")
+        resp.raise_for_status()
+    except Exception as e:
+        logger.error(f"❌ [CTe-Direto] [{informante}] Erro HTTP CT-e cUF={cuf}: {e}")
+        return None
+
+    try:
+        resp_tree = etree.fromstring(resp.content)
+        body = resp_tree.find('.//{http://www.w3.org/2003/05/soap-envelope}Body')
+        if body is not None and len(body) > 0:
+            return etree.tostring(body[0], encoding='unicode')
+    except Exception as e:
+        logger.error(f"❌ [CTe-Direto] [{informante}] Parse resposta SOAP: {e}")
+
+    # Fallback — retorna texto bruto se contiver CT-e
+    resp_txt = resp.content.decode('utf-8', errors='replace')
+    if any(t in resp_txt for t in ('<retConsSitCTe', '<procCTe', '<cteProc', '<CTe ')):
+        return resp_txt
+    return None
+
 
 # -------------------------------------------------------------------
 # Serviço SOAP
@@ -3473,21 +3953,7 @@ class NFeService:
         # Chave CTe: posições 0-1 = cUF
         cuf_from_chave = chave[:2] if len(chave) == 44 else str(self.cuf)
         
-        # URLs OFICIAIS dos serviços de consulta CT-e (versão 4.00)
-        # Fonte: https://dfe-portal.svrs.rs.gov.br/Cte/Servicos
-        url_map = {
-            '51': 'https://cte.sefaz.mt.gov.br/ctews/services/CTeConsultaV4',  # MT
-            '50': 'https://producao.cte.ms.gov.br/ws/CTeConsultaV4',  # MS (sem .asmx!)
-            '31': 'https://cte.fazenda.mg.gov.br/cte/services/CTeConsultaV4',  # MG
-            '41': 'https://cte.fazenda.pr.gov.br/cte/CTeConsultaV4?wsdl',  # PR
-            '43': 'https://cte.svrs.rs.gov.br/ws/CTeConsultaV4/CTeConsultaV4.asmx',  # RS (SVRS)
-            '35': 'https://nfe.fazenda.sp.gov.br/cteWEB/services/cteConsultaV4.asmx',  # SP
-            # SVRS (usado por GO=52, DF=53, RJ=33, AC, AL, AP, ES, PA, PB, PI, RN, RO, RR, SC, SE, TO)
-            '52': 'https://cte.svrs.rs.gov.br/ws/CTeConsultaV4/CTeConsultaV4.asmx',  # GO (SVRS)
-            '53': 'https://cte.svrs.rs.gov.br/ws/CTeConsultaV4/CTeConsultaV4.asmx',  # DF (SVRS)
-            '33': 'https://cte.svrs.rs.gov.br/ws/CTeConsultaV4/CTeConsultaV4.asmx',  # RJ (SVRS)
-        }
-        url = url_map.get(cuf_from_chave, 'https://cte.svrs.rs.gov.br/ws/CTeConsultaV4/CTeConsultaV4.asmx')  # Default: SVRS
+        url = _cte_url_por_cuf(cuf_from_chave)
         
         # Monta XML de consulta CT-e (versão 4.00)
         xml_consulta = f'''<consSitCTe xmlns="http://www.portalfiscal.inf.br/cte" versao="4.00"><tpAmb>1</tpAmb><xServ>CONSULTAR</xServ><chCTe>{chave}</chCTe></consSitCTe>'''
@@ -3708,7 +4174,12 @@ def processar_cte(db, cert_data):
         parser = XMLProcessor(informante=inf)
         
         # Inicializa serviço CT-e
-        cte_svc = CTeService(path, senha, cnpj, cuf, ambiente='producao')
+        try:
+            cte_svc = CTeService(path, senha, cnpj, cuf, ambiente='producao')
+        except (FileNotFoundError, ValueError) as e:
+            logger.error(f"❌ [{cnpj}] CT-e: Certificado inválido ou excluído: {e}")
+            logger.warning(f"   ⏭️ Pulando CT-e para {cnpj}")
+            return
         logger.info(f"🚛 Iniciando busca de CT-e para {inf}")
         
         # Obtém último NSU CT-e processado
@@ -3777,7 +4248,60 @@ def processar_cte(db, cert_data):
                     # Detecta tipo de documento CT-e
                     tipo_doc = detectar_tipo_documento(xml_cte)
                     logger.debug(f"🔍 [{inf}] CT-e NSU {nsu}: tipo={tipo_doc}")
-                    
+
+                    # ── Tratamento especial para resCTe (resumo de distribuição) ──────
+                    # CTeDistribuicaoDFe retorna resCTe quando o destinatário ainda não
+                    # tem acesso ao CT-e completo.  detectar_tipo_documento retorna None
+                    # porque resCTe não contém infCte. Salva um stub RESUMO para que
+                    # baixar_ctes_pendentes baixe o XML completo no próximo ciclo.
+                    if tipo_doc is None and '<resCTe' in xml_cte:
+                        try:
+                            _tree_res = etree.fromstring(xml_cte.encode('utf-8'))
+                            _ch = (_tree_res.findtext('.//{http://www.portalfiscal.inf.br/cte}chCTe') or '').strip()
+                            _cnpj_emit_res = _ch[6:20] if len(_ch) == 44 else ''
+                            _nome_res = _tree_res.findtext('.//{http://www.portalfiscal.inf.br/cte}xNome') or ''
+                            _dhemi_res = _tree_res.findtext('.//{http://www.portalfiscal.inf.br/cte}dhEmi') or ''
+                            _valor_res = _tree_res.findtext('.//{http://www.portalfiscal.inf.br/cte}vCT') or ''
+                            if _ch and len(_ch) == 44:
+                                # Só salva se ainda não existe no banco
+                                _existe = False
+                                try:
+                                    with db._connect() as _c:
+                                        _existe = bool(_c.execute(
+                                            "SELECT 1 FROM notas_detalhadas WHERE chave=?", (_ch,)
+                                        ).fetchone())
+                                except Exception:
+                                    pass
+                                if not _existe:
+                                    db.salvar_nota_detalhada({
+                                        'chave': _ch,
+                                        'nsu': str(nsu),
+                                        'informante': inf,
+                                        'xml_status': 'RESUMO',
+                                        'tipo': 'CTe',
+                                        'numero': '',
+                                        'nome_emitente': _nome_res,
+                                        'cnpj_emitente': _cnpj_emit_res,
+                                        'data_emissao': _dhemi_res[:10] if _dhemi_res else '',
+                                        'valor': _valor_res,
+                                        'status': 'CT-e distribuído (resumo)',
+                                        'atualizado_em': datetime.now().isoformat(),
+                                    })
+                                    logger.info(f"📋 [{inf}] resCTe NSU={nsu} salvo como RESUMO pendente: {_ch}")
+                                    xmls_processados_historico_cte.append({
+                                        'tipo': 'cte_resumo',
+                                        'chave': _ch,
+                                        'xml_status': 'RESUMO'
+                                    })
+                                    docs_processados += 1
+                                else:
+                                    logger.debug(f"⏭️ [{inf}] resCTe NSU={nsu} já existe no banco: {_ch}")
+                            else:
+                                logger.debug(f"⏭️ [{inf}] resCTe NSU={nsu}: chave inválida ({len(_ch)} dígitos), pulando")
+                        except Exception as _e_res:
+                            logger.warning(f"⚠️ [{inf}] Erro ao salvar resCTe stub NSU={nsu}: {_e_res}")
+                        continue
+
                     if tipo_doc != 'CTe':
                         logger.debug(f"⏭️ [{inf}] CT-e NSU {nsu}: não é CT-e, pulando")
                         continue
@@ -3822,11 +4346,9 @@ def processar_cte(db, cert_data):
                         db.registrar_xml(chave_cte, cnpj)
                         logger.warning(f"⚠️ [{inf}] CT-e XML salvo mas caminho não obtido: {chave_cte}")
                     
-                    # 2. Se configurado armazenamento diferente, copia para lá também
-                    pasta_storage = db.get_config('storage_pasta_base', 'xmls')
-                    if pasta_storage and pasta_storage != 'xmls':
-                        logger.debug(f"💾 [{inf}] CT-e {chave_cte}: Copiando para armazenamento ({pasta_storage})...")
-                        salvar_xml_por_certificado(xml_cte, cnpj, pasta_base=pasta_storage, nome_certificado=nome_cert)
+                    # 2. Salva em TODOS os perfis ativos (inclui storage_pasta_base como fallback)
+                    logger.debug(f"💾 [{inf}] CT-e {chave_cte}: Salvando nos perfis de armazenamento...")
+                    salvar_xml_por_certificado(xml_cte, cnpj, pasta_base=None, nome_certificado=nome_cert)
                     
                     db.criar_tabela_detalhada()
                     
@@ -3840,8 +4362,9 @@ def processar_cte(db, cert_data):
                         logger.debug(f"✅ PDF path cached: {chave_cte} → {caminho_pdf}")
                     
                     # Determina status do XML (COMPLETO, RESUMO, EVENTO)
+                    # cteProc = distribuição v4, procCTe = distribuição v3/variante
                     root_tag = tree.tag.split('}')[-1] if '}' in tree.tag else tree.tag
-                    if root_tag in ['cteProc', 'CTe']:
+                    if root_tag in ['cteProc', 'procCTe', 'CTe']:
                         nota_cte['xml_status'] = 'COMPLETO'
                     elif root_tag == 'resCTe':
                         nota_cte['xml_status'] = 'RESUMO'
@@ -3868,7 +4391,11 @@ def processar_cte(db, cert_data):
                     logger.debug(f"💾 [{inf}] CT-e {chave_cte}: Salvando nota detalhada...")
                     db.salvar_nota_detalhada(nota_cte)
                     
-                    # 📊 HISTÓRICO: Registra CT-e processado
+                    # � ATUALIZAÇÃO INTERFACE: Notifica interface sobre nova nota
+                    if hasattr(db, '_callback_nova_nota') and callable(db._callback_nova_nota):
+                        db._callback_nova_nota(nota_cte)
+                    
+                    # �📊 HISTÓRICO: Registra CT-e processado
                     xmls_processados_historico_cte.append({
                         'tipo': 'cte',
                         'chave': chave_cte,
@@ -3892,10 +4419,10 @@ def processar_cte(db, cert_data):
             # ✅ CORREÇÃO: SEMPRE atualiza NSU quando SEFAZ retorna ultNSU
             # Mesmo que seja igual, garante sincronização (importante após Busca Completa)
             if ult_cte:
-                if ult_cte != ult_nsu_cte:
-                    logger.info(f"💾 [{inf}] CT-e: Atualizando NSU no banco: {ult_nsu_cte} → {ult_cte}")
-                    logger.info(f"➡️ [{inf}] CT-e NSU avançou: {ult_nsu_cte} → {ult_cte} ({docs_processados} docs)")
-                    ult_nsu_cte = ult_cte
+                nsu_avancou = (ult_cte != ult_nsu_cte)
+                
+                if nsu_avancou:
+                    logger.info(f"💾 [{inf}] CT-e: NSU avançou: {ult_nsu_cte} → {ult_cte} ({docs_processados} docs)")
                     logger.info(f"🔄 [{inf}] CT-e: Continuando para próxima iteração...")
                 else:
                     # NSU não mudou - sincroniza e encerra
@@ -3931,8 +4458,13 @@ def processar_cte(db, cert_data):
                 except Exception as e:
                     logger.warning(f"⚠️ Erro ao registrar histórico NSU CT-e (não-crítico): {e}")
                 
-                # Break apenas se NSU não mudou
-                if ult_cte == ult_nsu_cte:
+                # ✅ BUGFIX: Avança NSU local APÓS salvar no banco e registrar histórico
+                # Antes era feito dentro do if acima, o que tornava 'ult_cte == ult_nsu_cte'
+                # sempre True aqui, causando break prematuro em TODA iteração.
+                ult_nsu_cte = ult_cte
+                
+                # Break apenas se NSU não avançou (sem novos documentos)
+                if not nsu_avancou:
                     break
             else:
                 logger.warning(f"⚠️ [{inf}] CT-e: SEFAZ não retornou ultNSU, encerrando loop")
@@ -3963,6 +4495,7 @@ def salvar_nfse_detalhada(xml_content, nsu, informante):
     try:
         from lxml import etree
         from pathlib import Path
+        from datetime import datetime
         
         # Define caminho do banco principal
         base_dir = get_data_dir()
@@ -4084,17 +4617,36 @@ def salvar_nfse_detalhada(xml_content, nsu, informante):
             logger.info(f"🔄 NFS-e {numero}: Informante é INTERMEDIÁRIO")
             
         else:
-            # Não identificou - usa prestador como emitente (padrão NFS-e)
-            cnpj_emit = cnpj_prestador_xml or informante
+            # ⚠️ Não foi possível identificar o papel do informante no XML.
+            # USA o prestador do XML como emitente (NÃO usa informante como fallback),
+            # para evitar que NFS-e recebidas apareçam nos "Emitidos" da empresa errada.
+            # Se cnpj_prestador_xml for vazio, cnpj_emitente ficará vazio (melhor que incorreto).
+            cnpj_emit = cnpj_prestador_xml or ''
             cnpj_dest = cnpj_tomador_xml or ''
             nome_emitente = nome_emit or ''
             nome_destinatario = nome_dest or ''
-            logger.warning(f"⚠️ NFS-e {numero}: Informante ({informante_normalizado}) não é prestador ({prestador_normalizado or 'N/A'}) nem tomador ({tomador_normalizado or 'N/A'})")
+            logger.warning(
+                f"⚠️ NFS-e {numero}: Informante ({informante_normalizado}) não identificado como "
+                f"prestador ({prestador_normalizado or 'N/A'}) nem tomador ({tomador_normalizado or 'N/A'}). "
+                f"cnpj_emitente definido como: '{cnpj_emit or '(vazio)'}'"
+            )
         
-        # Extrai data de processamento (<dhProc>)
-        data_emissao = tree.findtext('.//nfse:dhProc', namespaces=ns)
-        if not data_emissao:
-            data_emissao = tree.findtext('.//dhProc')
+        # Extrai data de EMISSÃO (dhEmi/dCompet em DPS/infDPS) — NÃO usar dhProc!
+        # dhProc = data em que a SEFAZ processou; pode ser a data de re-download (errado para pasta)
+        # dhEmi / dCompet = data real da emissão do serviço (correto para organização em pastas)
+        data_emissao = (
+            tree.findtext('.//nfse:DPS/nfse:infDPS/nfse:dhEmi', namespaces=ns) or
+            tree.findtext('.//DPS/infDPS/dhEmi') or
+            tree.findtext('.//nfse:DPS/nfse:infDPS/nfse:dCompet', namespaces=ns) or
+            tree.findtext('.//DPS/infDPS/dCompet') or
+            tree.findtext('.//nfse:dhEmi', namespaces=ns) or
+            tree.findtext('.//dhEmi') or
+            tree.findtext('.//nfse:DataEmissao', namespaces=ns) or
+            tree.findtext('.//DataEmissao') or
+            # dhProc = fallback de último recurso (data de autorização, não de emissão)
+            tree.findtext('.//nfse:dhProc', namespaces=ns) or
+            tree.findtext('.//dhProc')
+        )
         if data_emissao and 'T' in data_emissao:
             data_emissao = data_emissao.split('T')[0]  # Pega apenas a data
         
@@ -4160,14 +4712,62 @@ def salvar_nfse_detalhada(xml_content, nsu, informante):
         xml_path_absolute = None
         try:
             import os
-            # 🔧 CORREÇÃO v1.1.5: Salva na estrutura organizada xmls/{INFORMANTE}/NFS-e/{ANO-MES}/
-            # Essa estrutura é consistente com NFe e CTe, facilitando a busca
             
-            # Extrai ano-mês da data de emissão
-            year_month = data_emissao[:7] if data_emissao and len(data_emissao) >= 7 else datetime.now().strftime("%Y-%m")
+            # 🔧 v1.1.28: Aplica perfil de armazenamento configurado (formato_mes e organizacao_tipo)
+            # Lê configuração do banco
+            try:
+                formato_mes = db.get_config('storage_formato_mes', 'AAAA-MM')
+                organizacao_tipo = db.get_config('storage_organizacao_tipo', 'CERTIFICADO_TIPO')
+                logger.debug(f"[NFSE-SALVAR] Perfil: {organizacao_tipo}, Formato: {formato_mes}")
+            except Exception as e_config:
+                formato_mes = 'AAAA-MM'
+                organizacao_tipo = 'CERTIFICADO_TIPO'
+                logger.warning(f"[NFSE-SALVAR] Erro ao ler configuração: {e_config}, usando padrão")
             
-            # Define pasta principal: xmls/{INFORMANTE}/NFS-e/{ANO-MES}/
-            xml_dir = base_dir / "xmls" / informante / "NFS-e" / year_month
+            # Extrai ano e mês da data de emissão
+            if data_emissao and len(data_emissao) >= 7:
+                ano = data_emissao[:4]
+                mes = data_emissao[5:7]
+            else:
+                now = datetime.now()
+                ano = str(now.year)
+                mes = f"{now.month:02d}"
+            
+            # Aplica formato configurado
+            if formato_mes == 'MM-AAAA':
+                ano_mes = f"{mes}-{ano}"
+            elif formato_mes == 'MMAAAA':
+                ano_mes = f"{mes}{ano}"
+            elif formato_mes == 'AAAA/MM':
+                ano_mes = f"{ano}/{mes}"
+            elif formato_mes == 'MM/AAAA':
+                ano_mes = f"{mes}/{ano}"
+            else:  # AAAA-MM (padrão)
+                ano_mes = f"{ano}-{mes}"
+            
+            logger.debug(f"[NFSE-SALVAR] Data: {ano}-{mes}, Formatado: {ano_mes}")
+            
+            # Define estrutura de pastas baseado no perfil ativo
+            tipo_base = "NFSE"  # Tipo base para NFS-e
+            pasta_base = str(base_dir / "xmls")
+            pasta_certificado = informante  # CNPJ do informante
+            
+            # Aplica lógica de organização
+            if organizacao_tipo == 'TIPO_CERTIFICADO':
+                # 🎨 PERFIL: TIPO → CERTIFICADO → DATA
+                xml_dir = base_dir / "xmls" / tipo_base / pasta_certificado / ano_mes
+                logger.debug(f"[NFSE-SALVAR] Estrutura TIPO_CERTIFICADO: {tipo_base}/{pasta_certificado}/{ano_mes}/")
+            
+            elif organizacao_tipo == 'CERTIFICADO_TIPO_DATA':
+                # 🎨 PERFIL: CERTIFICADO → TIPO → DATA (novo v1.1.28)
+                xml_dir = base_dir / "xmls" / pasta_certificado / tipo_base / ano_mes
+                logger.debug(f"[NFSE-SALVAR] Estrutura CERTIFICADO_TIPO_DATA: {pasta_certificado}/{tipo_base}/{ano_mes}/")
+            
+            else:  # CERTIFICADO_TIPO (padrão)
+                # 🎨 PERFIL: CERTIFICADO → DATA → TIPO
+                xml_dir = base_dir / "xmls" / pasta_certificado / ano_mes / tipo_base
+                logger.debug(f"[NFSE-SALVAR] Estrutura CERTIFICADO_TIPO: {pasta_certificado}/{ano_mes}/{tipo_base}/")
+            
             xml_dir.mkdir(parents=True, exist_ok=True)
             
             # Nome do arquivo: NFSe_{NUMERO}.xml (padrão usado na busca)
@@ -4197,35 +4797,45 @@ def salvar_nfse_detalhada(xml_content, nsu, informante):
             logger.error(f"❌ Erro ao salvar XML NFS-e {numero} no disco: {e}")
         
         # 🆕 v1.1.8: Extrai IBS e CBS (Reforma Tributária)
-        # Estrutura NFS-e: <IBSCBS><gIBSCBS><vIBS> e <gCBS><vCBS>
+        # Estrutura NFS-e real: <IBSCBS><totCIBS><gIBS><vIBSTot> e <gCBS><vCBS>
         v_ibs = ''
         v_cbs = ''
         
         try:
-            # Busca bloco IBSCBS (com e sem namespace)
-            ibs_cbs_bloco = tree.find('.//nfse:IBSCBS/nfse:gIBSCBS', namespaces=ns)
-            if not ibs_cbs_bloco:
-                ibs_cbs_bloco = tree.find('.//IBSCBS/gIBSCBS')
-            
-            if ibs_cbs_bloco is not None:
-                # Extrai vIBS
-                v_ibs = ibs_cbs_bloco.findtext('nfse:vIBS', namespaces=ns)
-                if not v_ibs:
-                    v_ibs = ibs_cbs_bloco.findtext('vIBS')
-                
-                # Extrai vCBS (está dentro de <gCBS>)
-                g_cbs = ibs_cbs_bloco.find('nfse:gCBS', namespaces=ns)
-                if not g_cbs:
-                    g_cbs = ibs_cbs_bloco.find('gCBS')
-                
+            # Caminho correto: IBSCBS > totCIBS > gIBS/gCBS
+            tot_cibs = (
+                tree.find('.//nfse:IBSCBS/nfse:totCIBS', namespaces=ns) or
+                tree.find('.//IBSCBS/totCIBS')
+            )
+
+            if tot_cibs is not None:
+                # IBS total: <gIBS><vIBSTot>
+                g_ibs = (
+                    tot_cibs.find('nfse:gIBS', namespaces=ns) or
+                    tot_cibs.find('gIBS')
+                )
+                if g_ibs is not None:
+                    v_ibs = (
+                        g_ibs.findtext('nfse:vIBSTot', namespaces=ns) or
+                        g_ibs.findtext('vIBSTot') or ''
+                    )
+
+                # CBS total: <gCBS><vCBS>
+                g_cbs = (
+                    tot_cibs.find('nfse:gCBS', namespaces=ns) or
+                    tot_cibs.find('gCBS')
+                )
                 if g_cbs is not None:
-                    v_cbs = g_cbs.findtext('nfse:vCBS', namespaces=ns)
-                    if not v_cbs:
-                        v_cbs = g_cbs.findtext('vCBS')
-                
-                if v_ibs or v_cbs:
-                    logger.debug(f"💰 NFS-e {numero} - IBS: {v_ibs or '0.00'}, CBS: {v_cbs or '0.00'}")
-        
+                    v_cbs = (
+                        g_cbs.findtext('nfse:vCBS', namespaces=ns) or
+                        g_cbs.findtext('vCBS') or ''
+                    )
+
+            if v_ibs or v_cbs:
+                logger.debug(f"💰 NFS-e {numero} - IBS: {v_ibs or '0.00'}, CBS: {v_cbs or '0.00'}")
+            else:
+                logger.debug(f"ℹ️  NFS-e {numero} - Sem IBS/CBS no XML (versão anterior à Reforma Tributária)")
+
         except Exception as e_ibs:
             logger.debug(f"⚠️ Erro ao extrair IBS/CBS da NFS-e {numero}: {e_ibs}")
             v_ibs = ''
@@ -4264,6 +4874,11 @@ def salvar_nfse_detalhada(xml_content, nsu, informante):
         # Salva no banco (agora com caminho do XML registrado)
         db.criar_tabela_detalhada()
         db.salvar_nota_detalhada(nota_nfse)
+        
+        # 🔄 ATUALIZAÇÃO INTERFACE: Notifica interface sobre nova nota
+        if hasattr(db, '_callback_nova_nota') and callable(db._callback_nova_nota):
+            db._callback_nova_nota(nota_nfse)
+        
         logger.debug(f"✅ NFS-e {numero} salva em notas_detalhadas com caminho: {xml_path_absolute}")
         
         return True
@@ -4271,6 +4886,78 @@ def salvar_nfse_detalhada(xml_content, nsu, informante):
     except Exception as e:
         logger.error(f"❌ Erro ao salvar NFS-e detalhada: {e}")
         return False
+
+
+def _processar_cancelamento_nfse(xml_content, nsu, informante, db):
+    """
+    Processa um evento de cancelamento de NFS-e:
+    - Identifica a NFS-e cancelada pelo número/chave
+    - Atualiza status para 'Cancelamento homologado' no banco
+    - Remove registros fantasma criados por processamentos anteriores
+      (ex.: cancelamentos salvos erroneamente como NFS-e com valor 0)
+    """
+    try:
+        from lxml import etree
+        ns = {'nfse': 'http://www.sped.fazenda.gov.br/nfse'}
+        tree = etree.fromstring(xml_content.encode('utf-8') if isinstance(xml_content, str) else xml_content)
+
+        # Extrai número e/ou chave da NFS-e sendo cancelada
+        numero = (
+            tree.findtext('.//nfse:nNFSe', namespaces=ns) or
+            tree.findtext('.//nNFSe')
+        )
+        chave = (
+            tree.findtext('.//nfse:chNFSe', namespaces=ns) or
+            tree.findtext('.//chNFSe') or
+            tree.findtext('.//nfse:cChaveNFSe', namespaces=ns) or
+            tree.findtext('.//cChaveNFSe')
+        )
+
+        if not numero and not chave:
+            logger.warning(f"⚠️ Cancelamento NFS-e NSU={nsu}: sem número/chave identificável — ignorado")
+            return
+
+        updated = 0
+        with db._connect() as conn:
+            # 1) Atualiza por chave (mais preciso)
+            if chave:
+                updated += conn.execute(
+                    "UPDATE notas_detalhadas SET status='Cancelamento homologado' "
+                    "WHERE chave=? AND UPPER(REPLACE(REPLACE(tipo,'-',''),'_','')) LIKE '%NFS%'",
+                    (chave,)
+                ).rowcount
+
+            # 2) Atualiza por número + informante (fallback)
+            if not updated and numero:
+                updated += conn.execute(
+                    "UPDATE notas_detalhadas SET status='Cancelamento homologado' "
+                    "WHERE CAST(numero AS TEXT)=? AND informante=? "
+                    "AND UPPER(REPLACE(REPLACE(tipo,'-',''),'_','')) LIKE '%NFS%'",
+                    (numero, informante)
+                ).rowcount
+
+            # 3) Remove registros fantasma: cancelamentos salvos como NFS-e com
+            #    número igual ao NSU (formato 000000000000XXX), valor 0, sem CNPJ
+            #    — gerados por versões anteriores que não filtravam por tipo_doc
+            nsu_padded = str(nsu).zfill(15)
+            conn.execute(
+                "DELETE FROM notas_detalhadas "
+                "WHERE numero=? AND (valor IS NULL OR valor='0.00' OR valor='0') "
+                "AND (cnpj_emitente IS NULL OR cnpj_emitente='') "
+                "AND UPPER(REPLACE(REPLACE(tipo,'-',''),'_','')) LIKE '%NFS%'",
+                (nsu_padded,)
+            )
+
+        if updated:
+            logger.info(f"❌ NFS-e {numero or chave} marcada como 'Cancelamento homologado' (NSU={nsu})")
+        else:
+            logger.warning(
+                f"⚠️ Cancelamento NFS-e NSU={nsu}: registro não encontrado no banco "
+                f"(número={numero}, chave={chave}) — será atualizado quando a nota for baixada"
+            )
+
+    except Exception as e:
+        logger.error(f"❌ Erro ao processar cancelamento NFS-e NSU={nsu}: {e}")
 
 
 def processar_nfse(cert_data, db):
@@ -4284,7 +4971,12 @@ def processar_nfse(cert_data, db):
     
     try:
         # Inicializa serviço NFS-e
-        nfse_svc = NFSeService(path, senha, cnpj, cuf, ambiente='producao')
+        try:
+            nfse_svc = NFSeService(path, senha, cnpj, cuf, ambiente='producao')
+        except (FileNotFoundError, ValueError) as e:
+            logger.error(f"❌ [{cnpj}] NFS-e: Certificado inválido ou excluído: {e}")
+            logger.warning(f"   ⏭️ Pulando NFS-e para {cnpj}")
+            return
         logger.info(f"📋 Iniciando busca de NFS-e para {inf}")
         
         # Obtém último NSU NFS-e processado
@@ -4311,8 +5003,26 @@ def processar_nfse(cert_data, db):
             logger.info(f"   📊 NSU solicitado: {ult_nsu_nfse}")
             logger.info(f"   🔐 Certificado: {path}")
             
-            resp_nfse = nfse_svc.consultar_nsu(ult_nsu_nfse)
-            
+            # Tenta com 2 tentativas rápidas antes de abandonar o loop
+            resp_nfse = None
+            for _tentativa_nsu in range(2):
+                try:
+                    resp_nfse = nfse_svc.consultar_nsu(ult_nsu_nfse)
+                    break
+                except Exception as _e_nsu:
+                    import requests as _req
+                    if isinstance(_e_nsu, (_req.exceptions.Timeout, _req.exceptions.ConnectionError)):
+                        logger.warning(f"⏱️ [{inf}] NFS-e timeout/erro na tentativa {_tentativa_nsu+1}/2: {_e_nsu}")
+                        if _tentativa_nsu < 1:
+                            import time as _time
+                            _time.sleep(3)
+                            continue
+                        else:
+                            logger.error(f"❌ [{inf}] NFS-e: 2 tentativas esgotadas, abortando loop")
+                            break
+                    else:
+                        raise
+
             if not resp_nfse:
                 logger.info(f"✅ [{inf}] NFS-e: Sem resposta (fim da fila)")
                 break
@@ -4340,18 +5050,28 @@ def processar_nfse(cert_data, db):
             for nsu, xml_nfse, tipo_doc in nfse_svc.extrair_documentos(resp_nfse):
                 doc_count += 1
                 logger.info(f"📄 [{inf}] NFS-e: Processando doc {doc_count}, NSU={nsu}, tipo={tipo_doc}")
-                
+
                 # Valida XML
                 if not nfse_svc.validar_xml(xml_nfse):
                     logger.warning(f"⚠️ [{inf}] NFS-e inválida, NSU={nsu}")
                     continue
-                
-                # 🆕 USA salvar_nfse_detalhada() - Função especializada em NFS-e
-                # Esta função faz:
-                # 1. Parse correto do XML NFS-e (namespace SPED)
-                # 2. Extração de número, emitente, valor, etc.
-                # 3. Salvamento no banco (notas_detalhadas)
-                # 4. Salvamento do XML em disco (xml_extraidos/NFSe_{NUMERO}.xml)
+
+                # Roteia por tipo de documento
+                if tipo_doc == 'Cancelamento':
+                    # Atualiza status da NFS-e original; NÃO cria novo registro
+                    try:
+                        _processar_cancelamento_nfse(xml_nfse, nsu, inf, db)
+                        docs_processados += 1
+                    except Exception as e:
+                        logger.error(f"❌ [{inf}] Erro ao processar cancelamento NFS-e NSU={nsu}: {e}")
+                    continue
+
+                if tipo_doc not in ('NFS-e', 'NFS-E'):
+                    # Substituição, Desconhecido, Outros — apenas registra no log
+                    logger.info(f"ℹ️ [{inf}] NFS-e: tipo '{tipo_doc}' não processado (NSU={nsu})")
+                    continue
+
+                # NFS-e regular: salva/atualiza no banco e disco
                 try:
                     salvar_nfse_detalhada(xml_nfse, nsu, inf)
                     logger.info(f"✅ [{inf}] NFS-e processada com sucesso, NSU={nsu}")
@@ -4383,6 +5103,216 @@ def processar_nfse(cert_data, db):
     except Exception as e:
         logger.error(f"❌ [{inf}] ERRO CRÍTICO ao processar NFS-e: {e}")
         logger.exception(f"Erro ao processar NFS-e para {inf}: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Busca NFS-e via SOAP Municipal (padrão ABRASF / DominioWeb / Ginfes)
+# ---------------------------------------------------------------------------
+
+def _salvar_nfse_abrasf(xml_nota, informante, numero, db):
+    """
+    Persiste uma nota ABRASF (CompNfse / InfNfse) nas tabelas
+    notas_detalhadas e em disco (xmls/{informante}/MMAAAA/NFSE/).
+    Retorna True se nova, False se já existia (chave duplicada).
+    """
+    from lxml import etree as _et
+    from pathlib import Path as _Path
+    from datetime import datetime as _dt
+    import re as _re, sqlite3 as _sq
+
+    ns_ab = {'ab': 'http:/www.abrasf.org.br/nfse.xsd'}
+
+    def _tx(el, *tags):
+        for tag in tags:
+            e = el.find(f'ab:{tag}', ns_ab) or el.find(tag)
+            if e is not None and e.text:
+                return e.text.strip()
+        return ''
+
+    def _ex(el, tag):
+        e = el.find(f'ab:{tag}', ns_ab)
+        if e is None:
+            e = el.find(tag)
+        return e if e is not None else _et.Element('_')
+
+    # --- localiza InfNfse ---
+    if isinstance(xml_nota, str):
+        xml_nota = xml_nota.encode('utf-8')
+    tree = _et.fromstring(xml_nota)
+    inf_el = tree.find('.//ab:InfNfse', ns_ab) or tree.find('.//InfNfse')
+    if inf_el is None:
+        logger.warning(f"[ABRASF] InfNfse não encontrado no XML do número {numero}")
+        return False
+
+    prest    = _ex(inf_el, 'PrestadorServico')
+    id_prest = _ex(prest, 'IdentificacaoPrestador')
+    prest_cnpj = _tx(id_prest, 'Cnpj')
+    prest_nome = _tx(prest, 'RazaoSocial', 'NomeFantasia')
+    end_prest  = _ex(prest, 'Endereco')
+    uf         = _tx(end_prest, 'Uf', 'UF')
+
+    toma     = _ex(inf_el, 'TomadorServico')
+    id_toma  = _ex(toma, 'IdentificacaoTomador')
+    cpfcnpj  = _ex(id_toma, 'CpfCnpj')
+    toma_cnpj = _tx(cpfcnpj, 'Cnpj') or _tx(cpfcnpj, 'Cpf')
+    toma_nome  = _tx(toma, 'RazaoSocial', 'NomeFantasia')
+
+    serv  = _ex(inf_el, 'Servico')
+    vals  = _ex(serv, 'Valores')
+    valor_str = _tx(vals, 'ValorServicos') or '0'
+    data_emissao = (_tx(inf_el, 'DataEmissao') or '')[:10]
+    codigo_mun   = _tx(end_prest, 'CodigoMunicipio')
+
+    # --- chave ---
+    inf_id = inf_el.get('Id', '')
+    if inf_id and inf_id.startswith('NFS'):
+        chave = inf_id[3:]
+    elif prest_cnpj and numero:
+        chave = f"{_re.sub(r'\\D','',prest_cnpj)}_{str(numero).zfill(15)}"
+    else:
+        chave = inf_id or f"ABRASF_{informante}_{numero}"
+
+    # --- checa duplicata ---
+    db_path = str(get_data_dir() / "notas.db")
+    with _sq.connect(db_path) as _conn:
+        exists = _conn.execute(
+            "SELECT 1 FROM notas_detalhadas WHERE chave=?", (chave,)
+        ).fetchone()
+    if exists:
+        logger.debug(f"[ABRASF] NFS-e {numero} já existe (chave={chave[:20]}…)")
+        return False
+
+    # --- salva XML em disco ---
+    informante_norm = _re.sub(r'\D', '', informante)
+    year_month = data_emissao[:7].replace('-', '') if len(data_emissao) >= 7 else _dt.now().strftime('%m%Y')
+    pasta_nfse = get_data_dir() / "xmls" / informante_norm / year_month[:4] + year_month[4:] / "NFSE"
+    # Formata corretamente: MMAAAA → pasta 042026
+    mm   = data_emissao[5:7] if len(data_emissao) >= 7 else _dt.now().strftime('%m')
+    aaaa = data_emissao[:4]  if len(data_emissao) >= 4 else _dt.now().strftime('%Y')
+    pasta_nfse = get_data_dir() / "xmls" / informante_norm / f"{mm}{aaaa}" / "NFSE"
+    pasta_nfse.mkdir(parents=True, exist_ok=True)
+    xml_file = pasta_nfse / f"NFSe_{numero}.xml"
+    xml_file.write_bytes(xml_nota if isinstance(xml_nota, bytes) else xml_nota.encode('utf-8'))
+    logger.info(f"[ABRASF] XML salvo: {xml_file}")
+
+    # --- persiste no banco ---
+    informante_cnpj = _re.sub(r'\\D', '', informante)
+    if informante_cnpj == _re.sub(r'\\D', '', prest_cnpj or ''):
+        cnpj_emitente = prest_cnpj
+        cnpj_dest     = toma_cnpj or ''
+        nome_emitente = prest_nome
+        nome_dest     = toma_nome or ''
+    else:
+        cnpj_emitente = prest_cnpj
+        cnpj_dest     = toma_cnpj or ''
+        nome_emitente = prest_nome
+        nome_dest     = toma_nome or ''
+
+    nota = {
+        'chave':             chave,
+        'tipo':              'NFS-e',
+        'xml_status':        'COMPLETO',
+        'informante':        informante_norm,
+        'cnpj_emitente':     _re.sub(r'\D', '', cnpj_emitente or ''),
+        'nome_emitente':     nome_emitente or '',
+        'cnpj_destinatario': _re.sub(r'\D', '', cnpj_dest or ''),
+        'nome_destinatario': nome_dest or '',
+        'numero':            str(numero),
+        'data_emissao':      data_emissao,
+        'valor':             valor_str,
+        'uf':                uf or '',
+        'caminho_xml':       str(xml_file),
+        'status':            'Autorizado',
+    }
+    db.save_note(nota)
+    logger.info(f"[ABRASF] ✅ NFS-e {numero} salva (chave={chave[:20]}…)")
+    return True
+
+
+def processar_nfse_abrasf(cert_data, db):
+    """
+    Busca NFS-e no WebService SOAP municipal (padrão ABRASF / Ginfes / DominioWeb).
+    Acionado para cada certificado que tenha provedores ABRASF configurados em nfse_config.
+    Complementa processar_nfse() que só cobre o Padrão Nacional ADN.
+    """
+    cnpj, path, senha, inf, cuf = cert_data
+
+    try:
+        # Busca configurações ABRASF para este CNPJ
+        db_path = str(get_data_dir() / "notas.db")
+        import sqlite3 as _sq
+        with _sq.connect(db_path) as _conn:
+            rows = _conn.execute(
+                """SELECT provedor, codigo_municipio, inscricao_municipal, url_customizada
+                   FROM nfse_config
+                   WHERE cnpj_cpf = ? AND ativo = 1
+                     AND provedor NOT IN ('ADN', 'NACIONAL', 'NUVEMFISCAL')""",
+                (cnpj,)
+            ).fetchall()
+
+        if not rows:
+            logger.debug(f"[ABRASF] {cnpj}: sem provedores ABRASF configurados — pulando")
+            return
+
+        logger.info(f"[ABRASF] {cnpj}: {len(rows)} provedor(es) ABRASF configurado(s)")
+
+        # Importa serviço ABRASF do nfse_search.py
+        try:
+            from nfse_search import NFSeService as _NFSeService
+        except ImportError:
+            logger.error("[ABRASF] nfse_search.py não encontrado — busca ABRASF ignorada")
+            return
+
+        try:
+            svc = _NFSeService(path, senha, cnpj)
+        except Exception as e:
+            logger.error(f"[ABRASF] Erro ao criar NFSeService para {cnpj}: {e}")
+            return
+
+        from datetime import datetime as _dt, timedelta as _td
+        hoje       = _dt.now()
+        data_final = hoje.strftime('%d/%m/%Y')
+        # Janela de 31 dias — garante que não perde notas entre ciclos
+        data_ini   = (hoje - _td(days=31)).strftime('%d/%m/%Y')
+
+        total_novas = 0
+
+        for provedor, cod_mun, insc_mun, url_custom in rows:
+            logger.info(f"[ABRASF] Consultando {provedor} — município {cod_mun}...")
+
+            try:
+                resultado = svc.buscar_ginfes(cod_mun, insc_mun or '', data_ini, data_final)
+            except Exception as e:
+                logger.error(f"[ABRASF] Erro na consulta {provedor}/{cod_mun}: {e}")
+                continue
+
+            status = resultado.get('status', 'erro')
+            notas  = resultado.get('notas', [])
+
+            if status == 'erro':
+                logger.warning(f"[ABRASF] {provedor}/{cod_mun}: {resultado.get('mensagem','erro desconhecido')}")
+                continue
+
+            logger.info(f"[ABRASF] {provedor}/{cod_mun}: {len(notas)} nota(s) retornada(s)")
+
+            for nota in notas:
+                xml_str = nota.get('xml', '')
+                numero  = nota.get('numero', '')
+                if not xml_str or not numero:
+                    continue
+                try:
+                    nova = _salvar_nfse_abrasf(xml_str.encode('utf-8') if isinstance(xml_str, str) else xml_str,
+                                               inf, numero, db)
+                    if nova:
+                        total_novas += 1
+                except Exception as e:
+                    logger.error(f"[ABRASF] Erro ao salvar NFS-e {numero}: {e}")
+
+        logger.info(f"[ABRASF] {cnpj}: {total_novas} NFS-e nova(s) salva(s)")
+
+    except Exception as e:
+        logger.error(f"[ABRASF] ERRO CRÍTICO para {inf}: {e}")
+        logger.exception(e)
 
 
 def main():
@@ -4437,6 +5367,485 @@ def consultar_nfe_por_chave(chave: str, certificado_path: str, senha: str, cnpj:
         return None
 
 
+def baixar_resumos_pendentes(db):
+    """
+    Fase 1.5: Para cada NF-e com xml_status='RESUMO' no banco, envia
+    Ciência da Operação (se ainda não enviada) e baixa o XML completo via
+    Distribuição DFe (consChNFe).  Chamada uma vez por ciclo, após a Fase 1.
+    """
+    import time
+    try:
+        from modules.manifestacao_service import ManifestacaoService
+    except Exception as e:
+        logger.warning(f"⚠️ [RESUMO] ManifestacaoService indisponível: {e} — fase 1.5 ignorada")
+        return
+
+    # Consulta RESUMOs pendentes
+    try:
+        with db._connect() as conn:
+            rows = conn.execute(
+                "SELECT chave, informante FROM notas_detalhadas "
+                "WHERE xml_status='RESUMO' AND tipo IN ('NFe', 'NF-e') "
+                "ORDER BY data_emissao DESC"
+            ).fetchall()
+    except Exception as e:
+        logger.error(f"❌ [RESUMO] Erro ao consultar RESUMOs pendentes: {e}")
+        return
+
+    if not rows:
+        logger.info("✅ [RESUMO] Nenhum RESUMO pendente para processar")
+        return
+
+    logger.info(f"📋 [RESUMO] {len(rows)} NF-e(s) com xml_status=RESUMO — iniciando download automático")
+
+    # Rastreia certificados que atingiram rate-limit (656) neste ciclo.
+    # Chave: cnpj_cert (str). Valor: True = bloqueado.
+    # Quando um cert é bloqueado, todas as notas desse cert são puladas ==
+    # sem novos requests, sem novos WSDLs, sem spammar a SEFAZ.
+    _certs_656: set = set()
+
+    # Cache de NFeService por cnpj_cert para reusar cliente WSDL entre notas.
+    # Evita re-baixar os dois WSDLs (~400 ms) para cada nota individualmente.
+    _svc_cache: dict = {}
+
+    for chave, informante in rows:
+        # Aceita apenas NF-e modelo 55 (posições 20-21 da chave)
+        if len(chave) != 44:
+            logger.debug(f"⏭️ [RESUMO] Chave inválida ({len(chave)} dígitos): {chave}")
+            continue
+        if chave[20:22] != '55':
+            logger.debug(f"⏭️ [RESUMO] Modelo {chave[20:22]} != 55, ignorando {chave}")
+            continue
+
+        # Obtém certificado para este informante
+        cert = db.find_cert_by_cnpj(informante)
+        if not cert:
+            logger.warning(f"⚠️ [RESUMO] Certificado não encontrado para informante {informante}, pulando {chave}")
+            continue
+
+        cnpj_cert, cert_path, cert_senha, inf, cuf = cert
+
+        # Pula todas as notas de um certificado já bloqueado por 656
+        if cnpj_cert in _certs_656:
+            logger.debug(f"⏭️ [RESUMO] Cert {cnpj_cert} bloqueado (656) — pulando {chave}")
+            continue
+
+        # ── Etapa 1: Ciência da Operação (tpEvento=210210) ──────────────────
+        ja_manifestado = db.check_manifestacao_exists(chave, '210210', informante)
+        if not ja_manifestado:
+            logger.info(f"📢 [RESUMO] Enviando Ciência da Operação para {chave}")
+            try:
+                svc_man = ManifestacaoService(cert_path, cert_senha)
+                sucesso, protocolo, msg, _ = svc_man.enviar_manifestacao(
+                    chave=chave,
+                    tipo_evento='210210',
+                    cnpj_destinatario=informante,
+                )
+                if sucesso:
+                    logger.info(f"✅ [RESUMO] Ciência registrada: protocolo={protocolo}")
+                    db.register_manifestacao(chave, '210210', informante,
+                                             status='ENVIADA', protocolo=protocolo)
+                    time.sleep(3)  # Aguarda SEFAZ processar antes de baixar
+                else:
+                    logger.warning(f"⚠️ [RESUMO] Ciência rejeitada: {msg} — tentando download mesmo assim")
+                    # cStat 596 = prazo de 10 dias esgotado: Ciência nunca mais será aceita,
+                    # mas o XML está disponível livremente na Distribuição DFe após 10 dias.
+                    # Persiste no banco para não tentar Ciência novamente nos próximos ciclos.
+                    if '596' in str(msg):
+                        try:
+                            db.register_manifestacao(
+                                chave, '210210', informante,
+                                status='DISPENSADA_596', protocolo=''
+                            )
+                            logger.info(f"📋 [RESUMO] 596 registrado — Ciência não será reenviada nos próximos ciclos")
+                        except Exception:
+                            pass  # UNIQUE constraint já satisfeita, sem problema
+            except Exception as e:
+                logger.error(f"❌ [RESUMO] Erro ao enviar Ciência para {chave}: {e}")
+                # Prossegue mesmo com falha na manifestação
+        else:
+            logger.debug(f"✅ [RESUMO] Ciência já registrada anteriormente para {chave}")
+
+        # ── Etapa 2: Download do XML completo via Distribuição DFe ──────────
+        # Reutiliza NFeService já inicializado para este certificado (evita re-download de WSDL)
+        if cnpj_cert not in _svc_cache:
+            try:
+                _svc_cache[cnpj_cert] = NFeService(cert_path, cert_senha, cnpj_cert, cuf)
+            except Exception as e:
+                logger.error(f"❌ [RESUMO] Não foi possível inicializar NFeService para {chave}: {e}")
+                continue
+        svc_nfe = _svc_cache[cnpj_cert]
+
+        logger.info(f"⬇️  [RESUMO] Baixando XML completo: {chave}")
+        try:
+            xml_completo = svc_nfe.fetch_by_chave_dist(chave)
+        except Exception as e:
+            logger.error(f"❌ [RESUMO] Erro em fetch_by_chave_dist para {chave}: {e}")
+            continue
+
+        if not xml_completo:
+            logger.warning(f"⚠️ [RESUMO] Sem XML retornado para {chave} — será tentado no próximo ciclo")
+            continue
+
+        # Verifica cStat da resposta SEFAZ antes de processar
+        # Se for erro (ex: 656=rate limit, 137=não localizado) não marca como COMPLETO
+        _cstat_resp = ''
+        try:
+            import re as _re
+            _m = _re.search(r'<cStat>(\d+)</cStat>', xml_completo)
+            _cstat_resp = _m.group(1) if _m else ''
+        except Exception:
+            pass
+
+        if _cstat_resp == '656':
+            logger.warning(
+                f"⚠️ [RESUMO] Rate limit SEFAZ (656) para cert {cnpj_cert} — "
+                f"bloqueando certificado para o resto deste ciclo"
+            )
+            _certs_656.add(cnpj_cert)
+            continue
+        if _cstat_resp == '137':
+            logger.warning(f"⚠️ [RESUMO] Documento não localizado na distribuição (137) para {chave} — pode não ser destinatário")
+            continue
+        # Rejeições da DistribuiçãoDFe — 632=fora do prazo  633=inexistente  634=inutilizada
+        # 653=NF-e cancelada, arquivo indisponível (não recuperável via NFeConsultaProtocolo4 —
+        #      retorna apenas protNFe sem infNFe; vai direto para INDISPONIVEL).
+        # Para cStat 632: a NF-e pode ainda existir no NFeConsultaProtocolo4 (sem limite de 60 dias).
+        # Tentamos fetch_prot_nfe antes de desistir e marcar como INDISPONIVEL.
+        if _cstat_resp in ('632', '633', '634', '653'):
+            _xmotivo_str = ''
+            try:
+                _m2 = __import__('re').search(r'<xMotivo>([^<]+)</xMotivo>', xml_completo)
+                _xmotivo_str = _m2.group(1) if _m2 else ''
+            except Exception:
+                pass
+
+            xml_via_prot = None
+            if _cstat_resp == '632':
+                logger.info(f"🔄 [RESUMO] cStat 632 — tentando NFeConsultaProtocolo4 para {chave}")
+                try:
+                    xml_via_prot_resp = svc_nfe.fetch_prot_nfe(chave)
+                    if xml_via_prot_resp and ('<nfeProc' in xml_via_prot_resp or '<procNFe' in xml_via_prot_resp):
+                        xml_via_prot = xml_via_prot_resp
+                        logger.info(f"✅ [RESUMO] XML obtido via NFeConsultaProtocolo4 (cStat 632 contornado)")
+                except Exception as _e_prot:
+                    logger.debug(f"[RESUMO] fetch_prot_nfe após 632 falhou: {_e_prot}")
+
+            if xml_via_prot:
+                # Sucesso — continua processamento como COMPLETO
+                xml_completo = xml_via_prot
+                # Pula direto para a etapa 3 (reatribui xml_completo e cai no fluxo normal abaixo)
+            else:
+                logger.warning(
+                    f"🚫 [RESUMO] Rejeição permanente cStat={_cstat_resp} ({_xmotivo_str}) para {chave} "
+                    f"— marcando como INDISPONIVEL (não será tentado novamente)"
+                )
+                try:
+                    with db._connect() as _conn_ind:
+                        if _cstat_resp == '653':
+                            # 653 = "NF-e Cancelada, arquivo indisponível" — confirma cancelamento
+                            _conn_ind.execute(
+                                "UPDATE notas_detalhadas SET xml_status='INDISPONIVEL', status='Cancelamento homologado' WHERE chave=?",
+                                (chave,)
+                            )
+                            logger.info(f"❌ [RESUMO] cStat 653 — nota {chave[:10]}… marcada como Cancelamento homologado")
+                        else:
+                            _conn_ind.execute(
+                                "UPDATE notas_detalhadas SET xml_status='INDISPONIVEL' WHERE chave=?",
+                                (chave,)
+                            )
+                except Exception as _e_ind:
+                    logger.warning(f"⚠️ [RESUMO] Erro ao marcar INDISPONIVEL: {_e_ind}")
+                continue
+
+        # ── Etapa 3: Processar e salvar como COMPLETO ───────────────────────
+        try:
+            _parser = XMLProcessor(informante=informante)
+            nome_cert = db.get_cert_nome_by_informante(inf)
+
+            # ── Descompacta envelope: extrai XML da NF-e e NSU do docZip ────
+            # fetch_by_chave_dist retorna o envelope retDistDFeInt completo da
+            # SEFAZ (com <docZip NSU="...">base64+gzip do XML real</docZip>).
+            # É preciso chamar extract_docs() para obter o XML da NF-e e o NSU.
+            nsu_resumo = ''
+            xml_nfe = None
+            try:
+                docs = _parser.extract_docs(xml_completo)
+                if docs:
+                    nsu_resumo, xml_nfe = docs[0]
+                    logger.info(f"✅ [RESUMO] NSU extraído do docZip: {nsu_resumo}")
+                else:
+                    logger.warning(f"⚠️ [RESUMO] extract_docs vazio para {chave} — resposta SEFAZ sem docZip (cStat={_cstat_resp or '?'})")
+            except Exception as e_ext:
+                logger.warning(f"⚠️ [RESUMO] Falha ao extrair docZip: {e_ext} — tentando fallback")
+
+            # Fallback: só usa a resposta bruta se contiver XML real de NF-e
+            # NUNCA usar envelopes de erro (656, 137, etc.) como fallback
+            if not xml_nfe:
+                if any(tag in xml_completo for tag in ('<nfeProc', '<NFe ', '<procNFe', '<NFeProc')):
+                    xml_nfe = xml_completo
+                    logger.info(f"✅ [RESUMO] Usando resposta bruta como fallback (contém NF-e válida)")
+                else:
+                    logger.warning(
+                        f"⚠️ [RESUMO] Resposta SEFAZ sem NF-e válida para {chave} "
+                        f"(cStat={_cstat_resp or '?'}) — tentando no próximo ciclo"
+                    )
+                    continue
+
+            # Se NSU ainda não veio, tenta recuperar do banco (nota salva anteriormente)
+            if not nsu_resumo:
+                try:
+                    with db._connect() as conn:
+                        row = conn.execute(
+                            "SELECT nsu FROM notas_detalhadas WHERE chave=?", (chave,)
+                        ).fetchone()
+                    if row and row[0]:
+                        nsu_resumo = str(row[0])
+                        logger.info(f"✅ [RESUMO] NSU recuperado do banco: {nsu_resumo}")
+                except Exception:
+                    pass
+
+            # Salva arquivo XML em disco (XML real da NF-e, não o envelope)
+            resultado = salvar_xml_por_certificado(
+                xml_nfe, informante,
+                pasta_base="xmls", nome_certificado=nome_cert
+            )
+
+            # Registra em xmls_baixados
+            if resultado:
+                caminho_xml = resultado[0] if isinstance(resultado, tuple) else resultado
+                try:
+                    with db._connect() as conn:
+                        conn.execute(
+                            "INSERT OR REPLACE INTO xmls_baixados "
+                            "(chave, caminho_arquivo, cnpj_cpf, baixado_em) VALUES (?, ?, ?, ?)",
+                            (chave, caminho_xml, informante, datetime.now().isoformat())
+                        )
+                except Exception as ex:
+                    logger.warning(f"⚠️ [RESUMO] Erro ao registrar em xmls_baixados: {ex}")
+
+                # Registra PDF se gerado
+                if isinstance(resultado, tuple) and len(resultado) >= 2 and resultado[1]:
+                    db.atualizar_pdf_path(chave, resultado[1])
+
+            # Extrai detalhes e grava como COMPLETO — passa NSU e XML real
+            nota = extrair_nfe_detalhado(xml_nfe, _parser, db, chave, informante, nsu_documento=nsu_resumo)
+            nota['informante'] = informante
+            nota['xml_status'] = 'COMPLETO'
+            db.salvar_nota_detalhada(nota)
+
+            # 2. Armazenamento externo (single-path legacy)
+            pasta_storage = db.get_config('storage_pasta_base', 'xmls')
+            if pasta_storage and pasta_storage != 'xmls':
+                salvar_xml_por_certificado(
+                    xml_nfe, informante,
+                    pasta_base=pasta_storage, nome_certificado=nome_cert
+                )
+
+            # 3. Todos os perfis ativos (DominioWeb etc.)
+            salvar_xml_por_certificado(
+                xml_nfe, informante,
+                pasta_base=None, nome_certificado=nome_cert
+            )
+
+            logger.info(
+                f"✅ [RESUMO] {chave} salvo como COMPLETO "
+                f"(nº {nota.get('numero', 'N/A')}, "
+                f"emitente: {nota.get('nome_emitente') or nota.get('cnpj_emitente', 'N/A')})"
+            )
+
+        except Exception as e:
+            logger.error(f"❌ [RESUMO] Erro ao processar XML completo de {chave}: {e}", exc_info=True)
+
+    logger.info("✅ [RESUMO] Fase 1.5 concluída")
+
+
+def baixar_ctes_pendentes(db):
+    """
+    Fase 1.6: Para cada CT-e com xml_status='RESUMO' no banco, baixa o XML
+    completo via CTeConsultaV4 (NFeService.fetch_prot_cte).
+    Primeiro verifica se o arquivo no disco já é um CT-e completo (corrige
+    registros onde o XML estava certo mas o status foi gravado errado).
+    Espelha baixar_resumos_pendentes mas para CT-e.
+    Chamada uma vez por ciclo, após a Fase 1.5.
+    """
+    import time
+    import re as _re
+    from pathlib import Path as _Path
+
+    # Consulta CT-e RESUMOs pendentes — inclui caminho do XML se disponível
+    try:
+        with db._connect() as conn:
+            rows = conn.execute(
+                "SELECT nd.chave, nd.informante, x.caminho_arquivo, nd.nsu "
+                "FROM notas_detalhadas nd "
+                "LEFT JOIN xmls_baixados x ON x.chave = nd.chave "
+                "WHERE nd.xml_status='RESUMO' AND nd.tipo='CTe' "
+                "ORDER BY nd.data_emissao DESC"
+            ).fetchall()
+    except Exception as e:
+        logger.error(f"❌ [CTE-RESUMO] Erro ao consultar CT-e RESUMOs pendentes: {e}")
+        return
+
+    if not rows:
+        logger.info("✅ [CTE-RESUMO] Nenhum CT-e RESUMO pendente para processar")
+        return
+
+    logger.info(f"📋 [CTE-RESUMO] {len(rows)} CT-e(s) com xml_status=RESUMO — iniciando download automático")
+
+    _certs_656: set = set()      # certs bloqueados por rate-limit neste ciclo
+    _svc_cache: dict = {}        # CTeService por cnpj_cert (reutiliza WSDL)
+
+    for chave, informante, caminho_xml_db, nsu_db in rows:
+        # Aceita apenas CT-e modelo 57 (posições 20-21 da chave)
+        if len(chave) != 44:
+            logger.debug(f"⏭️ [CTE-RESUMO] Chave inválida ({len(chave)} dígitos): {chave}")
+            continue
+        if chave[20:22] != '57':
+            logger.debug(f"⏭️ [CTE-RESUMO] Modelo {chave[20:22]} != 57, ignorando {chave}")
+            continue
+
+        # ── Atalho: arquivo já existe no disco com CT-e completo ────────────
+        # Corrige registros onde o XML estava correto mas o status foi gravado
+        # errado (procCTe → não estava em ['cteProc', 'CTe'] antes desta correção).
+        _tags_completo = ('<procCTe', '<cteProc', '<CTe ')
+        if caminho_xml_db and _Path(caminho_xml_db).is_file():
+            try:
+                _xml_disco = _Path(caminho_xml_db).read_text(encoding='utf-8', errors='replace')
+                if any(t in _xml_disco for t in _tags_completo):
+                    db.salvar_nota_detalhada({'chave': chave, 'xml_status': 'COMPLETO'})
+                    logger.info(f"✅ [CTE-RESUMO] {chave[:10]}… — arquivo em disco é completo, status corrigido para COMPLETO (sem rede)")
+                    continue
+            except Exception as _e_disco:
+                logger.debug(f"[CTE-RESUMO] Erro ao ler arquivo em disco {caminho_xml_db}: {_e_disco}")
+
+        # Obtém certificado para este informante
+        cert = db.find_cert_by_cnpj(informante)
+        if not cert:
+            logger.warning(f"⚠️ [CTE-RESUMO] Certificado não encontrado para informante {informante}, pulando {chave}")
+            continue
+
+        cnpj_cert, cert_path, cert_senha, inf, cuf = cert
+
+        if cnpj_cert in _certs_656:
+            logger.debug(f"⏭️ [CTE-RESUMO] Cert {cnpj_cert} bloqueado (656) — pulando {chave}")
+            continue
+
+        # ── Download do XML completo via CTeDistribuicaoDFe (consNSU) ───────
+        # CTeConsultaV4 (consSitCTe) retorna APENAS protCTe (status) na maioria
+        # dos estados — NÃO inclui o XML do CT-e no corpo da resposta.
+        # A única forma de obter o procCTe para um destinatário é via
+        # CTeDistribuicaoDFe com consNSU (usando o NSU atribuído ao CT-e).
+        if not nsu_db:
+            logger.warning(f"⚠️ [CTE-RESUMO] NSU não disponível para {chave} — aguardando próximo ciclo de distribuição")
+            continue
+
+        logger.info(f"⬇️  [CTE-RESUMO] Consultando CTeDistribuicaoDFe consNSU={nsu_db}: {chave}")
+        xml_cte_completo = None
+        try:
+            from modules.cte_service import CTeService
+            _cte_svc_key = f"{cnpj_cert}_{cuf}"
+            if _cte_svc_key not in _svc_cache:
+                _svc_cache[_cte_svc_key] = CTeService(cert_path, cert_senha, cnpj_cert, cuf)
+            cte_svc = _svc_cache[_cte_svc_key]
+            resp_xml = cte_svc.fetch_by_nsu(nsu_db)
+        except Exception as e:
+            logger.error(f"❌ [CTE-RESUMO] Erro ao inicializar/chamar CTeService para {chave}: {e}")
+            continue
+
+        if not resp_xml:
+            logger.warning(f"⚠️ [CTE-RESUMO] Sem resposta CTeDistribuicaoDFe para {chave}")
+            continue
+
+        # Verifica cStat da resposta
+        _cstat = ''
+        try:
+            _m = _re.search(r'<cStat>(\d+)</cStat>', resp_xml)
+            _cstat = _m.group(1) if _m else ''
+        except Exception:
+            pass
+
+        if _cstat == '656':
+            logger.warning(f"⚠️ [CTE-RESUMO] Rate limit SEFAZ (656) para cert {cnpj_cert}")
+            _certs_656.add(cnpj_cert)
+            continue
+        if _cstat in ('215', '137'):
+            logger.warning(f"⚠️ [CTE-RESUMO] CT-e não localizado ({_cstat}) para {chave} NSU={nsu_db}")
+            continue
+
+        # Extrai procCTe do docZip da resposta CTeDistribuicaoDFe
+        _tags_cte = ('<procCTe', '<cteProc', '<CTe ')
+        try:
+            for _nsu_r, _xml_doc, _schema in cte_svc.extrair_docs(resp_xml):
+                if any(t in _xml_doc for t in _tags_cte):
+                    xml_cte_completo = _xml_doc
+                    logger.info(f"✅ [CTE-RESUMO] procCTe extraído do docZip NSU={_nsu_r}")
+                    break
+                elif '<resCTe' in _xml_doc:
+                    logger.info(
+                        f"⏭️ [CTE-RESUMO] NSU={nsu_db} retornou resCTe — "
+                        f"procCTe ainda não distribuído para {chave[:10]}…"
+                    )
+                    break
+        except Exception as _ep:
+            logger.warning(f"⚠️ [CTE-RESUMO] extrair_docs falhou: {_ep}")
+
+        if not xml_cte_completo:
+            logger.warning(
+                f"⚠️ [CTE-RESUMO] Sem procCTe para {chave} "
+                f"(cStat={_cstat or '?'}) — aguardando próximo ciclo"
+            )
+            continue
+
+        # ── Processa e salva como COMPLETO ───────────────────────────────────
+        try:
+            _parser = XMLProcessor(informante=informante)
+            nome_cert = db.get_cert_nome_by_informante(inf)
+
+            # NSU preservado do banco (foi salvo quando resCTe chegou na distribuição)
+            nsu_cte = ''
+            try:
+                with db._connect() as _conn_nsu:
+                    _row_nsu = _conn_nsu.execute(
+                        "SELECT nsu FROM notas_detalhadas WHERE chave=?", (chave,)
+                    ).fetchone()
+                if _row_nsu and _row_nsu[0]:
+                    nsu_cte = str(_row_nsu[0])
+            except Exception:
+                pass
+
+            # Salva XML em disco
+            resultado = salvar_xml_por_certificado(
+                xml_cte_completo, informante,
+                pasta_base="xmls", nome_certificado=nome_cert
+            )
+            if resultado:
+                caminho_xml = resultado[0] if isinstance(resultado, tuple) else resultado
+                db.registrar_xml(chave, informante, caminho_xml)
+                if isinstance(resultado, tuple) and len(resultado) >= 2 and resultado[1]:
+                    db.atualizar_pdf_path(chave, resultado[1])
+
+            salvar_xml_por_certificado(xml_cte_completo, informante, pasta_base=None, nome_certificado=nome_cert)
+
+            nota = extrair_nota_detalhada(xml_cte_completo, _parser, db, chave, informante, nsu_documento=nsu_cte)
+            nota['informante'] = informante
+            nota['xml_status'] = 'COMPLETO'
+            db.salvar_nota_detalhada(nota)
+
+            logger.info(
+                f"✅ [CTE-RESUMO] {chave} salvo como COMPLETO "
+                f"(nº {nota.get('numero', 'N/A')}, "
+                f"emitente: {nota.get('nome_emitente') or nota.get('cnpj_emitente', 'N/A')})"
+            )
+
+            time.sleep(1)  # Respeita rate limit da SEFAZ entre CT-e
+
+        except Exception as e:
+            logger.error(f"❌ [CTE-RESUMO] Erro ao processar CT-e completo de {chave}: {e}", exc_info=True)
+
+    logger.info("✅ [CTE-RESUMO] Fase 1.6 concluída")
+
+
 def run_single_cycle():
     """
     Executa apenas UMA iteração de busca (sem loop infinito).
@@ -4459,8 +5868,11 @@ def run_single_cycle():
             # 1.1) Busca NFe
             logger.info(f"📄 Iniciando busca de NF-e para {cnpj}")
             
+            # Obtém NSU uma única vez (evita disparar divergência/recovery múltiplas vezes)
+            last_nsu = db.get_last_nsu(inf)
+            
             # Verifica se pode consultar (não teve erro 656 recente)
-            if not db.pode_consultar_certificado(inf, db.get_last_nsu(inf)):
+            if not db.pode_consultar_certificado(inf, last_nsu):
                 logger.info(f"⏭️ [{cnpj}] NF-e: Pulando consulta - aguardando cooldown de erro 656 anterior")
                 # Pula NF-e mas ainda processa CT-e e NFS-e
                 try:
@@ -4473,10 +5885,26 @@ def run_single_cycle():
                     processar_nfse((cnpj, path, senha, inf, cuf), db)
                 except Exception as e:
                     logger.exception(f"❌ Erro ao processar NFS-e para {inf}: {e}")
+
+                # 1.3b) NFS-e ABRASF (SOAP municipal — padrão DominioWeb/Ginfes)
+                try:
+                    processar_nfse_abrasf((cnpj, path, senha, inf, cuf), db)
+                except Exception as e:
+                    logger.exception(f"❌ Erro ao processar NFS-e ABRASF para {inf}: {e}")
                 continue
             
-            svc      = NFeService(path, senha, cnpj, cuf)
-            last_nsu = db.get_last_nsu(inf)
+            try:
+                svc = NFeService(path, senha, cnpj, cuf)
+            except FileNotFoundError:
+                logger.error(f"❌ [{cnpj}] Certificado NÃO ENCONTRADO: {path}")
+                logger.error(f"   Verifique ou atualize o caminho nas configurações!")
+                logger.warning(f"   ⏭️ Pulando certificado {cnpj} neste ciclo (NF-e, CT-e e NFS-e)")
+                continue
+            except ValueError as e:
+                logger.error(f"❌ [{cnpj}] Certificado inválido ou excluído: {e}")
+                logger.error(f"   Arquivo: {path}")
+                logger.warning(f"   ⏭️ Pulando certificado {cnpj} neste ciclo (NF-e, CT-e e NFS-e)")
+                continue
             logger.info(f"📊 [{cnpj}] NF-e: NSU atual = {last_nsu}")
             logger.info(f"🔐 [{cnpj}] NF-e: Certificado = {path}, cUF = {cuf}")
             
@@ -4526,26 +5954,29 @@ UF: {cuf}
                 # 🔴 TRATAMENTO DE ERRO 656 - Consumo Indevido (ANTES de processar docs)
                 if cStat == '656':
                     logger.warning(f"🚫 [{cnpj}] NF-e: cStat=656 - Consumo Indevido detectado")
-                    
-                    # ⚠️ IMPORTANTE: NÃO atualizar NSU em erro 656!
-                    # Se atualizar, perdemos documentos intermediários
-                    # Exemplo: NSU=1459, SEFAZ retorna ultNSU=1461
-                    # Documentos 1460 e 1461 serão perdidos se avançarmos
-                    logger.warning(f"⚠️ [{cnpj}] NF-e: NSU mantido em {last_nsu} para evitar perda de documentos")
-                    logger.warning(f"📋 [{cnpj}] NF-e: SEFAZ indicou ultNSU={ult}, documentos serão baixados após bloqueio")
-                    
+                    logger.warning(f"📋 [{cnpj}] NF-e: SEFAZ indicou ultNSU={ult}, maxNSU={max_nsu}")
+
+                    if max_nsu == "000000000000000":
+                        # SEFAZ confirmou que NÃO há documentos novos pendentes.
+                        # É seguro avançar o NSU para ultNSU — caso contrário o sistema
+                        # ficaria preso em loop infinito consultando com NSU=0 para sempre.
+                        if ult and ult != "000000000000000":
+                            db.set_last_nsu(inf, ult)
+                            last_nsu = ult
+                            logger.info(f"   ✅ NSU avançado para {ult} (maxNSU=0 — sem documentos pendentes)")
+                        else:
+                            logger.info(f"   ℹ️  NSU mantido (ultNSU também é zero)")
+                        logger.info(f"   ⏰ Bloqueio por consulta muito frequente — aguarde 1 hora")
+                    else:
+                        # Há documentos entre last_nsu e maxNSU que ainda não foram processados.
+                        # NÃO avança o NSU para não pular documentos intermediários.
+                        logger.warning(f"⚠️ [{cnpj}] NF-e: NSU mantido em {last_nsu} — há docs pendentes até maxNSU={max_nsu}")
+                        logger.info(f"   ⏰ Documentos serão baixados após o bloqueio de 65 minutos")
+
                     # Registra erro 656 para bloquear por 65 minutos
                     db.registrar_erro_656(inf, last_nsu)
                     logger.warning(f"🔒 [{cnpj}] NF-e bloqueada por 65 minutos - próxima consulta possível às {(datetime.now() + timedelta(minutes=65)).strftime('%H:%M:%S')}")
-                    
-                    # Explica o erro de forma clara
-                    if max_nsu == "000000000000000":
-                        logger.info(f"   ✅ Situação normal: SEFAZ retornou maxNSU=0 (não há documentos novos)")
-                        logger.info(f"   📝 NSU atual ({ult}) está atualizado - sistema aguardando novos documentos")
-                    else:
-                        logger.info(f"   📭 SEFAZ informa maxNSU={max_nsu}")
-                    logger.info(f"   ⏰ Bloqueio por consulta muito frequente (< 1 hora) - aguarde intervalo")
-                    
+
                     break  # Sai do loop NF-e, vai para CT-e
                 
                 # 🛑 ORDEM CORRETA: Verifica cStat=137 PRIMEIRO (antes de ultNSU==maxNSU)
@@ -4942,15 +6373,37 @@ UF: {cuf}
             except Exception as e:
                 logger.exception(f"Erro geral ao processar CT-e para {inf}: {e}")
             
-            # 1.3) Busca NFS-e (Padrão Nacional)
+            # 1.3) Busca NFS-e (Padrão Nacional ADN)
             try:
                 logger.info(f"📋 Iniciando busca de NFS-e para {cnpj}")
                 processar_nfse((cnpj, path, senha, inf, cuf), db)
             except Exception as e:
                 logger.exception(f"❌ Erro ao processar NFS-e para {inf}: {e}")
+
+            # 1.3b) NFS-e ABRASF (SOAP municipal — padrão DominioWeb/Ginfes)
+            try:
+                processar_nfse_abrasf((cnpj, path, senha, inf, cuf), db)
+            except Exception as e:
+                logger.exception(f"❌ Erro ao processar NFS-e ABRASF para {inf}: {e}")
         
         logger.info("✅ Fase 1 concluída: Todos os documentos foram buscados (NFe, CTe e NFSe)!")
-        
+
+        # 1.5) Download automático de RESUMOs pendentes
+        logger.info("📥 Fase 1.5: Processando NF-e com xml_status=RESUMO ...")
+        try:
+            baixar_resumos_pendentes(db)
+        except Exception as e:
+            logger.error(f"❌ Erro na Fase 1.5 (baixar_resumos_pendentes): {e}", exc_info=True)
+        logger.info("✅ Fase 1.5 concluída")
+
+        # 1.6) Download automático de CT-e RESUMOs pendentes
+        logger.info("📥 Fase 1.6: Processando CT-e com xml_status=RESUMO ...")
+        try:
+            baixar_ctes_pendentes(db)
+        except Exception as e:
+            logger.error(f"❌ Erro na Fase 1.6 (baixar_ctes_pendentes): {e}", exc_info=True)
+        logger.info("✅ Fase 1.6 concluída")
+
         # 2) Consulta de Protocolo - AGORA SIM, depois de buscar tudo
         # Verifica se o usuário habilitou a consulta de status
         consultar_status = db.get_config('consultar_status_protocolo', '1')
@@ -5038,10 +6491,34 @@ def atualizar_status_notas_lote(db, certificados, chaves_list, progress_callback
     processadas = [0]  # Lista para ser mutável em closure
     processadas_lock = threading.Lock()
     
-    def consultar_chave(chave, svc, cuf):
+    def consultar_chave(chave, cert_data, cuf):
         """Consulta uma chave individualmente (executado em thread separada)."""
         nonlocal processadas
-        
+
+        # Cria NFeService dedicado por thread: requests.Session não é thread-safe,
+        # compartilhá-lo entre workers causa "Cannot set verify_mode to CERT_NONE
+        # when check_hostname is enabled" em conexões SSL paralelas.
+        # O WSDL é cacheado em _get_cached_wsdl_client, então isso é barato.
+        try:
+            svc = NFeService(
+                cert_data.get('caminho'),
+                cert_data.get('senha'),
+                cert_data.get('cnpj_cpf'),
+                cert_data.get('cUF_autor')
+            )
+        except Exception as e:
+            logger.error(f"Erro ao criar NFeService na thread para chave {chave}: {e}")
+            with stats_lock:
+                stats['erros'] += 1
+            with processadas_lock:
+                processadas[0] += 1
+                if progress_callback:
+                    try:
+                        progress_callback(processadas[0], total_chaves, chave)
+                    except:
+                        pass
+            return 'erro'
+
         try:
             # Consulta eventos da chave
             xml_resposta = svc.consultar_eventos_chave(chave)
@@ -5082,40 +6559,19 @@ def atualizar_status_notas_lote(db, certificados, chaves_list, progress_callback
                     novo_status = f"Cancelamento de {tipo_doc} homologado"
                     db.atualizar_status_por_evento(chave, novo_status)
                     
-                    # Salva XML do evento
+                    # Salva XML do evento no armazenamento usando salvar_xml_por_certificado
+                    # (resolve caminho absoluto via get_data_dir, registra no banco, respeita perfis)
                     try:
                         evento_xml = etree.tostring(evento, encoding='utf-8', pretty_print=True).decode()
                         
-                        # Tenta extrair CNPJ do evento, depois da chave, e por último usa o informante do certificado
-                        informante = evento.findtext(f'{{{ns_uri}}}CNPJ')
-                        
-                        if not informante:
-                            # Extrai CNPJ da chave (posições 6-20 = 14 dígitos do CNPJ)
-                            try:
-                                informante = chave[6:20] if len(chave) >= 20 else None
-                            except:
-                                pass
-                        
-                        # Se ainda não tem, usa o CNPJ do certificado (self.cnpj_cpf)
-                        if not informante:
-                            informante = getattr(self, 'cnpj_cpf', None)
-                        
-                        # Último fallback: usa string vazia (vai para pasta raiz)
-                        if not informante:
-                            logger.warning(f"⚠️ Não foi possível identificar CNPJ para evento de {chave}")
-                            informante = ""
-                        
-                        ano_mes = chave[2:6]  # AAMM da chave
-                        ano = '20' + ano_mes[:2]
-                        mes = ano_mes[2:4]
-                        
-                        from pathlib import Path
-                        eventos_dir = Path('xmls') / informante / f"{ano}-{mes}" / "Eventos"
-                        eventos_dir.mkdir(parents=True, exist_ok=True)
-                        
-                        evento_file = eventos_dir / f"{chave}.xml"
-                        evento_file.write_text(evento_xml, encoding='utf-8')
-                        logger.info(f"[SALVO Evento] {evento_file}")
+                        # CNPJ: tenta extrair do evento; senão usa CNPJ embutido na chave (posições 6-20)
+                        informante_evt = (
+                            evento.findtext(f'{{{ns_uri}}}CNPJ')
+                            or (chave[6:20] if len(chave) >= 20 else "")
+                        )
+                        nome_cert_evt = db.get_cert_nome_by_informante(informante_evt) if informante_evt else None
+                        salvar_xml_por_certificado(evento_xml, informante_evt, pasta_base="xmls", nome_certificado=nome_cert_evt)
+                        logger.info(f"[SALVO Evento cancelamento] chave={chave}")
                     except Exception as e:
                         logger.warning(f"Não foi possível salvar evento de {chave}: {e}")
                     
@@ -5162,26 +6618,27 @@ def atualizar_status_notas_lote(db, certificados, chaves_list, progress_callback
                 cert = c
                 break
         
-        # Cria serviço NFe
+        # Valida que o certificado consegue criar NFeService antes de paralelizar
         try:
-            svc = NFeService(
+            _svc_test = NFeService(
                 cert.get('caminho'),
                 cert.get('senha'),
                 cert.get('cnpj_cpf'),
                 cert.get('cUF_autor')
             )
+            del _svc_test  # descarta — cada thread cria o seu próprio
         except Exception as e:
             logger.error(f"Erro ao criar serviço NFe para UF {cuf}: {e}")
             with stats_lock:
                 stats['erros'] += len(chaves)
             continue
-        
+
         # Paraleliza consultas com ThreadPoolExecutor
         logger.info(f"🚀 Consultando {len(chaves)} chaves da UF {cuf} com {max_workers} workers paralelos")
-        
+
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            # Submete todas as consultas
-            futures = {executor.submit(consultar_chave, chave, svc, cuf): chave for chave in chaves}
+            # Passa cert (não svc) — cada thread cria seu próprio NFeService (thread-safe)
+            futures = {executor.submit(consultar_chave, chave, cert, cuf): chave for chave in chaves}
             
             # Aguarda conclusão
             for future in as_completed(futures):

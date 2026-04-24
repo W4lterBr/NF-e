@@ -1,104 +1,222 @@
 @echo off
+chcp 65001 >nul 2>&1
+setlocal enabledelayedexpansion
+
 echo ============================================================
-echo  Busca XML - Compilador de Aplicativo v1.0.95
+echo  🚀 Busca XML - Build Automatizado
 echo  Desenvolvido por: DWM System Developer
-echo  GitHub: https://github.com/W4lterBr/NF-e
+echo  Site: https://dwmsystems.up.railway.app/
 echo ============================================================
 echo.
 
+REM Lê versão do arquivo version.txt
+if exist version.txt (
+    set /p APP_VERSION=<version.txt
+    echo 📌 Versão: !APP_VERSION!
+) else (
+    echo ⚠️  AVISO: version.txt não encontrado, usando versão padrão 1.0.0
+    set APP_VERSION=1.0.0
+)
+echo.
+
 REM Ativa ambiente virtual
-echo [1/4] Ativando ambiente virtual...
-call .venv\Scripts\activate.bat
-if errorlevel 1 (
-    echo ERRO: Nao foi possivel ativar o ambiente virtual
+echo [1/6] 🔧 Ativando ambiente virtual...
+if exist .venv\Scripts\activate.bat (
+    call .venv\Scripts\activate.bat
+    echo ✅ Ambiente virtual ativado
+) else (
+    echo ❌ ERRO: Ambiente virtual não encontrado em .venv\
+    echo 💡 Execute: python -m venv .venv
     pause
     exit /b 1
 )
+echo.
 
-REM Instala PyInstaller se necessário
-echo [2/4] Verificando PyInstaller...
+REM Instala/atualiza dependências de build
+echo [2/6] 📦 Verificando dependências de build...
 pip show pyinstaller >nul 2>&1
 if errorlevel 1 (
-    echo Instalando PyInstaller...
+    echo    Instalando PyInstaller...
     pip install pyinstaller
+) else (
+    echo    ✓ PyInstaller instalado
 )
 
-REM Verifica e instala Pillow se necessário (para conversão de ícone)
 pip show pillow >nul 2>&1
 if errorlevel 1 (
-    echo Instalando Pillow para conversao de icone...
+    echo    Instalando Pillow para conversão de ícone...
     pip install pillow
+) else (
+    echo    ✓ Pillow instalado
 )
+echo.
 
 REM Converte Logo.png em Logo.ico se existir
+echo [3/6] 🎨 Processando ícone da aplicação...
 if exist Logo.png (
-    echo Convertendo Logo.png para Logo.ico...
-    python -c "from PIL import Image; img = Image.open('Logo.png'); img.save('Logo.ico', format='ICO', sizes=[(256,256), (128,128), (64,64), (48,48), (32,32), (16,16)])"
-    if errorlevel 1 (
-        echo AVISO: Falha ao converter icone, continuando...
+    echo    Convertendo Logo.png para Logo.ico...
+    .venv\Scripts\python.exe -c "from PIL import Image; img = Image.open('Logo.png'); img.save('Logo.ico', format='ICO', sizes=[(256,256), (128,128), (64,64), (48,48), (32,32), (16,16)])" 2>nul
+    if !errorlevel! equ 0 (
+        echo    ✅ Logo.ico criado com sucesso
     ) else (
-        echo Icone Logo.ico criado com sucesso!
+        echo    ⚠️  Falha ao converter ícone, usando padrão
     )
 ) else (
-    echo AVISO: Logo.png nao encontrado, compilando sem icone personalizado
+    echo    ⚠️  Logo.png não encontrado
+)
+echo.
+
+REM Gera metadados de versão do Windows para o EXE
+echo [3.5/6] 📋 Gerando metadados de versão do Windows...
+if exist gerar_version_info.py (
+    .venv\Scripts\python.exe gerar_version_info.py 2>nul
+    if !errorlevel! equ 0 (
+        if exist file_version_info.txt (
+            echo    ✅ file_version_info.txt gerado (Versão: !APP_VERSION!)
+        ) else (
+            echo    ⚠️  file_version_info.txt não foi criado
+        )
+    ) else (
+        echo    ⚠️  Falha ao gerar metadados de versão
+    )
+) else (
+    echo    ⚠️  gerar_version_info.py não encontrado
+)
+echo.
+
+REM Valida arquivos críticos
+echo [4/6] ✔️  Validando arquivos necessários...
+set MISSING_FILES=0
+
+if not exist "Busca NF-e.py" (
+    echo    ❌ Busca NF-e.py não encontrado
+    set MISSING_FILES=1
+)
+if not exist "BOT_Busca_NFE.spec" (
+    echo    ❌ BOT_Busca_NFE.spec não encontrado
+    set MISSING_FILES=1
+)
+if not exist "updater_launcher.py" (
+    echo    ⚠️  updater_launcher.py não encontrado (auto-update desabilitado)
+)
+if not exist "Arquivo_xsd" (
+    echo    ⚠️  Pasta Arquivo_xsd não encontrada
 )
 
+if !MISSING_FILES! EQU 1 (
+    echo.
+    echo ❌ Arquivos críticos ausentes. Build cancelado.
+    pause
+    exit /b 1
+)
+echo    ✅ Todos os arquivos críticos presentes
+echo.
+
 REM Limpa builds anteriores
-echo [3/4] Limpando builds anteriores...
-if exist build rmdir /s /q build
-if exist "dist\Busca XML" rmdir /s /q "dist\Busca XML"
-if exist "dist\Busca XML.exe" del /q "dist\Busca XML.exe"
+echo [5/6] 🧹 Limpando builds anteriores...
+if exist build (
+    rmdir /s /q build
+    echo    ✓ Pasta build removida
+)
+if exist "dist\Busca XML" (
+    rmdir /s /q "dist\Busca XML"
+    echo    ✓ Pasta dist\Busca XML removida
+)
+if exist "dist\Busca XML.exe" (
+    del /q "dist\Busca XML.exe"
+    echo    ✓ Executável antigo removido
+)
+echo.
 
 REM Compila o aplicativo
-echo [4/4] Compilando aplicativo...
+echo [6/6] 🔨 Compilando aplicativo...
+echo    PyInstaller: BOT_Busca_NFE.spec
+echo.
 pyinstaller --clean --noconfirm BOT_Busca_NFE.spec
 
 if errorlevel 1 (
     echo.
     echo ============================================================
-    echo ERRO: Falha na compilacao
+    echo ❌ ERRO: Falha na compilação do PyInstaller
     echo ============================================================
+    echo.
+    echo 💡 Dicas de troubleshooting:
+    echo    1. Verifique se todas as dependências estão instaladas
+    echo    2. Execute: pip install -r requirements.txt
+    echo    3. Tente limpar cache: rmdir /s /q build dist
+    echo.
     pause
     exit /b 1
 )
 
-REM ===================================================================
-REM ARQUIVOS .PY REMOVIDOS DA DISTRIBUIÇÃO (Segurança)
-REM ===================================================================
-REM O executável já contém todo o código compilado.
-REM Apenas dados do usuário (xmls/, notas.db) devem permanecer após desinstalação.
-REM
-REM Se precisar de atualizações remotas no futuro, implemente via:
-REM - Novo instalador/executável
-REM - Sistema de atualização automática que baixa novo .exe
-REM ===================================================================
-
-REM Copiar recursos necessários (Icone, Logo.ico e Arquivo_xsd)
+echo    ✅ Compilação concluída com sucesso!
 echo.
-echo [RECURSOS] Copiando icones e schemas XSD...
-xcopy /E /I /Y "Icone" "dist\Busca XML\Icone" >nul 2>&1
-xcopy /E /I /Y "Arquivo_xsd" "dist\Busca XML\Arquivo_xsd" >nul 2>&1
-copy /Y "Logo.ico" "dist\Busca XML\Logo.ico" >nul 2>&1
-copy /Y "Logo.png" "dist\Busca XML\Logo.png" >nul 2>&1
-copy /Y "version.txt" "dist\Busca XML\version.txt" >nul 2>&1
-echo   Recursos copiados com sucesso!
 
-echo.
-echo [SEGURANCA] Codigo-fonte NAO incluido na distribuicao
-echo   Apenas executavel compilado sera distribuido
+REM Valida se o executável foi criado
+if not exist "dist\Busca XML\Busca XML.exe" (
+    echo ❌ ERRO: Executável não foi gerado em dist\Busca XML\
+    pause
+    exit /b 1
+)
 
-echo.
 echo ============================================================
-echo SUCESSO! Aplicativo compilado em: dist\Busca XML\
+echo ✅ BUILD CONCLUÍDO COM SUCESSO!
 echo ============================================================
 echo.
+echo 📦 Executável: dist\Busca XML\Busca XML.exe
+echo 📏 Tamanho: 
+for %%I in ("dist\Busca XML\Busca XML.exe") do echo    %%~zI bytes
+echo.
+
+REM Verifica se Inno Setup está instalado
+set INNO_PATH=
+if exist "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" set INNO_PATH=C:\Program Files (x86)\Inno Setup 6\ISCC.exe
+if exist "C:\Program Files\Inno Setup 6\ISCC.exe" set INNO_PATH=C:\Program Files\Inno Setup 6\ISCC.exe
+
+if "%INNO_PATH%"=="" (
+    echo ⚠️  Inno Setup 6 não encontrado
+    echo 💡 Baixe em: https://jrsoftware.org/isdl.php
+    echo.
+    echo Build finalizado sem instalador.
+    pause
+    exit /b 0
+)
+
+echo 🔧 Inno Setup encontrado: %INNO_PATH%
+echo.
+echo ============================================================
 echo Deseja criar o instalador agora? (S/N)
+echo ============================================================
 set /p CREATE_INSTALLER=
 
 if /i "%CREATE_INSTALLER%"=="S" (
     echo.
-    echo Criando instalador...
-    "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer.iss
+    echo 📦 Criando instalador...
+    echo.
+    "%INNO_PATH%" installer.iss
+    
+    if errorlevel 1 (
+        echo ❌ Erro ao criar instalador
+        pause
+        exit /b 1
+    )
+    
+    echo.
+    echo ============================================================
+    echo ✅ INSTALADOR CRIADO COM SUCESSO!
+    echo ============================================================
+    echo.
+    echo 📦 Localização: Output\Busca_XML_Setup.exe
+    if exist "Output\Busca_XML_Setup.exe" (
+        for %%I in ("Output\Busca_XML_Setup.exe") do echo 📏 Tamanho: %%~zI bytes
+    )
+    echo.
+    pause
+) else (
+    echo.
+    echo Build finalizado. Execute installer.iss manualmente para criar instalador.
+    pause
+)
     if errorlevel 1 (
         echo AVISO: Inno Setup nao encontrado em C:\Program Files (x86)\Inno Setup 6\
         echo Instale Inno Setup de: https://jrsoftware.org/isdl.php

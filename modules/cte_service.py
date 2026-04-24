@@ -18,10 +18,22 @@ from datetime import datetime
 # Usa o logger raiz para herdar configurações do módulo principal
 logger = logging.getLogger('nfe_search')  # Mesmo logger do nfe_search.py
 
+# Desabilita logs verbosos do zeep para evitar "I/O operation on closed file"
+logging.getLogger('zeep').setLevel(logging.WARNING)
+logging.getLogger('zeep.wsdl').setLevel(logging.WARNING)
+logging.getLogger('zeep.xsd').setLevel(logging.WARNING)
+logging.getLogger('zeep.transports').setLevel(logging.WARNING)
+logging.getLogger('urllib3').setLevel(logging.WARNING)
+logging.getLogger('urllib3.connectionpool').setLevel(logging.WARNING)
+
 # Endpoints oficiais CT-e (Ambiente Nacional - Receita Federal)
 # Fonte: https://www.cte.fazenda.gov.br/portal/webServices.aspx
+# NOTA: CTeDistribuicaoDFe é **exclusivo** do Ambiente Nacional (AN – Receita Federal).
+# O SVRS (cte.svrs.rs.gov.br) NÃO oferece este serviço — apenas autorização (v4.00).
 URL_CTE_DISTRIBUICAO_PROD = "https://www1.cte.fazenda.gov.br/CTeDistribuicaoDFe/CTeDistribuicaoDFe.asmx?wsdl"
+URL_CTE_DISTRIBUICAO_PROD_SVRS = None  # SVRS não possui CTeDistribuicaoDFe
 URL_CTE_DISTRIBUICAO_HOM = "https://hom.cte.fazenda.gov.br/CTeDistribuicaoDFe/CTeDistribuicaoDFe.asmx?wsdl"
+URL_CTE_DISTRIBUICAO_HOM_SVRS = None  # SVRS não possui CTeDistribuicaoDFe
 
 # Namespace CTe
 NS_CTE = "http://www.portalfiscal.inf.br/cte"
@@ -94,17 +106,43 @@ class CTeService:
             pkcs12_filename=cert_path, pkcs12_password=senha
         ))
         
-        # Seleciona endpoint baseado no ambiente
-        url_dist = URL_CTE_DISTRIBUICAO_PROD if ambiente == 'producao' else URL_CTE_DISTRIBUICAO_HOM
+        # Seleciona endpoints (principal e alternativo)
+        if ambiente == 'producao':
+            url_principal = URL_CTE_DISTRIBUICAO_PROD
+            url_alternativa = URL_CTE_DISTRIBUICAO_PROD_SVRS
+        else:
+            url_principal = URL_CTE_DISTRIBUICAO_HOM
+            url_alternativa = URL_CTE_DISTRIBUICAO_HOM_SVRS
         
-        trans = Transport(session=sess)
-        try:
-            self.dist_client = Client(wsdl=url_dist, transport=trans)
-            logger.debug(f"Cliente CTe inicializado: {url_dist}")
-        except Exception as e:
-            logger.error(f"Falha ao inicializar cliente CTe: {e}")
-            raise
+        # Configuração de transporte com timeout maior (60s) para CT-e
+        trans = Transport(session=sess, timeout=60, operation_timeout=60)
+
+        # Monta lista de URLs a tentar (filtra entradas None)
+        urls_tentativas = [(nome, url) for nome, url in [
+            ("Nacional", url_principal),
+            ("SVRS",     url_alternativa),
+        ] if url]
+
+        # Tenta conectar nas URLs disponíveis
+        self.dist_client = None
+        url_usada = None
+
+        for nome_url, url_dist in urls_tentativas:
+            try:
+                logger.debug(f"Tentando conectar CT-e via {nome_url}: {url_dist}")
+                self.dist_client = Client(wsdl=url_dist, transport=trans)
+                url_usada = url_dist
+                logger.info(f"✅ Cliente CTe inicializado via {nome_url}: {url_dist}")
+                break  # Conectou com sucesso
+            except Exception as e:
+                logger.warning(f"⚠️ Falha ao conectar CT-e via {nome_url}: {str(e)[:100]}")
+                if nome_url == urls_tentativas[-1][0]:  # Era a última tentativa
+                    logger.error(f"❌ Falha ao inicializar cliente CTe em TODAS as URLs")
+                    raise
+                # Continua para próxima URL
         
+        # Salva configurações
+        self.url_atual = url_usada  # URL que funcionou
         self.informante = informante
         self.cuf = cuf
         self.ambiente = '1' if ambiente == 'producao' else '2'
@@ -139,9 +177,8 @@ class CTeService:
         save_debug_soap_cte(self.informante, "request", xml_envio, prefixo="cte_dist")
         
         # 🌐 DEBUG HTTP: Informações da requisição SOAP CT-e
-        url_dist = URL_CTE_DISTRIBUICAO_PROD if self.ambiente == '1' else URL_CTE_DISTRIBUICAO_HOM
         logger.info(f"🌐 [{self.informante}] HTTP REQUEST CT-e Distribuição:")
-        logger.info(f"   📍 URL: {url_dist}")
+        logger.info(f"   📍 URL: {self.url_atual}")
         logger.info(f"   🔐 Certificado: Configurado com PKCS12")
         logger.info(f"   📦 Método: POST (SOAP)")
         logger.info(f"   📋 Payload: distDFeInt (ultNSU={ult_nsu}, cUF={self.cuf}, tpAmb={self.ambiente})")
@@ -177,7 +214,51 @@ class CTeService:
         save_debug_soap_cte(self.informante, "response", xml_str, prefixo="cte_dist")
         
         return xml_str
-    
+
+    def fetch_by_nsu(self, nsu):
+        """
+        Busca CT-e específico por NSU via CTeDistribuicaoDFe (consNSU).
+        Nota: CTeDistribuicaoDFe NÃO suporta consChCTe (query por chave) — apenas
+        distNSU (sequencial) e consNSU (NSU específico). Para query por chave de acesso
+        use NFeService.fetch_prot_cte() que chama CTeConsultaV4.
+
+        Args:
+            nsu: NSU de 15 dígitos do documento CT-e
+
+        Returns:
+            XML da resposta ou None em caso de erro
+        """
+        logger.info(f"🔑 [CTe] Consultando via Distribuição DFe por NSU: {nsu}")
+
+        distInt = etree.Element("distDFeInt", xmlns=NS_CTE, versao="1.00")
+        etree.SubElement(distInt, "tpAmb").text = self.ambiente
+        etree.SubElement(distInt, "cUFAutor").text = str(self.cuf)
+        etree.SubElement(distInt, "CNPJ").text = self.informante
+        sub = etree.SubElement(distInt, "consNSU")
+        etree.SubElement(sub, "NSU").text = str(nsu).zfill(15)
+
+        xml_envio = etree.tostring(distInt, encoding='utf-8').decode()
+        save_debug_soap_cte(self.informante, "request", xml_envio, prefixo="cte_dist_nsu")
+
+        logger.info(f"🌐 [{self.informante}] HTTP REQUEST CT-e Por NSU:")
+        logger.info(f"   📍 URL: {self.url_atual}")
+        logger.info(f"   📋 Payload: distDFeInt (consNSU={nsu}, cUF={self.cuf})")
+        logger.info(f"   📏 Tamanho XML: {len(xml_envio)} bytes")
+
+        try:
+            resp = self.dist_client.service.cteDistDFeInteresse(cteDadosMsg=distInt)
+            xml_str = etree.tostring(resp, encoding='utf-8').decode()
+            logger.info(f"📥 [{self.informante}] Resposta CT-e Por NSU: {len(xml_str)} bytes")
+            save_debug_soap_cte(self.informante, "response", xml_str, prefixo="cte_dist_nsu")
+            return xml_str
+        except Fault as fault:
+            logger.error(f"SOAP Fault CTe Por NSU: {fault}")
+            save_debug_soap_cte(self.informante, "fault", str(fault), prefixo="cte_dist_nsu")
+            return None
+        except Exception as e:
+            logger.error(f"❌ [{self.informante}] Erro ao buscar CT-e por NSU: {e}")
+            return None
+
     def extrair_docs(self, xml_resposta):
         """
         Extrai documentos compactados (docZip) da resposta SOAP

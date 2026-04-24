@@ -11,7 +11,6 @@ from lxml import etree
 
 # Biblioteca PyNFe para manifestação
 from pynfe.processamento.comunicacao import ComunicacaoSefaz
-from pynfe.processamento.assinatura import AssinaturaA1
 from pynfe.processamento.serializacao import SerializacaoXML
 from pynfe.entidades.evento import EventoManifestacaoDest
 
@@ -37,6 +36,50 @@ class ManifestacaoService:
             raise FileNotFoundError(f"Certificado não encontrado: {certificado_path}")
         
         logger.info(f"[MANIFESTAÇÃO PyNFe] Serviço inicializado")
+
+    def _assinar_evento_pkcs12(self, xml_evento):
+        """Assina XML de evento com PKCS12, contornando incompatibilidade PyNFe/signxml 4.x.
+
+        PyNFe's AssinaturaA1 strips the PEM headers from the cert string.
+        signxml >= 4.0 requer PEM completo ou List[x509.Certificate].
+        Aqui passamos x509.Certificate diretamente para signxml, que insere
+        X509Certificate no XML automaticamente (já com base64 sem headers).
+        """
+        from cryptography.hazmat.primitives.serialization import (
+            pkcs12, Encoding, PrivateFormat, NoEncryption
+        )
+        from pynfe.utils import etree, remover_acentos, CustomXMLSigner
+        import signxml
+
+        with open(self.certificado_path, 'rb') as fp:
+            p12_data = fp.read()
+        senha = (
+            self.certificado_senha.encode()
+            if isinstance(self.certificado_senha, str)
+            else self.certificado_senha
+        )
+        private_key, cert_obj, _ = pkcs12.load_key_and_certificates(p12_data, senha)
+        key_pem = private_key.private_bytes(Encoding.PEM, PrivateFormat.PKCS8, NoEncryption())
+
+        reference = xml_evento.find(".//*[@Id]").attrib["Id"]
+        xml_str = remover_acentos(
+            etree.tostring(xml_evento, encoding="unicode", pretty_print=False)
+        )
+        xml = etree.fromstring(xml_str)
+
+        signer = CustomXMLSigner(
+            method=signxml.methods.enveloped,
+            signature_algorithm="rsa-sha1",
+            digest_algorithm="sha1",
+            c14n_algorithm="http://www.w3.org/TR/2001/REC-xml-c14n-20010315",
+        )
+        signer.excise_empty_xmlns_declarations = True
+        signer.namespaces = {None: signer.namespaces["ds"]}
+
+        # signxml 4.x aceita List[x509.Certificate] e gera X509Certificate automaticamente
+        return signer.sign(
+            xml, key=key_pem, cert=[cert_obj], reference_uri=f"#{reference}"
+        )
     
     def enviar_manifestacao(
         self,
@@ -105,12 +148,16 @@ class ManifestacaoService:
             xml_evento = serializador.serializar_evento(evento, retorna_string=False)
             
             # Assinar evento
-            logger.info("Assinando evento com PyNFe...")
-            assinatura = AssinaturaA1(self.certificado_path, self.certificado_senha)
-            xml_assinado = assinatura.assinar(xml_evento)
-            
-            xml_str = etree.tostring(xml_assinado, encoding='unicode')
-            logger.info(f"Evento assinado ({len(xml_str)} bytes)")
+            logger.info("Assinando evento com PKCS12...")
+            try:
+                xml_assinado = self._assinar_evento_pkcs12(xml_evento)
+
+                xml_str = etree.tostring(xml_assinado, encoding='unicode')
+                logger.info(f"Evento assinado ({len(xml_str)} bytes)")
+            except Exception as sign_error:
+                logger.warning(f"Falha na assinatura: {sign_error}")
+                logger.info("Manifestação não será enviada (falha na assinatura)")
+                return (False, "", f"Falha na assinatura: {str(sign_error)}", "")
             
             # Enviar para SEFAZ
             logger.info("Enviando para SEFAZ via Ambiente Nacional...")

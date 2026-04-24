@@ -88,7 +88,7 @@ class NFSeService:
             logger.error(f"❌ Erro ao inicializar cliente NFS-e: {e}")
             raise
     
-    def consultar_nsu(self, nsu):
+    def consultar_nsu(self, nsu, tipo_nsu=None):
         """
         Consulta documento por NSU.
         
@@ -96,16 +96,27 @@ class NFSeService:
         
         Args:
             nsu: Numero Sequencial Unico
+            tipo_nsu: Tipo de NSU (opcional)
+                - "RECEPCAO": NSU de recepção (emissão)
+                - "DISTRIBUICAO": NSU de distribuição
+                - "GERAL": Todos os NSUs (recomendado!)
+                - "MEI": Específico para MEI
+                - None: Usa padrão (DISTRIBUICAO)
         
         Returns:
             dict ou bytes: Resposta da API
         """
         endpoint = f"{self.url_base}/contribuintes/DFe/{nsu}"
         
+        # Adiciona parâmetros query
+        params = {}
+        if tipo_nsu:
+            params['tipoNSU'] = tipo_nsu
+        
         try:
-            logger.debug(f"📡 Consultando NSU: {nsu}")
+            logger.debug(f"📡 Consultando NSU: {nsu}" + (f" (tipoNSU={tipo_nsu})" if tipo_nsu else ""))
             
-            response = self.session.get(endpoint, timeout=30)
+            response = self.session.get(endpoint, params=params, timeout=12)
             response.raise_for_status()
             
             # Verifica se conteudo esta vazio
@@ -172,7 +183,7 @@ class NFSeService:
                     logger.info(f"   🔄 Tentativa {tentativa}/{retry}...")
                     time.sleep(2)  # Aguarda 2s entre tentativas
                 
-                response = self.session.get(endpoint, timeout=45)
+                response = self.session.get(endpoint, timeout=(5, 10))
                 
                 # Verifica se retornou PDF
                 if response.status_code == 200:
@@ -386,8 +397,9 @@ def consultar_nfse_incremental(db, cert_path, senha, informante, cuf, ambiente='
             ultimo_nsu = 0
             logger.info(f"🔄 BUSCA COMPLETA: Iniciando do NSU=0 (todos os documentos)")
         else:
-            ultimo_nsu = db.get_last_nsu_nfse(informante) or 0
-            logger.info(f"📍 BUSCA INCREMENTAL: Ultimo NSU processado: {ultimo_nsu}")
+            # int() garante que o valor do banco (string "000000000000000") seja numérico
+            ultimo_nsu = int(db.get_last_nsu_nfse(informante) or 0)
+            logger.info(f"📍 BUSCA INCREMENTAL: Ultimo NSU processado: {ultimo_nsu:015d}")
         
         documentos_encontrados = []
         nsu_atual = max(ultimo_nsu + 1, 1)  # Comeca do proximo (minimo 1)

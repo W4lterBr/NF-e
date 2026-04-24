@@ -1,7 +1,9 @@
+import os
 import sqlite3
 from pathlib import Path
 
-db_path = Path(r"C:\Users\Nasci\AppData\Roaming\Busca XML\notas.db")
+# 🔧 Detecta caminho automaticamente (funciona em qualquer PC)
+db_path = Path(os.getenv('APPDATA')) / 'Busca XML' / 'notas.db'
 
 conn = sqlite3.connect(str(db_path))
 cur = conn.cursor()

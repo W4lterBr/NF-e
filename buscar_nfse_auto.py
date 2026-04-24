@@ -9,12 +9,17 @@ import io
 from pathlib import Path
 from datetime import datetime, timedelta
 
-# Força UTF-8 no Windows
-if sys.platform == 'win32':
+# Força UTF-8 no Windows SOMENTE ao executar diretamente como script.
+# Quando importado como módulo pela GUI (.exe frozen), NÃO substituímos
+# sys.stdout/stderr pois isso quebraria o stdout do processo principal.
+if __name__ == "__main__" and sys.platform == 'win32':
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
 
-sys.path.insert(0, str(Path(__file__).parent))
+# Em modo dev (não-frozen), garante que o diretório-pai está no path.
+# Em modo frozen (PyInstaller), os módulos já estão disponíveis sem isso.
+if not getattr(sys, 'frozen', False):
+    sys.path.insert(0, str(Path(__file__).parent))
 
 from nfse_search import NFSeDatabase, logger, URLS_MUNICIPIOS, consultar_cnpj
 from modules.nfse_service import NFSeService, consultar_nfse_incremental
@@ -23,49 +28,18 @@ from lxml import etree
 # Importa salvar_nfse_detalhada para salvar em notas_detalhadas (banco principal)
 from nfe_search import salvar_nfse_detalhada
 
-# Importa gerador profissional de DANFSe
-try:
-    from gerar_danfse_profissional import gerar_danfse_profissional
-    GERADOR_PDF_DISPONIVEL = True
-except ImportError:
-    GERADOR_PDF_DISPONIVEL = False
-    logger.warning("⚠️  Gerador de DANFSe profissional não disponível")
-
-
-def gerar_pdf_nfse(xml_content, pdf_path):
-    """
-    Gera DANFSe profissional a partir do XML.
-    Wrapper para a função gerar_danfse_profissional().
-    
-    Args:
-        xml_content: Conteúdo XML da NFS-e
-        pdf_path: Caminho onde salvar o PDF
-        
-    Returns:
-        bool: True se PDF foi gerado com sucesso
-    """
-    if not GERADOR_PDF_DISPONIVEL:
-        logger.warning("   ⚠️  Gerador de PDF não disponível")
-        return False
-    
-    try:
-        return gerar_danfse_profissional(xml_content, pdf_path)
-    except Exception as e:
-        logger.error(f"   ❌ Erro ao gerar DANFSe: {e}")
-        return False
+# PDF da NFS-e é baixado APENAS via API oficial do Ambiente Nacional (ADN).
+# Não há geração local de PDF — município não integrado = mensagem informativa.
 
 
 def salvar_xml_nfse(db, cnpj, xml_content, numero_nfse, data_emissao):
     """
-    Salva XML da NFS-e em arquivo local seguindo o padrão de NF-e e CT-e.
+    Salva XML da NFS-e usando a mesma lógica de NF-e e CT-e.
     
-    Estrutura: xmls/{CNPJ}/{ANO-MES}/NFSe/{NUMERO}-{FORNECEDOR}.xml
-    
-    O formato ANO-MES respeita a configuração storage_formato_mes do banco:
-    - AAAA-MM (padrão): 2026-01
-    - MM-AAAA: 01-2026
-    - AAAA/MM: 2026/01
-    - MM/AAAA: 01/2026
+    🔧 CORREÇÃO (2026-02-05): Usa salvar_xml_por_certificado() para garantir:
+    1. Salvamento local em xmls/ (backup)
+    2. Salvamento no storage configurado (se existir)
+    3. Nome do certificado usado nas pastas do storage
     
     Args:
         db: Instância do banco de dados (NFSeDatabase)
@@ -75,78 +49,45 @@ def salvar_xml_nfse(db, cnpj, xml_content, numero_nfse, data_emissao):
         data_emissao: Data de emissao (formato ISO ou datetime)
     
     Returns:
-        Caminho do arquivo salvo ou None se erro
+        Tupla (caminho_local, caminho_storage) com os caminhos onde o XML foi salvo
+        Retorna (caminho_local, None) se storage não configurado
+        Retorna (None, None) em caso de erro
     """
     try:
-        from lxml import etree
-        import re
+        from nfe_search import salvar_xml_por_certificado
+        from modules.database import DatabaseManager
         
-        # Parse da data
-        if isinstance(data_emissao, str):
-            # Tenta varios formatos
-            for fmt in ['%Y-%m-%d', '%Y-%m-%dT%H:%M:%S', '%d/%m/%Y']:
-                try:
-                    dt = datetime.strptime(data_emissao.split('T')[0] if 'T' in data_emissao else data_emissao, fmt)
-                    break
-                except:
-                    continue
-            else:
-                dt = datetime.now()
-        else:
-            dt = data_emissao
+        # Salva localmente (backup) usando função padrão
+        resultado_local = salvar_xml_por_certificado(xml_content, cnpj)
+        caminho_local = resultado_local[0] if isinstance(resultado_local, tuple) else resultado_local
+        logger.info(f"   💾 XML salvo localmente (backup): {caminho_local}")
         
-        # Extrai ano e mês
-        ano = str(dt.year)
-        mes = f"{dt.month:02d}"
-        
-        # Lê formato de pasta do banco (mesmo padrão de NF-e/CT-e)
+        # Verifica se há storage configurado
         try:
-            formato_mes = db.get_config('storage_formato_mes', 'AAAA-MM')
-        except:
-            formato_mes = 'AAAA-MM'  # Padrão se não conseguir ler
-        
-        # Aplica formato configurado
-        if formato_mes == 'MM-AAAA':
-            ano_mes = f"{mes}-{ano}"
-        elif formato_mes == 'AAAA/MM':
-            ano_mes = f"{ano}/{mes}"
-        elif formato_mes == 'MM/AAAA':
-            ano_mes = f"{mes}/{ano}"
-        else:  # AAAA-MM (padrão)
-            ano_mes = f"{ano}-{mes}"
-        
-        # Extrai nome do prestador do XML para nomenclatura
-        xNome = "NFSe"  # Padrão
-        try:
-            root = etree.fromstring(xml_content.encode('utf-8') if isinstance(xml_content, str) else xml_content)
-            ns = '{http://www.sped.fazenda.gov.br/nfse}'
+            from nfe_search import get_data_dir
+            _db_path = str(get_data_dir() / 'notas.db')
+            db_main = DatabaseManager(_db_path)
+            pasta_storage = db_main.get_config('storage_pasta_base', 'xmls')
             
-            # Tenta extrair RazaoSocial do Prestador
-            razao_social = root.findtext(f'.//{ns}PrestadorServico//{ns}RazaoSocial')
-            if razao_social:
-                # Sanitiza o nome (remove caracteres inválidos)
-                xNome = re.sub(r'[\\/*?:"<>|]', "_", razao_social).strip()[:50]  # Limita a 50 caracteres
+            if pasta_storage and pasta_storage != 'xmls':
+                # Busca nome amigável do certificado
+                nome_cert = db_main.get_cert_nome_by_informante(cnpj)
+                
+                # Salva também no storage
+                resultado_storage = salvar_xml_por_certificado(xml_content, cnpj, pasta_base=pasta_storage, nome_certificado=nome_cert)
+                caminho_storage = resultado_storage[0] if isinstance(resultado_storage, tuple) else resultado_storage
+                logger.info(f"   💾 XML salvo no armazenamento: {caminho_storage}")
+                return (caminho_local, caminho_storage)
+            else:
+                return (caminho_local, None)
+                
         except Exception as e:
-            logger.debug(f"   ⚠️ Não foi possível extrair razão social do XML: {e}")
-        
-        # Define estrutura de pastas: xmls/{CNPJ}/{ANO-MES}/NFSe/
-        pasta_base = Path(__file__).parent / "xmls" / cnpj / ano_mes / "NFSe"
-        pasta_base.mkdir(parents=True, exist_ok=True)
-        
-        # Nome do arquivo no padrão: {NUMERO}-{FORNECEDOR}.xml
-        nome_arquivo = f"{numero_nfse}-{xNome}.xml"
-        caminho_completo = pasta_base / nome_arquivo
-        
-        # Salva XML
-        with open(caminho_completo, 'w', encoding='utf-8') as f:
-            f.write(xml_content)
-        
-        logger.info(f"   💾 XML salvo: {caminho_completo}")
-        return str(caminho_completo)
+            logger.warning(f"   ⚠️  Não foi possível salvar no storage: {e}")
+            return (caminho_local, None)
         
     except Exception as e:
         logger.error(f"   ❌ Erro ao salvar XML: {e}")
-        return None
+        return (None, None)
 
 
 def buscar_nfse_ambiente_nacional(db, cert_data, config_nfse, busca_completa=False):
@@ -255,7 +196,7 @@ def buscar_nfse_ambiente_nacional(db, cert_data, config_nfse, busca_completa=Fal
                 )
                 
                 # Salva XML
-                caminho_xml = salvar_xml_nfse(
+                caminhos = salvar_xml_nfse(
                     db=db,
                     cnpj=cnpj,
                     xml_content=xml_content,
@@ -263,7 +204,9 @@ def buscar_nfse_ambiente_nacional(db, cert_data, config_nfse, busca_completa=Fal
                     data_emissao=data_emissao
                 )
                 
-                if caminho_xml:
+                caminho_xml_local, caminho_xml_storage = caminhos if caminhos else (None, None)
+                
+                if caminho_xml_local:
                     # Salva no banco local (nfse_baixadas)
                     db.salvar_nfse(
                         numero=numero_nfse,
@@ -313,29 +256,41 @@ def buscar_nfse_ambiente_nacional(db, cert_data, config_nfse, busca_completa=Fal
                             )
                             
                             # Tenta baixar com retry (3 tentativas)
-                            pdf_content = nfse_service.consultar_danfse(chave_acesso, retry=3)
+                            pdf_content = nfse_service.consultar_danfse(chave_acesso, retry=1)
                             
                             if pdf_content:
-                                # Salva PDF OFICIAL na mesma pasta do XML
-                                pdf_path = caminho_xml.replace('.xml', '.pdf')
-                                with open(pdf_path, 'wb') as f:
-                                    f.write(pdf_content)
+                                # Salva PDF OFICIAL no mesmo local do XML (LOCAL)
+                                if caminho_xml_local:
+                                    pdf_path_local = caminho_xml_local.replace('.xml', '.pdf')
+                                    with open(pdf_path_local, 'wb') as f:
+                                        f.write(pdf_content)
+                                    logger.info(f"   ✅ DANFSe OFICIAL salvo (local): {pdf_path_local}")
                                 
-                                logger.info(f"   ✅ DANFSe OFICIAL salvo: {pdf_path}")
+                                # Salva PDF OFICIAL no mesmo local do XML (STORAGE)
+                                if caminho_xml_storage:
+                                    pdf_path_storage = caminho_xml_storage.replace('.xml', '.pdf')
+                                    with open(pdf_path_storage, 'wb') as f:
+                                        f.write(pdf_content)
+                                    logger.info(f"   ✅ DANFSe OFICIAL salvo (storage): {pdf_path_storage}")
+
+                            else:
+                                # PDF não disponível — município não integrado ao ADN ou nota cancelada
+                                logger.info(f"   ℹ️  PDF não retornado pela API ADN (sem conteúdo)")
+                                logger.info(f"   ℹ️  Município possivelmente não integrado ao Padrão Nacional ADN")
+
                         else:
                             logger.warning(f"   ⚠️  NFS-e {numero_nfse} sem ChaveAcesso - PDF não disponível")
                     
                     except Exception as e_pdf:
-                        logger.warning(f"   ⚠️  API indisponível: {str(e_pdf)[:100]}")
-                        
-                        # FALLBACK: Gera PDF local genérico
-                        logger.info(f"   🔄 Gerando PDF genérico local (API indisponível)...")
-                        pdf_path = caminho_xml.replace('.xml', '.pdf')
-                        if gerar_pdf_nfse(xml_content, pdf_path):
-                            logger.info(f"   ✅ PDF genérico salvo: {pdf_path}")
-                            logger.info(f"   💡 Dica: Execute gerar_pdfs_nfse.py para tentar baixar PDFs oficiais")
+                        _e_str = str(e_pdf)
+                        logger.info(f"   ℹ️  PDF indisponível via API: {_e_str[:120]}")
+                        if '502' in _e_str or '503' in _e_str or '504' in _e_str or 'Bad Gateway' in _e_str or 'Gateway' in _e_str:
+                            logger.info(f"   ℹ️  Erro {('502' if '502' in _e_str else '503' if '503' in _e_str else '504')} (servidor ADN instável) — PDF pode ser baixado depois via Atualizar PDFs")
                         else:
-                            logger.warning(f"   ⚠️  Não foi possível gerar PDF")
+                            logger.info(f"   ℹ️  Município não integrado ao Padrão Nacional ADN — PDF indisponível")
+                            logger.info(f"   ℹ️  Isso NÃO é um bug! Acontece quando:")
+                            logger.info(f"   ℹ️    • Município não integrado ao Padrão Nacional ADN")
+                            logger.info(f"   ℹ️    • Em breve o município irá aderir ao Padrão!")
                     
             except Exception as e:
                 logger.error(f"   ❌ Erro ao processar NSU={nsu}: {e}")
@@ -375,15 +330,18 @@ def processar_certificado(db, cert_data, busca_completa=False):
     logger.info(f"UF: {cuf}")
     logger.info(f"Certificado: {cert_path}")
     
-    # Busca configuracoes NFS-e para este CNPJ
+    # Busca configuracoes NFS-e para este CNPJ (provedores municipais)
     configs = db.get_config_nfse(cnpj)
     
     if not configs:
-        logger.info("⚠️  Nenhuma configuracao NFS-e encontrada para este certificado")
-        logger.info("   Use test_nfse_module.py para configurar")
-        return 0
-    
-    logger.info(f"✅ {len(configs)} configuracao(oes) NFS-e encontrada(s)")
+        # Sem configuração municipal — tenta Ambiente Nacional diretamente.
+        # O Ambiente Nacional (Receita Federal) não exige configuração de provedor/município.
+        logger.info("ℹ️  Sem config municipal — tentando Ambiente Nacional (Receita Federal)")
+        # Usa config padrão: provedor vazio, município vazio (não usado em buscar_nfse_ambiente_nacional)
+        configs = [('AMBIENTE_NACIONAL', '', '', None)]
+        logger.info(f"✅ Usando Ambiente Nacional como padrão")
+    else:
+        logger.info(f"✅ {len(configs)} configuracao(oes) municipal(ais) encontrada(s)")
     
     total_notas = 0
     
@@ -391,14 +349,16 @@ def processar_certificado(db, cert_data, busca_completa=False):
     for config in configs:
         provedor, cod_municipio, inscricao_municipal, url = config
         
-        logger.info(f"\n--- Configuracao ---")
-        logger.info(f"   Provedor: {provedor}")
-        logger.info(f"   Municipio: {cod_municipio}")
-        logger.info(f"   Inscricao: {inscricao_municipal}")
+        if provedor == 'AMBIENTE_NACIONAL':
+            logger.info(f"\n--- Ambiente Nacional (Receita Federal) ---")
+            logger.info(f"   Metodo: Consulta propria via certificado digital (NSU)")
+        else:
+            logger.info(f"\n--- Configuracao Municipal ---")
+            logger.info(f"   Provedor: {provedor}")
+            logger.info(f"   Municipio: {cod_municipio}")
+            logger.info(f"   Inscricao: {inscricao_municipal}")
+            logger.info("   Metodo: Consulta propria via certificado digital")
         
-        # Usa consulta propria via Ambiente Nacional
-        # Similar ao que fazemos com NF-e e CT-e
-        logger.info("   Metodo: Consulta propria via certificado digital")
         notas = buscar_nfse_ambiente_nacional(db, cert_data, config, busca_completa=busca_completa)
         total_notas += len(notas)
         

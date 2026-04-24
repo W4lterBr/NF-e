@@ -1,10 +1,31 @@
 import os
+import sys
 from pathlib import Path
 
-chave = "31062001213891738000138240000000161624014871184399"
+# 🔧 Detecta diretório automaticamente (funciona em qualquer PC/instalação)
+if getattr(sys, 'frozen', False):
+    # Executável compilado (PyInstaller)
+    if hasattr(sys, '_MEIPASS'):
+        # Modo onefile
+        base_dir = Path(sys._MEIPASS).parent
+    else:
+        # Modo onedir
+        base_dir = Path(sys.executable).parent
+else:
+    # Modo desenvolvimento
+    base_dir = Path(__file__).parent
 
-# Busca recursivamente pelo arquivo
-base_dir = Path(r"c:\Users\Nasci\OneDrive\Documents\Programas VS Code\BOT - Busca NFE")
+# Ou usa pasta de dados do Windows (AppData)
+# Melhor para dados persistentes entre instalações
+import os
+DATA_DIR = Path(os.getenv('APPDATA')) / 'Busca XML'
+if DATA_DIR.exists() and (DATA_DIR / 'xmls').exists():
+    base_dir = DATA_DIR
+    print(f"📂 Usando pasta de dados: {base_dir}")
+else:
+    print(f"📂 Usando pasta local: {base_dir}")
+
+chave = "31062001213891738000138240000000161624014871184399"
 
 print(f"Procurando arquivos com chave: {chave}\n")
 

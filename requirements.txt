@@ -1,47 +1,55 @@
 # ====================================
 # BOT - Busca NFE - Requirements
 # Sistema de Busca e Gerenciamento de NF-e, CT-e e NFS-e
-# Versão: 2.0
-# Data: 2025-12-18
+# Versão: 1.0.96
+# Data: 06/02/2026
+# ====================================
+
+# ====================================
+# DEPENDÊNCIAS PRINCIPAIS
 # ====================================
 
 # Interface Gráfica
-PyQt5>=5.15.9
+PyQt5>=5.15.11
 PyQt5-Qt5>=5.15.2
-PyQt5-sip>=12.12.1
+PyQt5-sip>=12.15.0
 
 # Processamento XML
-lxml>=4.9.3
+lxml>=5.2.2
 
 # Requisições HTTP e SOAP
-requests>=2.31.0
-requests-pkcs12>=1.20
-urllib3>=2.0.7
-zeep>=4.2.1
+requests>=2.32.3
+requests-pkcs12>=1.25
+urllib3>=2.2.2
+zeep>=4.3.1
 
 # Criptografia e Certificados Digitais
-cryptography>=41.0.7
-pyOpenSSL>=23.3.0
-wincertstore>=0.2  # Para acessar certificados do Windows
-signxml>=3.2.2  # Para assinatura XMLDSIG conforme padrão SEFAZ
-pynfe>=0.6.0  # Biblioteca Python para NF-e e eventos de manifestação
+cryptography>=46.0.4
+pyOpenSSL>=24.2.1
+wincertstore>=0.2.1
+signxml>=4.0.2
 
 # PDF Generation
-reportlab>=4.0.7
-borb>=2.1.18
+reportlab>=4.2.2
 PyPDF2>=3.0.1
 
+# Manipulação de Imagens
+Pillow>=10.1.0
+
+# Excel Export
+openpyxl>=3.1.5
+
 # Data e Tempo
-python-dateutil>=2.8.2
+python-dateutil>=2.9.0
 
 # Utilitários
 python-dotenv>=1.0.0
-pathlib>=1.0.1
-psutil>=5.9.0  # Para gerenciamento de processos (updater)
+psutil>=6.0.0
 
 # ====================================
 # OPCIONAL - Para desenvolvimento
 # ====================================
-# PyInstaller>=6.3.0  # Para compilar executável
-# autopep8>=2.0.4  # Para formatação
-# pylint>=3.0.3  # Para análise de código
+# PyInstaller>=6.17.0  # Para compilar executável
+# autopep8>=2.0.4     # Para formatação
+# pylint>=3.0.3       # Para análise de código
+# pytest>=7.4.0       # Para testes unitários

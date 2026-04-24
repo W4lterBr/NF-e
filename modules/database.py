@@ -194,6 +194,12 @@ class DatabaseManager:
                     print("[MIGRAÇÃO] ✅ Coluna pdf_path adicionada com sucesso")
                     print("[INFO] PDFs serão indexados automaticamente conforme forem acessados")
                 
+                # Migração: Adiciona coluna pdf_tipo ('OFICIAL', 'GENERICO', NULL=desconhecido)
+                if 'pdf_tipo' not in columns:
+                    print("[MIGRAÇÃO] Adicionando coluna pdf_tipo para controle de qualidade de PDFs...")
+                    conn.execute("ALTER TABLE notas_detalhadas ADD COLUMN pdf_tipo TEXT")
+                    print("[MIGRAÇÃO] ✅ Coluna pdf_tipo adicionada com sucesso")
+                
                 # Migração: Adiciona colunas IBS e CBS (Reforma Tributária)
                 if 'v_ibs' not in columns:
                     print("[MIGRAÇÃO] Adicionando coluna v_ibs (Imposto sobre Bens e Serviços)...")
@@ -203,9 +209,373 @@ class DatabaseManager:
                     print("[MIGRAÇÃO] Adicionando coluna v_cbs (Contribuição sobre Bens e Serviços)...")
                     conn.execute("ALTER TABLE notas_detalhadas ADD COLUMN v_cbs TEXT")
                     print("[MIGRAÇÃO] ✅ Coluna v_cbs adicionada com sucesso")
+
+                # Reparo: preenche nome_destinatario em NFS-e ADN que foram salvas sem esse campo
+                try:
+                    conn.execute("""
+                        UPDATE notas_detalhadas
+                        SET nome_destinatario = (
+                            SELECT d.tom_xnome FROM nfse_docs d
+                            WHERE d.prest_cnpj = notas_detalhadas.cnpj_emitente
+                              AND d.n_nfse = notas_detalhadas.numero
+                              AND d.tom_xnome IS NOT NULL AND d.tom_xnome != ''
+                            LIMIT 1
+                        )
+                        WHERE tipo = 'NFS-e'
+                          AND (nome_destinatario IS NULL OR nome_destinatario = '')
+                          AND EXISTS (
+                            SELECT 1 FROM nfse_docs d
+                            WHERE d.prest_cnpj = notas_detalhadas.cnpj_emitente
+                              AND d.n_nfse = notas_detalhadas.numero
+                              AND d.tom_xnome IS NOT NULL AND d.tom_xnome != ''
+                          )
+                    """)
+                    if conn.execute("SELECT changes()").fetchone()[0]:
+                        print("[MIGRAÇÃO] ✅ nome_destinatario preenchido para NFS-e ADN existentes")
+                except Exception as _e:
+                    print(f"[MIGRAÇÃO] Aviso ao reparar nome_destinatario: {_e}")
             except Exception as e:
                 print(f"[MIGRAÇÃO] Erro ao adicionar colunas: {e}")
-            
+
+            # ------------------------------------------------------------------
+            # Tabela nfe_docs — campos completos extraídos do XML NF-e
+            # ------------------------------------------------------------------
+            conn.execute('''CREATE TABLE IF NOT EXISTS nfe_docs (
+                chave          TEXT PRIMARY KEY,
+                informante     TEXT,
+                caminho_xml    TEXT,
+                caminho_pdf    TEXT,
+                xml_status     TEXT,
+                -- ide
+                c_uf           TEXT,
+                nat_op         TEXT,
+                mod            TEXT,
+                serie          TEXT,
+                n_nf           TEXT,
+                dh_emi         TEXT,
+                dh_sai_ent     TEXT,
+                tp_nf          TEXT,
+                id_dest        TEXT,
+                c_mun_fg       TEXT,
+                tp_imp         TEXT,
+                tp_emis        TEXT,
+                fin_nfe        TEXT,
+                ind_final      TEXT,
+                ind_pres       TEXT,
+                -- emitente
+                emit_cnpj      TEXT,
+                emit_cpf       TEXT,
+                emit_ie        TEXT,
+                emit_xnome     TEXT,
+                emit_xfant     TEXT,
+                emit_xlgr      TEXT,
+                emit_nro       TEXT,
+                emit_xbairro   TEXT,
+                emit_cmun      TEXT,
+                emit_xmun      TEXT,
+                emit_uf        TEXT,
+                emit_cep       TEXT,
+                emit_crt       TEXT,
+                -- destinatário
+                dest_cnpj      TEXT,
+                dest_cpf       TEXT,
+                dest_ie        TEXT,
+                dest_xnome     TEXT,
+                dest_xlgr      TEXT,
+                dest_nro       TEXT,
+                dest_xbairro   TEXT,
+                dest_cmun      TEXT,
+                dest_xmun      TEXT,
+                dest_uf        TEXT,
+                dest_cep       TEXT,
+                -- totais ICMSTot
+                v_bc           TEXT,
+                v_icms         TEXT,
+                v_icms_deson   TEXT,
+                v_fcp          TEXT,
+                v_bc_st        TEXT,
+                v_st           TEXT,
+                v_fcp_st       TEXT,
+                v_prod         TEXT,
+                v_frete        TEXT,
+                v_seg          TEXT,
+                v_desc         TEXT,
+                v_ii           TEXT,
+                v_ipi          TEXT,
+                v_pis          TEXT,
+                v_cofins       TEXT,
+                v_outro        TEXT,
+                v_nf           TEXT,
+                v_tot_trib     TEXT,
+                -- IBS/CBS (Reforma Tributária)
+                v_ibs          TEXT,
+                v_cbs          TEXT,
+                v_bc_ibscbs    TEXT,
+                -- transporte
+                mod_frete      TEXT,
+                transp_cnpj    TEXT,
+                transp_xnome   TEXT,
+                -- pagamento
+                t_pag          TEXT,
+                v_pag          TEXT,
+                -- protocolo
+                n_prot         TEXT,
+                dh_recbto      TEXT,
+                c_stat         TEXT,
+                x_motivo       TEXT,
+                -- controle
+                indexado_em    TEXT
+            )''')
+            try:
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_nfe_docs_informante ON nfe_docs(informante)")
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_nfe_docs_emit_cnpj ON nfe_docs(emit_cnpj)")
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_nfe_docs_dest_cnpj ON nfe_docs(dest_cnpj)")
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_nfe_docs_dh_emi ON nfe_docs(dh_emi)")
+            except Exception:
+                pass
+
+            # ------------------------------------------------------------------
+            # Tabela cte_docs — campos completos extraídos do XML CT-e
+            # ------------------------------------------------------------------
+            conn.execute('''CREATE TABLE IF NOT EXISTS cte_docs (
+                chave          TEXT PRIMARY KEY,
+                informante     TEXT,
+                caminho_xml    TEXT,
+                caminho_pdf    TEXT,
+                xml_status     TEXT,
+                -- ide
+                c_uf           TEXT,
+                c_ct           TEXT,
+                cfop           TEXT,
+                nat_op         TEXT,
+                mod            TEXT,
+                serie          TEXT,
+                n_ct           TEXT,
+                dh_emi         TEXT,
+                tp_imp         TEXT,
+                tp_emis        TEXT,
+                tp_amb         TEXT,
+                tp_cte         TEXT,
+                modal          TEXT,
+                tp_serv        TEXT,
+                c_mun_ini      TEXT,
+                x_mun_ini      TEXT,
+                uf_ini         TEXT,
+                c_mun_fim      TEXT,
+                x_mun_fim      TEXT,
+                uf_fim         TEXT,
+                -- emitente
+                emit_cnpj      TEXT,
+                emit_ie        TEXT,
+                emit_xnome     TEXT,
+                emit_xfant     TEXT,
+                emit_uf        TEXT,
+                emit_xmun      TEXT,
+                emit_cep       TEXT,
+                -- remetente
+                rem_cnpj       TEXT,
+                rem_cpf        TEXT,
+                rem_ie         TEXT,
+                rem_xnome      TEXT,
+                rem_uf         TEXT,
+                rem_xmun       TEXT,
+                rem_cep        TEXT,
+                -- destinatário
+                dest_cnpj      TEXT,
+                dest_cpf       TEXT,
+                dest_ie        TEXT,
+                dest_xnome     TEXT,
+                dest_uf        TEXT,
+                dest_xmun      TEXT,
+                dest_cep       TEXT,
+                -- tomador
+                tom_cnpj       TEXT,
+                tom_cpf        TEXT,
+                tom_ie         TEXT,
+                tom_xnome      TEXT,
+                -- valores prestação
+                v_tprest       TEXT,
+                v_rec          TEXT,
+                -- impostos
+                v_tot_trib     TEXT,
+                cst_icms       TEXT,
+                v_bc_icms      TEXT,
+                v_icms         TEXT,
+                -- carga
+                v_carga        TEXT,
+                pro_pred       TEXT,
+                v_carga_averb  TEXT,
+                -- NF-e vinculadas (JSON array de chaves)
+                nfe_vinculadas TEXT,
+                -- modal rodoviário
+                rntrc          TEXT,
+                veic_placa     TEXT,
+                -- protocolo
+                n_prot         TEXT,
+                dh_recbto      TEXT,
+                c_stat         TEXT,
+                x_motivo       TEXT,
+                -- controle
+                indexado_em    TEXT
+            )''')
+            try:
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_cte_docs_informante ON cte_docs(informante)")
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_cte_docs_emit_cnpj ON cte_docs(emit_cnpj)")
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_cte_docs_rem_cnpj ON cte_docs(rem_cnpj)")
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_cte_docs_dest_cnpj ON cte_docs(dest_cnpj)")
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_cte_docs_dh_emi ON cte_docs(dh_emi)")
+            except Exception:
+                pass
+
+            # ------------------------------------------------------------------
+            # Tabela nfse_docs — campos completos extraídos do XML NFS-e
+            # ------------------------------------------------------------------
+            conn.execute('''CREATE TABLE IF NOT EXISTS nfse_docs (
+                chave          TEXT PRIMARY KEY,
+                informante     TEXT,
+                caminho_xml    TEXT,
+                caminho_pdf    TEXT,
+                xml_status     TEXT,
+                -- identificação
+                n_nfse         TEXT,
+                n_dfse         TEXT,
+                n_dps          TEXT,
+                serie          TEXT,
+                dh_proc        TEXT,
+                dh_emi         TEXT,
+                d_compet       TEXT,
+                c_stat         TEXT,
+                x_motivo       TEXT,
+                tp_emis        TEXT,
+                tp_amb         TEXT,
+                ver_aplic      TEXT,
+                -- localização
+                c_loc_incid    TEXT,
+                x_loc_incid    TEXT,
+                x_trib_nac     TEXT,
+                x_trib_mun     TEXT,
+                x_nbs          TEXT,
+                c_loc_prestacao TEXT,
+                -- prestador (emitente)
+                prest_cnpj     TEXT,
+                prest_cpf      TEXT,
+                prest_im       TEXT,
+                prest_xnome    TEXT,
+                prest_xfant    TEXT,
+                prest_cmun     TEXT,
+                prest_uf       TEXT,
+                prest_cep      TEXT,
+                prest_email    TEXT,
+                -- regime tributário
+                op_simp_nac    TEXT,
+                reg_esp_trib   TEXT,
+                -- tomador
+                tom_cnpj       TEXT,
+                tom_cpf        TEXT,
+                tom_xnome      TEXT,
+                tom_cmun       TEXT,
+                tom_uf         TEXT,
+                tom_cep        TEXT,
+                tom_email      TEXT,
+                -- serviço
+                c_trib_nac     TEXT,
+                c_trib_mun     TEXT,
+                x_desc_serv    TEXT,
+                c_nbs          TEXT,
+                -- valores
+                v_serv         TEXT,
+                v_bc           TEXT,
+                p_aliq         TEXT,
+                v_issqn        TEXT,
+                v_total_ret    TEXT,
+                v_liq          TEXT,
+                v_calc_dr      TEXT,
+                -- controle
+                indexado_em    TEXT
+            )''')
+            try:
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_nfse_docs_informante ON nfse_docs(informante)")
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_nfse_docs_prest_cnpj ON nfse_docs(prest_cnpj)")
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_nfse_docs_tom_cnpj ON nfse_docs(tom_cnpj)")
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_nfse_docs_dh_emi ON nfse_docs(dh_emi)")
+            except Exception:
+                pass
+
+            # Tabela nfce_docs — campos completos extraídos do XML NFC-e (modelo 65)
+            # ------------------------------------------------------------------
+            conn.execute('''CREATE TABLE IF NOT EXISTS nfce_docs (
+                chave          TEXT PRIMARY KEY,
+                informante     TEXT,
+                caminho_xml    TEXT,
+                caminho_pdf    TEXT,
+                xml_status     TEXT,
+                -- identificação
+                c_uf           TEXT,
+                nat_op         TEXT,
+                mod            TEXT,
+                serie          TEXT,
+                n_nf           TEXT,
+                dh_emi         TEXT,
+                tp_nf          TEXT,
+                c_mun_fg       TEXT,
+                tp_emis        TEXT,
+                fin_nfe        TEXT,
+                -- emitente
+                emit_cnpj      TEXT,
+                emit_cpf       TEXT,
+                emit_ie        TEXT,
+                emit_xnome     TEXT,
+                emit_xfant     TEXT,
+                emit_xlgr      TEXT,
+                emit_nro       TEXT,
+                emit_xbairro   TEXT,
+                emit_cmun      TEXT,
+                emit_xmun      TEXT,
+                emit_uf        TEXT,
+                emit_cep       TEXT,
+                emit_crt       TEXT,
+                -- destinatário (opcional na NFC-e)
+                dest_cnpj      TEXT,
+                dest_cpf       TEXT,
+                dest_xnome     TEXT,
+                -- produtos (JSON array)
+                produtos       TEXT,
+                qt_itens       INTEGER,
+                -- totais ICMSTot
+                v_prod         TEXT,
+                v_desc         TEXT,
+                v_frete        TEXT,
+                v_seg          TEXT,
+                v_outro        TEXT,
+                v_pis          TEXT,
+                v_cofins       TEXT,
+                v_nf           TEXT,
+                v_bc           TEXT,
+                v_icms         TEXT,
+                v_icms_deson   TEXT,
+                v_tot_trib     TEXT,
+                -- pagamento
+                t_pag          TEXT,
+                v_pag          TEXT,
+                v_troco        TEXT,
+                -- QR Code / suplementar
+                qr_code        TEXT,
+                url_chave      TEXT,
+                -- protocolo
+                n_prot         TEXT,
+                dh_recbto      TEXT,
+                c_stat         TEXT,
+                x_motivo       TEXT,
+                -- controle
+                indexado_em    TEXT
+            )''')
+            try:
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_nfce_docs_informante ON nfce_docs(informante)")
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_nfce_docs_emit_cnpj ON nfce_docs(emit_cnpj)")
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_nfce_docs_dh_emi ON nfce_docs(dh_emi)")
+            except Exception:
+                pass
+
             conn.commit()
     
     def load_notes(self, limit: int = 1000) -> List[Dict[str, Any]]:
@@ -469,7 +839,7 @@ class DatabaseManager:
         except Exception:
             return False
     
-    def atualizar_pdf_path(self, chave: str, pdf_path: str) -> bool:
+    def atualizar_pdf_path(self, chave: str, pdf_path: str, pdf_tipo: str = None) -> bool:
         """
         Update PDF path cache in notas_detalhadas table.
         
@@ -479,6 +849,7 @@ class DatabaseManager:
         Args:
             chave: Document key (44 digits)
             pdf_path: Absolute path to the PDF file
+            pdf_tipo: 'OFICIAL' (from ADN/ABRASF API) or 'GENERICO' (locally generated)
         
         Returns:
             True if updated successfully
@@ -486,8 +857,8 @@ class DatabaseManager:
         try:
             with self._connect() as conn:
                 conn.execute(
-                    "UPDATE notas_detalhadas SET pdf_path = ?, atualizado_em = ? WHERE chave = ?",
-                    (pdf_path, datetime.now().isoformat(), chave)
+                    "UPDATE notas_detalhadas SET pdf_path = ?, pdf_tipo = ?, atualizado_em = ? WHERE chave = ?",
+                    (pdf_path, pdf_tipo, datetime.now().isoformat(), chave)
                 )
                 conn.commit()
                 return True
@@ -582,7 +953,33 @@ class DatabaseManager:
                 return True
         except Exception:
             return False
-    
+
+    def get_nota_by_chave(self, chave: str) -> Optional[Dict[str, Any]]:
+        """Busca uma única nota pela chave usando o índice PRIMARY KEY (O(1))."""
+        with self._connect() as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                "SELECT * FROM notas_detalhadas WHERE chave = ?", (chave,)
+            ).fetchone()
+            return dict(row) if row else None
+
+    def atualizar_data_emissao_se_vazia(self, chave: str, data_emissao: str) -> bool:
+        """Atualiza data_emissao de uma nota somente se estiver vazia ou nula.
+        
+        Usado ao processar eventos (cancelamento, carta correção) para garantir que
+        notas que chegaram como RESUMO/INDISPONIVEL sempre tenham uma data visível.
+        """
+        try:
+            with self._connect() as conn:
+                conn.execute(
+                    "UPDATE notas_detalhadas SET data_emissao = ? WHERE chave = ? AND (data_emissao IS NULL OR data_emissao = '')",
+                    (data_emissao, chave)
+                )
+                conn.commit()
+                return True
+        except Exception:
+            return False
+
     def marcar_chave_cancelada(self, chave: str, motivo: str = 'Cancelamento') -> bool:
         """Marca uma chave como cancelada para não buscar mais eventos."""
         try:
@@ -847,3 +1244,169 @@ class DatabaseManager:
                 return None
         except Exception:
             return None
+
+    # ------------------------------------------------------------------
+    # Métodos upsert para as tabelas de documentos indexados
+    # ------------------------------------------------------------------
+
+    def upsert_nfe_doc(self, data: Dict[str, Any]) -> bool:
+        """Insere ou atualiza um documento NF-e na tabela nfe_docs."""
+        try:
+            fields = [
+                "chave", "informante", "caminho_xml", "caminho_pdf", "xml_status",
+                "c_uf", "nat_op", "mod", "serie", "n_nf", "dh_emi", "dh_sai_ent",
+                "tp_nf", "id_dest", "c_mun_fg", "tp_imp", "tp_emis", "fin_nfe",
+                "ind_final", "ind_pres",
+                "emit_cnpj", "emit_cpf", "emit_ie", "emit_xnome", "emit_xfant",
+                "emit_xlgr", "emit_nro", "emit_xbairro", "emit_cmun", "emit_xmun",
+                "emit_uf", "emit_cep", "emit_crt",
+                "dest_cnpj", "dest_cpf", "dest_ie", "dest_xnome",
+                "dest_xlgr", "dest_nro", "dest_xbairro", "dest_cmun", "dest_xmun",
+                "dest_uf", "dest_cep",
+                "v_bc", "v_icms", "v_icms_deson", "v_fcp", "v_bc_st", "v_st",
+                "v_fcp_st", "v_prod", "v_frete", "v_seg", "v_desc", "v_ii",
+                "v_ipi", "v_pis", "v_cofins", "v_outro", "v_nf", "v_tot_trib",
+                "v_ibs", "v_cbs", "v_bc_ibscbs",
+                "mod_frete", "transp_cnpj", "transp_xnome",
+                "t_pag", "v_pag",
+                "n_prot", "dh_recbto", "c_stat", "x_motivo",
+                "indexado_em",
+            ]
+            cols = ", ".join(fields)
+            placeholders = ", ".join(["?"] * len(fields))
+            values = [data.get(f) for f in fields]
+            with self._connect() as conn:
+                conn.execute(
+                    f"INSERT OR REPLACE INTO nfe_docs ({cols}) VALUES ({placeholders})",
+                    values,
+                )
+                conn.commit()
+            return True
+        except Exception as e:
+            print(f"[DB] Erro upsert_nfe_doc: {e}")
+            return False
+
+    def upsert_cte_doc(self, data: Dict[str, Any]) -> bool:
+        """Insere ou atualiza um documento CT-e na tabela cte_docs."""
+        try:
+            fields = [
+                "chave", "informante", "caminho_xml", "caminho_pdf", "xml_status",
+                "c_uf", "c_ct", "cfop", "nat_op", "mod", "serie", "n_ct", "dh_emi",
+                "tp_imp", "tp_emis", "tp_amb", "tp_cte", "modal", "tp_serv",
+                "c_mun_ini", "x_mun_ini", "uf_ini", "c_mun_fim", "x_mun_fim", "uf_fim",
+                "emit_cnpj", "emit_ie", "emit_xnome", "emit_xfant",
+                "emit_uf", "emit_xmun", "emit_cep",
+                "rem_cnpj", "rem_cpf", "rem_ie", "rem_xnome",
+                "rem_uf", "rem_xmun", "rem_cep",
+                "dest_cnpj", "dest_cpf", "dest_ie", "dest_xnome",
+                "dest_uf", "dest_xmun", "dest_cep",
+                "tom_cnpj", "tom_cpf", "tom_ie", "tom_xnome",
+                "v_tprest", "v_rec",
+                "v_tot_trib", "cst_icms", "v_bc_icms", "v_icms",
+                "v_carga", "pro_pred", "v_carga_averb",
+                "nfe_vinculadas",
+                "rntrc", "veic_placa",
+                "n_prot", "dh_recbto", "c_stat", "x_motivo",
+                "indexado_em",
+            ]
+            cols = ", ".join(fields)
+            placeholders = ", ".join(["?"] * len(fields))
+            values = [data.get(f) for f in fields]
+            with self._connect() as conn:
+                conn.execute(
+                    f"INSERT OR REPLACE INTO cte_docs ({cols}) VALUES ({placeholders})",
+                    values,
+                )
+                conn.commit()
+            return True
+        except Exception as e:
+            print(f"[DB] Erro upsert_cte_doc: {e}")
+            return False
+
+    def upsert_nfse_doc(self, data: Dict[str, Any]) -> bool:
+        """Insere ou atualiza um documento NFS-e na tabela nfse_docs."""
+        try:
+            fields = [
+                "chave", "informante", "caminho_xml", "caminho_pdf", "xml_status",
+                "n_nfse", "n_dfse", "n_dps", "serie", "dh_proc", "dh_emi",
+                "d_compet", "c_stat", "x_motivo", "tp_emis", "tp_amb", "ver_aplic",
+                "c_loc_incid", "x_loc_incid", "x_trib_nac", "x_trib_mun", "x_nbs",
+                "c_loc_prestacao",
+                "prest_cnpj", "prest_cpf", "prest_im", "prest_xnome", "prest_xfant",
+                "prest_cmun", "prest_uf", "prest_cep", "prest_email",
+                "op_simp_nac", "reg_esp_trib",
+                "tom_cnpj", "tom_cpf", "tom_xnome",
+                "tom_cmun", "tom_uf", "tom_cep", "tom_email",
+                "c_trib_nac", "c_trib_mun", "x_desc_serv", "c_nbs",
+                "v_serv", "v_bc", "p_aliq", "v_issqn", "v_total_ret", "v_liq", "v_calc_dr",
+                "indexado_em",
+            ]
+            cols = ", ".join(fields)
+            placeholders = ", ".join(["?"] * len(fields))
+            values = [data.get(f) for f in fields]
+            with self._connect() as conn:
+                conn.execute(
+                    f"INSERT OR REPLACE INTO nfse_docs ({cols}) VALUES ({placeholders})",
+                    values,
+                )
+                conn.commit()
+            return True
+        except Exception as e:
+            print(f"[DB] Erro upsert_nfse_doc: {e}")
+            return False
+
+    def upsert_nfce_doc(self, data: Dict[str, Any]) -> bool:
+        """Insere ou atualiza um documento NFC-e na tabela nfce_docs."""
+        try:
+            fields = [
+                "chave", "informante", "caminho_xml", "caminho_pdf", "xml_status",
+                "c_uf", "nat_op", "mod", "serie", "n_nf", "dh_emi", "tp_nf",
+                "c_mun_fg", "tp_emis", "fin_nfe",
+                "emit_cnpj", "emit_cpf", "emit_ie", "emit_xnome", "emit_xfant",
+                "emit_xlgr", "emit_nro", "emit_xbairro", "emit_cmun", "emit_xmun",
+                "emit_uf", "emit_cep", "emit_crt",
+                "dest_cnpj", "dest_cpf", "dest_xnome",
+                "produtos", "qt_itens",
+                "v_prod", "v_desc", "v_frete", "v_seg", "v_outro",
+                "v_pis", "v_cofins", "v_nf", "v_bc", "v_icms", "v_icms_deson", "v_tot_trib",
+                "t_pag", "v_pag", "v_troco",
+                "qr_code", "url_chave",
+                "n_prot", "dh_recbto", "c_stat", "x_motivo",
+                "indexado_em",
+            ]
+            cols = ", ".join(fields)
+            placeholders = ", ".join(["?"] * len(fields))
+            values = [data.get(f) for f in fields]
+            with self._connect() as conn:
+                conn.execute(
+                    f"INSERT OR REPLACE INTO nfce_docs ({cols}) VALUES ({placeholders})",
+                    values,
+                )
+                conn.commit()
+            return True
+        except Exception as e:
+            print(f"[DB] Erro upsert_nfce_doc: {e}")
+            return False
+
+    def atualizar_caminho_pdf_doc(self, chave: str, caminho_pdf: str, tipo_doc: str) -> bool:
+        """Atualiza o caminho do PDF nas tabelas de documentos indexados (nfe_docs / cte_docs / nfse_docs / nfce_docs)."""
+        tabelas = {
+            "NFe": "nfe_docs",
+            "CTe": "cte_docs",
+            "NFSe": "nfse_docs",
+            "NFCe": "nfce_docs",
+        }
+        tabela = tabelas.get(tipo_doc)
+        if not tabela:
+            return False
+        try:
+            with self._connect() as conn:
+                conn.execute(
+                    f"UPDATE {tabela} SET caminho_pdf = ? WHERE chave = ?",
+                    (caminho_pdf, chave),
+                )
+                conn.commit()
+            return True
+        except Exception as e:
+            print(f"[DB] Erro atualizar_caminho_pdf_doc: {e}")
+            return False

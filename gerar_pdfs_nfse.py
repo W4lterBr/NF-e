@@ -13,7 +13,9 @@ from time import sleep
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from buscar_nfse_auto import gerar_pdf_nfse, logger
+# 🔧 CORREÇÃO: Removida dependência de buscar_nfse_auto.py
+# O arquivo já importa gerar_danfse_profissional diretamente
+# Isso resolve problemas em outros PCs onde buscar_nfse_auto.py pode ter dependências não instaladas
 from gerar_danfse_profissional import gerar_danfse_profissional
 from modules.nfse_service import NFSeService
 from lxml import etree

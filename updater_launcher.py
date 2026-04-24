@@ -39,12 +39,11 @@ def wait_for_process_to_close(process_name: str, timeout: int = 30):
 
 def main():
     if len(sys.argv) < 3:
-        print("❌ Uso: updater_launcher.py <novo_exe> <exe_destino> [nova_versao]")
+        print("❌ Uso: updater_launcher.py <novo_exe> <exe_destino>")
         sys.exit(1)
     
     novo_exe = Path(sys.argv[1])
     exe_destino = Path(sys.argv[2])
-    nova_versao = sys.argv[3] if len(sys.argv) > 3 else None
     
     print("=" * 60)
     print("🚀 UPDATER LAUNCHER - Atualização Automática")
@@ -73,16 +72,6 @@ def main():
         if novo_exe.exists():
             shutil.move(str(novo_exe), str(exe_destino))
             print("✅ Executável atualizado com sucesso!")
-            
-            # Atualiza version.txt se nova versão foi fornecida
-            if nova_versao:
-                version_file = exe_destino.parent / 'version.txt'
-                print(f"📝 Atualizando version.txt para {nova_versao}...")
-                try:
-                    version_file.write_text(nova_versao, encoding='utf-8')
-                    print("✅ version.txt atualizado!")
-                except Exception as e:
-                    print(f"⚠️ Erro ao atualizar version.txt: {e}")
         else:
             print(f"❌ Erro: Arquivo {novo_exe} não encontrado!")
             sys.exit(1)
@@ -94,22 +83,55 @@ def main():
         # Reinicia a aplicação
         print(f"🚀 Reiniciando aplicação: {exe_destino}")
         
+        # Valida que executável existe antes de tentar reiniciar
+        if not exe_destino.exists():
+            print(f"❌ ERRO: Executável não encontrado: {exe_destino}")
+            print("   Não foi possível reiniciar automaticamente.")
+            print("   Por favor, inicie o programa manualmente.")
+            print()
+            print("Pressione ENTER para fechar...")
+            input()
+            sys.exit(1)
+        
+        # Lê versão atualizada para mostrar
+        try:
+            version_file = exe_destino.parent / "version.txt"
+            if version_file.exists():
+                nova_versao = version_file.read_text(encoding='utf-8').strip()
+                print(f"📦 Nova versão: {nova_versao}")
+        except Exception:
+            pass
+        
         # Usa subprocess.Popen para não bloquear
         # E executa em segundo plano sem manter o launcher aberto
-        if os.name == 'nt':  # Windows
-            subprocess.Popen(
-                [str(exe_destino)],
-                cwd=str(exe_destino.parent),
-                creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP,
-                close_fds=True
-            )
-        else:  # Linux/Mac
-            subprocess.Popen(
-                [str(exe_destino)],
-                cwd=str(exe_destino.parent),
-                start_new_session=True,
-                close_fds=True
-            )
+        try:
+            if os.name == 'nt':  # Windows
+                processo = subprocess.Popen(
+                    [str(exe_destino)],
+                    cwd=str(exe_destino.parent),
+                    creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP,
+                    close_fds=True,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL
+                )
+            else:  # Linux/Mac
+                processo = subprocess.Popen(
+                    [str(exe_destino)],
+                    cwd=str(exe_destino.parent),
+                    start_new_session=True,
+                    close_fds=True,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL
+                )
+            
+            print(f"✅ Aplicação reiniciada com sucesso! (PID: {processo.pid})")
+        except Exception as e:
+            print(f"❌ ERRO ao reiniciar: {e}")
+            print("   Por favor, inicie o programa manualmente.")
+            print()
+            print("Pressione ENTER para fechar...")
+            input()
+            sys.exit(1)
         
         print("✅ Atualização concluída! Aplicação reiniciada.")
         print()

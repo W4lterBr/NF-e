@@ -22,9 +22,15 @@ def generate_pdf(payload):
         if not xml_text or not out_path:
             return {"ok": False, "error": "Missing xml or out_path"}
         
-        # Call PDF generator
-        success = generate_danfe_pdf(xml_text, out_path, tipo)
-        return {"ok": success, "path": out_path if success else None}
+        # Call PDF generator — suporta retorno dict {ok, pdf_tipo} (NFS-e) e bool legado
+        raw = generate_danfe_pdf(xml_text, out_path, tipo)
+        if isinstance(raw, dict):
+            ok = raw.get("ok", False)
+            pdf_tipo = raw.get("pdf_tipo")
+        else:
+            ok = bool(raw)
+            pdf_tipo = None
+        return {"ok": ok, "path": out_path if ok else None, "pdf_tipo": pdf_tipo}
     except Exception as e:
         import traceback
         return {"ok": False, "error": str(e), "traceback": traceback.format_exc()}
@@ -68,17 +74,28 @@ if __name__ == "__main__":
         data = json.loads(input_data)
         task = data.get("task")
         payload = data.get("payload", {})
-        
+
+        # Redirect stdout → stderr while running the task so that library
+        # messages (e.g. WeasyPrint startup warnings) do not pollute the
+        # JSON line that the parent process reads from stdout.
+        _real_stdout = sys.stdout
+        sys.stdout = sys.stderr
+
         if task == "generate_pdf":
             result = generate_pdf(payload)
         elif task == "fetch_by_chave":
             result = fetch_by_chave(payload)
         else:
             result = {"ok": False, "error": f"Unknown task: {task}"}
-        
+
+        sys.stdout = _real_stdout
         print(json.dumps(result))
         sys.exit(0)
     except Exception as e:
         import traceback
+        try:
+            sys.stdout = _real_stdout  # type: ignore[name-defined]
+        except Exception:
+            pass
         print(json.dumps({"ok": False, "error": str(e), "traceback": traceback.format_exc()}))
         sys.exit(1)

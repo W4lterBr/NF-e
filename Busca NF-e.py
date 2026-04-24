@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import os
 import sys
@@ -265,6 +265,9 @@ def resolve_xml_text(item: Dict[str, Any]) -> Optional[str]:
             if xml_status_row and xml_status_row[0] == 'RESUMO':
                 print(f"[DEBUG XML] ⚠️ Nota marcada como RESUMO - sem XML completo disponível")
                 return None
+            if xml_status_row and xml_status_row[0] == 'INDISPONIVEL':
+                print(f"[DEBUG XML] 🚫 Nota marcada como INDISPONIVEL - XML não disponível no SEFAZ")
+                return None
             
             # Tenta pegar xml_completo primeiro (mais rápido)
             row = conn.execute("SELECT xml_completo, caminho_arquivo FROM xmls_baixados WHERE chave = ?", (chave,)).fetchone()
@@ -280,6 +283,17 @@ def resolve_xml_text(item: Dict[str, Any]) -> Optional[str]:
                         return Path(row[1]).read_text(encoding="utf-8", errors="ignore")
                     except Exception as e:
                         print(f"[DEBUG XML] ⚠️ Erro ao ler arquivo: {e}")
+            
+            # ⚡ FIX: xmls_caminhos tem o caminho exato — evita qualquer rglob
+            cam_row = conn.execute(
+                "SELECT caminho FROM xmls_caminhos WHERE chave = ? LIMIT 1", (chave,)
+            ).fetchone()
+            if cam_row and cam_row[0] and os.path.exists(cam_row[0]):
+                try:
+                    print(f"[DEBUG XML] ✅ XML encontrado via xmls_caminhos: {cam_row[0]}")
+                    return Path(cam_row[0]).read_text(encoding="utf-8", errors="ignore")
+                except Exception as e:
+                    print(f"[DEBUG XML] ⚠️ Erro ao ler via xmls_caminhos: {e}")
         
         print(f"[DEBUG XML] Buscando XML nas pastas locais para chave: {chave}")
         
@@ -320,8 +334,8 @@ def resolve_xml_text(item: Dict[str, Any]) -> Optional[str]:
             BASE_DIR / "xmls_nfce",
         ]
         # Pastas configuradas pelo usuário por CNPJ (emitidos)
+        digits_inf = ''.join(ch for ch in str(item.get('informante') or '') if ch.isdigit())
         try:
-            digits_inf = ''.join(ch for ch in str(item.get('informante') or '') if ch.isdigit())
             if digits_inf:
                 s = QSettings('NFE_System', 'BOT_NFE')
                 extra = str(s.value(f'emit_dirs/{digits_inf}', '') or '')
@@ -332,7 +346,54 @@ def resolve_xml_text(item: Dict[str, Any]) -> Optional[str]:
         except Exception:
             pass
         
-        # Primeira tentativa: busca rápida pelo nome do arquivo
+        # 🎯 CAMINHO DIRETO (NFS-e): tenta a pasta exata do ano-mês antes do rglob.
+        # Impede que uma NFS-e de mesmo número de outra data/prestador seja retornada.
+        if is_nfse and numero and digits_inf:
+            data_emissao_raw = str(item.get('data_emissao') or '')[:10]  # ex: "2020-06-15"
+            year_month_item = data_emissao_raw[:7] if len(data_emissao_raw) >= 7 else None
+            if year_month_item:
+                candidate_yms = [year_month_item]
+                try:
+                    yr, mo = year_month_item.split('-')
+                    candidate_yms.append(f"{mo}-{yr}")  # Formato legado MM-YYYY
+                except Exception:
+                    pass
+                for base_root in [DATA_DIR / "xmls", BASE_DIR / "xmls"]:
+                    inf_dir = base_root / digits_inf
+                    if not inf_dir.exists():
+                        continue
+                    for ym in candidate_yms:
+                        for tipo_subdir in ["NFSE", "NFSe", "nfse"]:
+                            cdir = inf_dir / ym / tipo_subdir
+                            if not cdir.exists():
+                                continue
+                            for sp in search_patterns:
+                                if '*' in sp:
+                                    found = list(cdir.glob(sp))
+                                else:
+                                    p = cdir / sp
+                                    found = [p] if p.exists() else []
+                                if found:
+                                    try:
+                                        f_path = found[0]
+                                        print(f"[DEBUG XML] ✅ XML encontrado (caminho direto por data): {f_path}")
+                                        xml_content = f_path.read_text(encoding="utf-8", errors="ignore")
+                                        if xml_content:
+                                            try:
+                                                with sqlite3.connect(str(DB_PATH)) as conn_upd:
+                                                    conn_upd.execute(
+                                                        "UPDATE notas_detalhadas SET xml_status = 'COMPLETO' WHERE chave = ?",
+                                                        (chave,)
+                                                    )
+                                                    conn_upd.commit()
+                                                    print(f"[DEBUG XML] ✅ NFS-e marcada como COMPLETO no banco")
+                                            except Exception:
+                                                pass
+                                            return xml_content
+                                    except Exception:
+                                        continue
+
+        # Primeira tentativa: busca rápida pelo nome do arquivo (fallback rglob)
         search_start = time.time()
         for r in roots:
             if not r.exists():
@@ -342,9 +403,18 @@ def resolve_xml_text(item: Dict[str, Any]) -> Optional[str]:
                 print(f"[DEBUG XML] ⏱️ Timeout na busca de XML (5s)")
                 break
             
+            # 🔒 SEGURANÇA: Restringe a busca ao subdiretório do informante quando disponível.
+            # Evita que um XML de outra empresa seja retornado por padrões genéricos
+            # como "NFSe_5.xml" ou "5-*.xml" que podem existir em múltiplos CNPJs.
+            if digits_inf and (r / digits_inf).exists():
+                search_base = r / digits_inf
+                print(f"[DEBUG XML] 🔒 Busca restrita à pasta do informante: {search_base}")
+            else:
+                search_base = r
+            
             # Tenta cada padrão de busca
             for search_pattern in search_patterns:
-                for f in r.rglob(search_pattern):
+                for f in search_base.rglob(search_pattern):
                     try:
                         print(f"[DEBUG XML] ✅ XML encontrado em: {f}")
                         xml_content = f.read_text(encoding="utf-8", errors="ignore")
@@ -603,9 +673,15 @@ class MainWindow(QMainWindow):
         
         # Cache de PDFs para abertura rápida {chave: pdf_path}
         self._pdf_cache = {}
+        # Cache de rate-limit SEFAZ 656: {cnpj: datetime_hit} — TTL 1 hora, compartilhado entre todos os fluxos
+        self._dist_rl_cache: dict = {}
+        # Cache de permissão 640: {(cnpj, chave)} — sesssão inteira; evita retentar combos que já falharam
+        self._dist_640_cache: set = set()
         self._cache_building = False
         self._cache_worker = None  # Referência para a thread do cache
         self._refreshing_emitidos = False  # Flag para evitar múltiplos refreshes simultâneos
+        self._is_shutting_down = False  # Flag para prevenir iniciar threads durante shutdown
+        self._really_closing = False       # Flag para distinguir fechar-janela (→ tray) de encerrar-app
         
         # Sistema de trabalhos em background
         self._trabalhos_ativos = []
@@ -666,7 +742,9 @@ class MainWindow(QMainWindow):
         self.date_inicio = QDateEdit()
         self.date_inicio.setCalendarPopup(True)
         self.date_inicio.setDisplayFormat("dd/MM/yyyy")
-        self.date_inicio.setDate(QDate.currentDate().addMonths(-3))  # Padrão: 3 meses atrás
+        # Padrão: primeiro dia do mês anterior (ex: hoje=04/03/2026 → 01/02/2026)
+        _hoje = QDate.currentDate()
+        self.date_inicio.setDate(QDate(_hoje.year(), _hoje.month(), 1).addMonths(-1))
         self.date_inicio.dateChanged.connect(self._on_filter_changed)
         self.date_inicio.setToolTip("Data inicial do filtro")
         
@@ -703,8 +781,8 @@ class MainWindow(QMainWindow):
         btn_manifestacao = QPushButton("Manifestação Manual"); btn_manifestacao.clicked.connect(lambda: self._manifestar_nota(None))
         btn_manifestacao.setToolTip("Manifestar um documento digitando a chave manualmente")
         btn_exportar = QPushButton("Exportar"); btn_exportar.clicked.connect(self.abrir_exportacao)
-        btn_relatorio = QPushButton("Relatório IBS/CBS"); btn_relatorio.clicked.connect(self.abrir_relatorio)
-        btn_relatorio.setToolTip("Relatório analítico com IBS e CBS")
+        btn_relatorio = QPushButton("📋 Relatórios"); btn_relatorio.clicked.connect(self.abrir_relatorios_menu)
+        btn_relatorio.setToolTip("Relatórios analíticos")
         
         # Seletor de intervalo entre buscas
         from PyQt5.QtWidgets import QSpinBox
@@ -822,7 +900,7 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
         tab1_layout.addWidget(self.table)
-        self.tabs.addTab(tab1, "Emitidos por terceiros")
+        self.tabs.addTab(tab1, "Entradas")
 
         # Second tab: Emitidos pela empresa
         tab2 = QWidget()
@@ -833,11 +911,11 @@ class MainWindow(QMainWindow):
         toolbar_layout_emitidos = QHBoxLayout(toolbar_emitidos)
         toolbar_layout_emitidos.setContentsMargins(0, 0, 0, 5)
         
-        # Botão recarregar
-        btn_reload_emitidos = QPushButton("🔄 Recarregar")
-        btn_reload_emitidos.setStyleSheet("""
+        # Botão consultar eventos em lote
+        btn_consultar_eventos_emitidos = QPushButton("🔍 Consultar Eventos")
+        btn_consultar_eventos_emitidos.setStyleSheet("""
             QPushButton {
-                background-color: #0078d4;
+                background-color: #27ae60;
                 color: white;
                 border: none;
                 padding: 6px 15px;
@@ -845,15 +923,22 @@ class MainWindow(QMainWindow):
                 font-weight: bold;
             }
             QPushButton:hover {
-                background-color: #106ebe;
+                background-color: #219a52;
+            }
+            QPushButton:disabled {
+                background-color: #aaa;
             }
         """)
-        btn_reload_emitidos.clicked.connect(self.refresh_emitidos_table)
-        toolbar_layout_emitidos.addWidget(btn_reload_emitidos)
+        btn_consultar_eventos_emitidos.setToolTip(
+            "Consulta eventos na SEFAZ para todas as notas exibidas no filtro atual e marca canceladas automaticamente"
+        )
+        btn_consultar_eventos_emitidos.clicked.connect(self._consultar_eventos_emitidos_lote)
+        toolbar_layout_emitidos.addWidget(btn_consultar_eventos_emitidos)
+        self.btn_consultar_eventos_emitidos = btn_consultar_eventos_emitidos
         
         # Label informativo
-        lbl_info_emitidos = QLabel("⚠️ NFS-e podem estar como RESUMO - clique 2x para tentar baixar XML completo")
-        lbl_info_emitidos.setStyleSheet("color: #666; font-size: 10px; padding: 5px;")
+        lbl_info_emitidos = QLabel("ℹ️ NFS-e emitidas pela empresa aparecem aqui com ícone ✅ (XML sempre disponível) — Saídas")
+        lbl_info_emitidos.setStyleSheet("color: #3a7ca5; font-size: 10px; padding: 5px;")
         toolbar_layout_emitidos.addWidget(lbl_info_emitidos)
         
         toolbar_layout_emitidos.addStretch()
@@ -902,7 +987,18 @@ class MainWindow(QMainWindow):
             pass
         
         tab2_layout.addWidget(self.table_emitidos)
-        self.tabs.addTab(tab2, "Emitidos pela empresa")
+        self.tabs.addTab(tab2, "Saídas")
+
+        # Atualiza totais no rodapé quando muda de aba
+        def _on_tab_changed(idx):
+            try:
+                if idx == 0:
+                    self._update_totais(getattr(self, '_table_fill_items', []) or [])
+                else:
+                    self._update_totais(self.filtered_emitidos())
+            except Exception:
+                pass
+        self.tabs.currentChanged.connect(_on_tab_changed)
 
         # Restaura ordem personalizada das colunas
         self._restore_column_order('table')
@@ -945,6 +1041,15 @@ class MainWindow(QMainWindow):
         self.search_summary_label.setStyleSheet("font-weight: bold; padding: 0 10px;")
         self._statusbar.addPermanentWidget(self.search_summary_label)
         
+        # Totais da aba ativa (NF-e / CT-e / NFS-e / Valor)
+        separator2 = QLabel("|")
+        separator2.setStyleSheet("color: #ccc; padding: 0 5px;")
+        self._statusbar.addPermanentWidget(separator2)
+
+        self.lbl_totais = QLabel("")
+        self.lbl_totais.setStyleSheet("font-size: 10px; padding: 0 8px; color: #333;")
+        self._statusbar.addPermanentWidget(self.lbl_totais)
+
         # Progress bar compacta na status bar
         self.search_progress = QProgressBar()
         self.search_progress.setMaximumWidth(200)
@@ -961,11 +1066,15 @@ class MainWindow(QMainWindow):
         # Data cache
         self.notes = []
         
+        # 🔄 Configura callback para atualizar interface quando uma nota é salva
+        self.db._callback_nova_nota = self._on_nova_nota_callback
+        
         # Estatísticas de busca
         self._search_stats = {
             'nfes_found': 0,
             'ctes_found': 0,
             'nfses_found': 0,
+            'chaves_found': 0,
             'start_time': None,
             'last_cert': ''
         }
@@ -987,6 +1096,9 @@ class MainWindow(QMainWindow):
         self._next_search_time = None
         self._selected_cert_cnpj = None  # Inicializa seleção de certificado
         self._pdf_generator_worker = None  # Thread de geração de PDFs
+        self._pdf_gerador_ativo = False    # Flag confiável (isRunning() tem race condition)
+        self._correcao_worker = None       # Thread de correção de xml_status
+        self._correcao_ativa = False       # Flag confiável (isRunning() tem race condition)
         self._status_timer = QTimer(self)
         self._status_timer.timeout.connect(self._update_search_status)
         self._status_timer.start(1000)  # Atualiza a cada segundo
@@ -1017,8 +1129,13 @@ class MainWindow(QMainWindow):
 
     def _gerar_pdfs_faltantes(self):
         """Gera PDFs para XMLs que ainda não possuem PDF (em background)."""
-        # Evita iniciar múltiplas threads
-        if self._pdf_generator_worker and self._pdf_generator_worker.isRunning():
+        # Evita iniciar threads durante shutdown
+        if self._is_shutting_down:
+            return
+        
+        # Guarda confiável: usa flag booleano em vez de isRunning()
+        # isRunning() tem race condition — pode retornar False logo após start()
+        if self._pdf_gerador_ativo:
             return
         
         class PDFGeneratorWorker(QThread):
@@ -1051,6 +1168,11 @@ class MainWindow(QMainWindow):
                         
                         pdf_file = xml_file.with_suffix('.pdf')
                         if not pdf_file.exists():
+                            # Verifica novamente antes de processar
+                            if self.isInterruptionRequested():
+                                print("[INFO] Geração de PDFs interrompida")
+                                break
+                            
                             try:
                                 xml_text = xml_file.read_text(encoding='utf-8')
                                 
@@ -1058,6 +1180,11 @@ class MainWindow(QMainWindow):
                                 # Só gera PDF se for nfeProc ou cteProc (documentos completos)
                                 if '<nfeProc' not in xml_text and '<cteProc' not in xml_text:
                                     continue
+                                
+                                # Verifica mais uma vez antes de gerar PDF (operação lenta)
+                                if self.isInterruptionRequested():
+                                    print("[INFO] Geração de PDFs interrompida")
+                                    break
                                 
                                 # Detecta tipo do documento
                                 tipo = "CTe" if "<CTe" in xml_text or "<cte" in xml_text else "NFe"
@@ -1080,8 +1207,28 @@ class MainWindow(QMainWindow):
                     print(f"[ERRO] Falha ao gerar PDFs: {e}")
                     self.finished_signal.emit(0)
         
+        # Marca como ocupado ANTES de start() para evitar race condition
+        self._pdf_gerador_ativo = True
+        
         # Cria e inicia worker
         self._pdf_generator_worker = PDFGeneratorWorker()
+        
+        # Limpa referência e flag quando a thread terminar
+        def _on_pdf_finished():
+            self._pdf_gerador_ativo = False
+            # NÃO fazer '= None' diretamente aqui — isso dispara o GC do Python
+            # e destrói o C++ QThread enquanto Qt ainda está no cleanup interno
+            # (causando "QThread: Destroyed while thread is still running").
+            # deleteLater() agenda a destruição segura no próximo ciclo do event loop.
+            old = self._pdf_generator_worker
+            self._pdf_generator_worker = None
+            if old is not None:
+                old.deleteLater()
+        # IMPORTANTE: usar .finished (sinal nativo do QThread, emitido APÓS run() retornar
+        # E após todo o cleanup interno do Qt) para ligar ao _on_pdf_finished,
+        # NÃO finished_signal (que é emitido de dentro de run(), enquanto thread ainda executa).
+        self._pdf_generator_worker.finished.connect(_on_pdf_finished)
+        
         self._pdf_generator_worker.start()
 
     def _atualizar_ufs_certificados(self):
@@ -1241,7 +1388,7 @@ class MainWindow(QMainWindow):
             from PyQt5.QtCore import QThread, pyqtSignal
             
             class UpdateStatusWorker(QThread):
-                finished = pyqtSignal(dict)
+                done = pyqtSignal(dict)   # renomeado: não shadowa QThread.finished nativo
                 error = pyqtSignal(str)
                 
                 def __init__(self, db, certs, chaves):
@@ -1259,7 +1406,7 @@ class MainWindow(QMainWindow):
                             self.chaves,
                             None  # Sem callback de progresso para ser silencioso
                         )
-                        self.finished.emit(stats)
+                        self.done.emit(stats)
                     except Exception as e:
                         self.error.emit(str(e))
             
@@ -1271,8 +1418,8 @@ class MainWindow(QMainWindow):
                 print(f"[AUTO-UPDATE] {msg}")
                 self.set_status(msg, 5000)
                 
-                # Limpa referência ao worker ANTES de recarregar (evita loop)
-                self._auto_update_worker = None
+                # NOTA: _auto_update_worker será limpo em _cleanup_auto_update_worker
+                # (conectado ao QThread.finished nativo, que dispara após run() terminar)
                 
                 # FORÇA recarregar dados do banco antes de atualizar tabela
                 print("[AUTO-UPDATE] Recarregando dados do banco...")
@@ -1296,13 +1443,18 @@ class MainWindow(QMainWindow):
             def on_error(error_msg):
                 print(f"[AUTO-UPDATE] Erro: {error_msg}")
                 self.set_status("Status atualizado com erros", 3000)
-                
-                # Limpa referência ao worker
+            
+            def _cleanup_auto_update_worker():
+                """Chamado pelo sinal NATIVO QThread.finished — thread já parou completamente."""
+                old = self._auto_update_worker
                 self._auto_update_worker = None
+                if old is not None:
+                    old.deleteLater()
             
             worker = UpdateStatusWorker(self.db, certs, chaves)
-            worker.finished.connect(on_finished)
+            worker.done.connect(on_finished)
             worker.error.connect(on_error)
+            worker.finished.connect(_cleanup_auto_update_worker)  # nativo: dispara APÓS run() terminar
             worker.start()
             
             # Mantém referência ao worker
@@ -1364,7 +1516,7 @@ class MainWindow(QMainWindow):
             from PyQt5.QtCore import QThread, pyqtSignal
             
             class UpdateStatusWorker(QThread):
-                finished = pyqtSignal(dict)
+                done = pyqtSignal(dict)   # renomeado: não shadowa QThread.finished nativo
                 error = pyqtSignal(str)
                 
                 def __init__(self, db, certs, chaves_nfe, chaves_cte):
@@ -1411,7 +1563,7 @@ class MainWindow(QMainWindow):
                             'canceladas_cte': stats_cte.get('canceladas', 0)
                         }
                         
-                        self.finished.emit(stats)
+                        self.done.emit(stats)
                     except Exception as e:
                         self.error.emit(str(e))
             
@@ -1426,8 +1578,8 @@ class MainWindow(QMainWindow):
                 print(f"[PÓS-BUSCA] {msg}")
                 self.set_status(msg, 5000)
                 
-                # Limpa worker
-                self._auto_update_worker = None
+                # NOTA: _auto_update_worker será limpo via _cleanup_pos_busca_worker
+                # (conectado ao QThread.finished nativo)
                 
                 # Recarrega dados se houver alterações
                 if stats.get('atualizadas', 0) > 0:
@@ -1438,14 +1590,24 @@ class MainWindow(QMainWindow):
                 # 🆕 SEMPRE executa correção de status (mesmo sem atualizações)
                 print("[PÓS-BUSCA] Executando correção automática de status XML...")
                 QTimer.singleShot(500, lambda: self._executar_correcao_status())
+                
+                # 🔗 EXECUTA TAREFAS ENCADEADAS (flag "Executar após Busca")
+                QTimer.singleShot(1000, lambda: self._executar_tarefas_encadeadas())
             
             def on_error(error_msg):
                 print(f"[PÓS-BUSCA] Erro: {error_msg}")
+            
+            def _cleanup_pos_busca_worker():
+                """Chamado pelo sinal NATIVO QThread.finished — thread já parou completamente."""
+                old = self._auto_update_worker
                 self._auto_update_worker = None
+                if old is not None:
+                    old.deleteLater()
             
             worker = UpdateStatusWorker(self.db, certs, chaves_nfe, chaves_cte)
-            worker.finished.connect(on_finished)
+            worker.done.connect(on_finished)
             worker.error.connect(on_error)
+            worker.finished.connect(_cleanup_pos_busca_worker)  # nativo: dispara APÓS run() terminar
             worker.start()
             
             # Mantém referência
@@ -1453,6 +1615,40 @@ class MainWindow(QMainWindow):
             
         except Exception as e:
             print(f"[PÓS-BUSCA] Erro geral: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    def _executar_tarefas_encadeadas(self):
+        """
+        Executa tarefas que foram configuradas com a flag "Executar após Busca de Notas".
+        
+        Chamado automaticamente após a busca na SEFAZ e atualização de status.
+        """
+        try:
+            from PyQt5.QtCore import QSettings
+            settings = QSettings('NFE_System', 'BOT_NFE')
+            
+            # Verifica se há tarefa configurada para execução após busca
+            executar_apos = settings.value('agendador/executar_apos_busca', False, type=bool)
+            if not executar_apos:
+                return
+            
+            tarefa_index = settings.value('agendador/tarefa_index', 0, type=int)
+            tarefa_nome = settings.value('agendador/tarefa_nome', '', type=str)
+            
+            # Não executa se a tarefa for a própria "Buscar Notas"
+            if tarefa_index == 0:
+                return
+            
+            print(f"[ENCADEAMENTO] ▶️  Executando tarefa encadeada: {tarefa_nome}")
+            self.set_status(f"⚙️ Executando tarefa encadeada: {tarefa_nome}...", 3000)
+            
+            # Executa tarefa usando o mesmo método do agendador
+            # Aguarda 2 segundos antes de executar (para não sobrecarregar)
+            QTimer.singleShot(2000, lambda: self._executar_tarefa_agendada(tarefa_index, tarefa_nome))
+        
+        except Exception as e:
+            print(f"[ENCADEAMENTO] ❌ Erro ao executar tarefa encadeada: {e}")
             import traceback
             traceback.print_exc()
     
@@ -1469,7 +1665,7 @@ class MainWindow(QMainWindow):
         """
         try:
             # Evita múltiplas execuções simultâneas
-            if hasattr(self, '_correcao_worker') and self._correcao_worker:
+            if self._correcao_ativa:
                 print("[CORREÇÃO] Já existe uma correção em andamento, aguardando...")
                 return
             
@@ -1478,7 +1674,7 @@ class MainWindow(QMainWindow):
             from PyQt5.QtCore import QThread, pyqtSignal
             
             class CorrecaoStatusWorker(QThread):
-                finished = pyqtSignal(int)  # Número de registros corrigidos
+                done = pyqtSignal(int)  # renomeado: não shadowa QThread.finished nativo
                 error = pyqtSignal(str)
                 
                 def __init__(self, parent_window):
@@ -1570,9 +1766,17 @@ class MainWindow(QMainWindow):
                                 try:
                                     with self.parent_window.db._connect() as conn:
                                         cursor = conn.cursor()
-                                        cursor.execute("SELECT xml_completo FROM xmls_baixados WHERE chave = ?", (chave,))
-                                        if cursor.fetchone():
-                                            arquivo_existe = True
+                                        cursor.execute(
+                                            "SELECT caminho_arquivo, xml_completo FROM xmls_baixados WHERE chave = ?",
+                                            (chave,)
+                                        )
+                                        row_xb = cursor.fetchone()
+                                        if row_xb:
+                                            caminho_xb, xml_completo_xb = row_xb
+                                            if caminho_xb and Path(caminho_xb).exists():
+                                                arquivo_existe = True
+                                            elif xml_completo_xb:
+                                                arquivo_existe = True
                                 except Exception:
                                     pass
                             
@@ -1616,7 +1820,7 @@ class MainWindow(QMainWindow):
                                 else:
                                     raise
                         
-                        self.finished.emit(corrigidos)
+                        self.done.emit(corrigidos)
                         
                     except Exception as e:
                         import traceback
@@ -1632,20 +1836,28 @@ class MainWindow(QMainWindow):
                 else:
                     print(f"[CORREÇÃO] ✅ Todos os registros estão consistentes")
                 
-                # Limpa worker
-                self._correcao_worker = None
+                # NOTA: _correcao_ativa e _correcao_worker serão limpos em _cleanup_correcao_worker
             
             def on_error(error_msg):
                 print(f"[CORREÇÃO] ❌ Erro: {error_msg}")
+            
+            def _cleanup_correcao_worker():
+                """Chamado pelo sinal NATIVO QThread.finished — thread já parou completamente."""
+                self._correcao_ativa = False
+                old = self._correcao_worker
                 self._correcao_worker = None
+                if old is not None:
+                    old.deleteLater()
             
+            # Marca como ocupado ANTES de start() para evitar race condition
+            self._correcao_ativa = True
             worker = CorrecaoStatusWorker(self)
-            worker.finished.connect(on_finished)
+            worker.done.connect(on_finished)
             worker.error.connect(on_error)
-            worker.start()
-            
-            # Mantém referência
+            worker.finished.connect(_cleanup_correcao_worker)  # nativo: dispara APÓS run() terminar
+            # Mantém referência ANTES de start() para evitar race condition
             self._correcao_worker = worker
+            worker.start()
             
         except Exception as e:
             print(f"[CORREÇÃO] Erro ao iniciar worker: {e}")
@@ -1671,38 +1883,14 @@ class MainWindow(QMainWindow):
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No
         )
-        
+
         if reply == QMessageBox.Yes:
             print("[DEBUG] Encerrando aplicação")
-            
-            # Finaliza threads ativas
-            if self._cache_worker and self._cache_worker.isRunning():
-                print("[DEBUG] Finalizando thread do cache...")
-                self._cache_worker.wait(1000)  # Aguarda até 1 segundo
-                if self._cache_worker.isRunning():
-                    self._cache_worker.terminate()
-            
-            if hasattr(self, '_load_worker') and self._load_worker and self._load_worker.isRunning():
-                print("[DEBUG] Finalizando thread de carregamento...")
-                self._load_worker.wait(1000)
-                if self._load_worker.isRunning():
-                    self._load_worker.terminate()
-            
-            # Finaliza threads de geração de PDF
-            if hasattr(self, '_pdf_workers'):
-                for worker in self._pdf_workers[:]:  # Cópia da lista
-                    if worker and worker.isRunning():
-                        print(f"[DEBUG] Aguardando finalização de thread PDF...")
-                        worker.wait(2000)  # Aguarda até 2 segundos
-                        if worker.isRunning():
-                            print(f"[DEBUG] Forçando término de thread PDF...")
-                            worker.terminate()
-                            worker.wait(500)
-                self._pdf_workers.clear()
-            
             if hasattr(self, 'tray_icon'):
                 self.tray_icon.hide()
-            QApplication.quit()
+            # Sinaliza encerramento real e delega toda a limpeza ao closeEvent
+            self._really_closing = True
+            self.close()
     
     def _setup_system_tray(self):
         """Configura o ícone na bandeja do sistema"""
@@ -1874,21 +2062,43 @@ class MainWindow(QMainWindow):
         if reply == QMessageBox.Yes:
             if self.tray_icon:
                 self.tray_icon.hide()
-            QApplication.quit()
+            # Sinaliza que é um encerramento real (não minimizar para bandeja).
+            # closeEvent vai limpar as threads e aceitar o evento.
+            self._really_closing = True
+            self.close()
     
     def closeEvent(self, event: QCloseEvent):
         """Intercepta o evento de fechar a janela."""
+        # Se NÃO for encerramento real, apenas minimiza para bandeja
+        # sem matar workers nem setar _is_shutting_down
+        if not getattr(self, '_really_closing', False):
+            event.ignore()
+            self.hide()
+            # Mostra notificação
+            if hasattr(self, 'tray_icon') and self.tray_icon.isVisible():
+                self.tray_icon.showMessage(
+                    "Busca de Notas Fiscais",
+                    "O sistema continua rodando em segundo plano. Clique com botão direito no ícone da bandeja para acessar as opções.",
+                    QSystemTrayIcon.Information,
+                    3000
+                )
+            return
+
+        # ── Encerramento real ────────────────────────────────────────────────
+        # Marca que está em processo de shutdown (bloqueia novos workers)
+        self._is_shutting_down = True
+
         # Finaliza threads ativas
         if self._cache_worker and self._cache_worker.isRunning():
             self._cache_worker.wait(1000)  # Aguarda até 1 segundo
             if self._cache_worker.isRunning():
                 self._cache_worker.terminate()  # Força finalização se necessário
-        
+
         if hasattr(self, '_load_worker') and self._load_worker and self._load_worker.isRunning():
             self._load_worker.wait(1000)
             if self._load_worker.isRunning():
                 self._load_worker.terminate()
-        
+
         # Finaliza thread de busca
         if hasattr(self, '_search_worker') and self._search_worker and self._search_worker.isRunning():
             print(f"[DEBUG] Aguardando finalização de thread de busca...")
@@ -1897,7 +2107,7 @@ class MainWindow(QMainWindow):
                 print(f"[DEBUG] Forçando término de thread de busca...")
                 self._search_worker.terminate()
                 self._search_worker.wait(500)
-        
+
         # Finaliza threads de geração de PDF
         if hasattr(self, '_pdf_workers'):
             for worker in self._pdf_workers[:]:  # Cópia da lista
@@ -1909,29 +2119,53 @@ class MainWindow(QMainWindow):
                         worker.terminate()
                         worker.wait(500)
             self._pdf_workers.clear()
-        
+
         # Finaliza thread de geração de PDFs em background
         if hasattr(self, '_pdf_generator_worker') and self._pdf_generator_worker and self._pdf_generator_worker.isRunning():
             print(f"[DEBUG] Aguardando finalização de thread de geração de PDFs...")
             self._pdf_generator_worker.requestInterruption()  # Sinal para parar graciosamente
-            self._pdf_generator_worker.wait(3000)  # Aguarda até 3 segundos
-            if self._pdf_generator_worker.isRunning():
+            if not self._pdf_generator_worker.wait(5000):  # Aguarda até 5 segundos
                 print(f"[DEBUG] Forçando término de thread de geração de PDFs...")
                 self._pdf_generator_worker.terminate()
-                self._pdf_generator_worker.wait(500)
-        
-        # Ao invés de fechar, minimiza para bandeja
-        event.ignore()
-        self.hide()
-        
-        # Mostra notificação
-        if hasattr(self, 'tray_icon') and self.tray_icon.isVisible():
-            self.tray_icon.showMessage(
-                "Busca de Notas Fiscais",
-                "O sistema continua rodando em segundo plano. Clique com botão direito no ícone da bandeja para acessar as opções.",
-                QSystemTrayIcon.Information,
-                3000
-            )
+                self._pdf_generator_worker.wait(1000)
+
+        # Finaliza thread de busca de NFS-e (aguarda mais - operação de BD pode ser lenta)
+        if hasattr(self, '_nfse_worker') and self._nfse_worker and self._nfse_worker.isRunning():
+            print(f"[DEBUG] Aguardando finalização de thread NFS-e...")
+            self._nfse_worker.wait(5000)  # NFS-e pode ser lenta — aguarda 5s
+            if self._nfse_worker.isRunning():
+                print(f"[DEBUG] Forçando término de thread NFS-e...")
+                self._nfse_worker.terminate()
+                self._nfse_worker.wait(1000)
+
+        # Finaliza thread de auto-update de status
+        if hasattr(self, '_auto_update_worker') and self._auto_update_worker and self._auto_update_worker.isRunning():
+            print(f"[DEBUG] Aguardando finalização de thread auto-update...")
+            self._auto_update_worker.wait(2000)
+            if self._auto_update_worker.isRunning():
+                self._auto_update_worker.terminate()
+                self._auto_update_worker.wait(500)
+
+        # Finaliza thread de correção
+        if hasattr(self, '_correcao_worker') and self._correcao_worker and self._correcao_worker.isRunning():
+            print(f"[DEBUG] Aguardando finalização de thread de correção...")
+            self._correcao_worker.wait(2000)
+            if self._correcao_worker.isRunning():
+                self._correcao_worker.terminate()
+                self._correcao_worker.wait(500)
+
+        # Finaliza thread de sincronização
+        if hasattr(self, '_sync_thread') and self._sync_thread and self._sync_thread.isRunning():
+            print(f"[DEBUG] Aguardando finalização de thread de sincronização...")
+            self._sync_thread.quit()
+            self._sync_thread.wait(2000)
+            if self._sync_thread.isRunning():
+                print(f"[DEBUG] Forçando término de thread de sincronização...")
+                self._sync_thread.terminate()
+                self._sync_thread.wait(500)
+
+        event.accept()
+        QApplication.quit()
     
     def _update_search_status(self):
         """Atualiza o status da busca no rodapé."""
@@ -2229,7 +2463,7 @@ class MainWindow(QMainWindow):
                     
                     xml_existe = False
                     
-                    # Busca em pastas locais
+                    # Busca em pastas locais fixas
                     pastas = [
                         DATA_DIR / "xmls",
                         DATA_DIR / "xmls_chave",
@@ -2238,6 +2472,27 @@ class MainWindow(QMainWindow):
                         DATA_DIR / "xml_extraidos",
                         DATA_DIR / "xml_resposta_sefaz"
                     ]
+                    
+                    # 🆕 Adiciona perfis de armazenamento ativos
+                    try:
+                        perfis = conn.execute("""
+                            SELECT pasta_base 
+                            FROM perfis_armazenamento 
+                            WHERE ativo = 1 AND pasta_base IS NOT NULL
+                        """).fetchall()
+                        
+                        for (pasta_perfil,) in perfis:
+                            # Resolve caminho relativo se necessário
+                            if not os.path.isabs(pasta_perfil):
+                                pasta_perfil_abs = DATA_DIR / pasta_perfil
+                            else:
+                                pasta_perfil_abs = Path(pasta_perfil)
+                            
+                            if pasta_perfil_abs.exists():
+                                pastas.append(pasta_perfil_abs)
+                    except Exception as e:
+                        # Ignora erro se tabela não existir (db antigo)
+                        pass
                     
                     for pasta in pastas:
                         if not pasta.exists():
@@ -2785,6 +3040,26 @@ class MainWindow(QMainWindow):
             except:
                 pass
 
+    def _on_nova_nota_callback(self, nota):
+        """
+        Callback chamado quando uma nova nota é salva no banco durante busca SEFAZ.
+        Adiciona a nota à lista self.notes e atualiza a tabela incrementalmente.
+        
+        Args:
+            nota (dict): Dicionário com dados da nota recém-salva
+        """
+        try:
+            # Adiciona nota à lista se não existir (evita duplicatas)
+            chave = nota.get('chave', '')
+            if chave and not any(n.get('chave', '') == chave for n in self.notes):
+                self.notes.append(nota)
+                logger.debug(f"🔄 Nova nota adicionada à interface: {chave} ({nota.get('tipo', 'NFe')})")
+                
+                # Dispara atualização da interface no thread principal
+                QTimer.singleShot(0, self._on_filter_changed)
+        except Exception as e:
+            logger.warning(f"⚠️ Erro no callback de nova nota: {e}")
+
     def refresh_all(self):
         # Evita reentrância e trava de UI: carrega notas em thread
         if self._loading_notes:
@@ -2814,8 +3089,13 @@ class MainWindow(QMainWindow):
             try:
                 self.notes = notes or []
                 
-                # Corrige xml_status baseado em arquivos existentes
-                self._corrigir_xml_status_automatico()
+                # 📌 OTIMIZAÇÃO: Correção automática removida da inicialização
+                # A correção agora é executada apenas:
+                #   1. Após download de novas notas (quando realmente necessário)
+                #   2. Via tarefa agendada "Auto-Verificação"
+                #   3. Manualmente pelo usuário
+                # Isso evita reprocessar TODAS as NFS-e a cada inicialização
+                # self._corrigir_xml_status_automatico()  # ❌ Removido - causava lentidão na inicialização
                 
                 try:
                     self._populate_certs_tree()
@@ -2848,11 +3128,43 @@ class MainWindow(QMainWindow):
                 self._load_worker.deleteLater()
                 self._load_worker = None
 
+        # Evita iniciar threads durante shutdown
+        if self._is_shutting_down:
+            return
+        
         self._load_worker = LoadNotesWorker(self.db, limit=5000)
         self._load_worker.finished_notes.connect(on_loaded)
         self._load_worker.finished.connect(on_thread_finished)
         self._load_worker.start()
     
+    def _ajustar_filtro_data_nfse(self):
+        """
+        Verifica a NFS-e mais antiga no banco e estende date_inicio se necessário.
+        Chamado sempre que notas são carregadas, evitando que NFS-e históricas
+        (ex: 2023) fiquem ocultas pelo filtro padrão de 3 meses.
+        Bloqueia sinais para não disparar refresh redundante.
+        """
+        try:
+            from PyQt5.QtCore import QDate
+            with self.db._connect() as conn:
+                row = conn.execute(
+                    "SELECT MIN(data_emissao) FROM notas_detalhadas "
+                    "WHERE tipo = 'NFS-e' AND data_emissao IS NOT NULL AND data_emissao != ''"
+                ).fetchone()
+                if row and row[0]:
+                    oldest_date = row[0][:10]  # YYYY-MM-DD
+                    current_inicio = self.date_inicio.date().toString("yyyy-MM-dd")
+                    if oldest_date < current_inicio:
+                        oldest_qdate = QDate.fromString(oldest_date, "yyyy-MM-dd")
+                        if oldest_qdate.isValid():
+                            # Bloqueia sinal para não disparar refresh extra aqui
+                            self.date_inicio.blockSignals(True)
+                            self.date_inicio.setDate(oldest_qdate)
+                            self.date_inicio.blockSignals(False)
+                            print(f"[NFS-e] 📅 Filtro de data estendido para {oldest_date} (NFS-e antigas detectadas)")
+        except Exception as e:
+            print(f"[DEBUG] _ajustar_filtro_data_nfse: {e}")
+
     def _refresh_table_only(self):
         """Atualiza apenas a visualização da tabela sem recarregar dados do banco"""
         try:
@@ -2938,36 +3250,75 @@ class MainWindow(QMainWindow):
                 # 🆕 CORREÇÃO NFS-e: Busca por múltiplos padrões de nomenclatura
                 # Problema resolvido: NFS-e tem nomes variados ({NUMERO}-{FORNECEDOR}.xml, {NUMERO}-NFSe.xml, etc)
                 # Solução: Usa wildcard {NUMERO}-*.xml para encontrar qualquer variação
-                # Também suporta múltiplos formatos de pasta: YYYY-MM e MM-YYYY
+                # v1.1.28: Suporta TODOS os formatos de pasta e organizações
                 if not xml_path.exists() and is_nfse and numero:
-                    # Tenta formato padrão: YYYY-MM
-                    pasta_nfse = DATA_DIR / "xmls" / informante / year_month / tipo
-                    print(f"[CORREÇÃO-NFSE]   Pasta (YYYY-MM): {pasta_nfse}, Existe: {pasta_nfse.exists()}")
+                    import glob
+                    from pathlib import Path
                     
-                    # Se não existir, tenta formato antigo: MM-YYYY
-                    if not pasta_nfse.exists() and len(year_month) == 7:
-                        try:
-                            year, month = year_month.split('-')
-                            year_month_old = f"{month}-{year}"  # 2024-09 -> 09-2024
-                            pasta_nfse = DATA_DIR / "xmls" / informante / year_month_old / tipo
-                            print(f"[CORREÇÃO-NFSE]   Tentando formato antigo (MM-YYYY): {pasta_nfse}, Existe: {pasta_nfse.exists()}")
-                        except:
-                            pass
+                    # Extrai ano e mês do year_month (AAAA-MM)
+                    try:
+                        if '-' in year_month and len(year_month) == 7:
+                            ano, mes = year_month.split('-')
+                        else:
+                            # Fallback: usa data atual
+                            from datetime import datetime
+                            now = datetime.now()
+                            ano = str(now.year)
+                            mes = f"{now.month:02d}"
+                    except:
+                        from datetime import datetime
+                        now = datetime.now()
+                        ano = str(now.year)
+                        mes = f"{now.month:02d}"
                     
-                    if pasta_nfse.exists():
-                        import glob
-                        # Busca: 8189-*.xml encontra:
-                        # - 8189-AILTON MORAIS JARDIM.xml
-                        # - 8189-NFSe.xml
-                        # - 8189-qualquer-nome.xml
-                        pattern = str(pasta_nfse / f"{numero}-*.xml")
-                        print(f"[CORREÇÃO-NFSE]   Padrão de busca: {pattern}")
-                        arquivos = glob.glob(pattern)
-                        print(f"[CORREÇÃO-NFSE]   Arquivos encontrados: {arquivos}")
-                        if arquivos:
-                            xml_path = Path(arquivos[0])
-                            pdf_path = xml_path.with_suffix('.pdf')
-                            print(f"[CORREÇÃO-NFSE]   ✅ XML encontrado: {xml_path}")
+                    # Gera TODOS os formatos possíveis de mês
+                    formatos_mes = [
+                        f"{ano}-{mes}",    # AAAA-MM (padrão)
+                        f"{mes}-{ano}",    # MM-AAAA (antigo)
+                        f"{mes}{ano}",     # MMAAAA (novo)
+                        f"{ano}/{mes}",    # AAAA/MM (novo - com sublayoutas)
+                        f"{mes}/{ano}",    # MM/AAAA (novo - com sublayoutas)
+                    ]
+                    
+                    tipo_base = "NFSE"
+                    
+                    # Gera TODAS as organizações possíveis
+                    pastas_possiveis = []
+                    for fmt in formatos_mes:
+                        # TIPO_CERTIFICADO: xmls/NFSE/{INFORMANTE}/{DATA}
+                        pastas_possiveis.append(DATA_DIR / "xmls" / tipo_base / informante / fmt)
+                        
+                        # CERTIFICADO_TIPO_DATA: xmls/{INFORMANTE}/NFSE/{DATA}
+                        pastas_possiveis.append(DATA_DIR / "xmls" / informante / tipo_base / fmt)
+                        
+                        # CERTIFICADO_TIPO (antigo): xmls/{INFORMANTE}/{DATA}/NFSE
+                        pastas_possiveis.append(DATA_DIR / "xmls" / informante / fmt / tipo_base)
+                        
+                        # Também tenta com "NFS-e" ao invés de "NFSE" (compatibilidade)
+                        pastas_possiveis.append(DATA_DIR / "xmls" / "NFS-e" / informante / fmt)
+                        pastas_possiveis.append(DATA_DIR / "xmls" / informante / "NFS-e" / fmt)
+                        pastas_possiveis.append(DATA_DIR / "xmls" / informante / fmt / "NFS-e")
+                    
+                    # Busca em TODAS as pastas possíveis
+                    for pasta_nfse in pastas_possiveis:
+                        if pasta_nfse.exists():
+                            # Busca: {NUMERO}-*.xml ou NFSe_{NUMERO}.xml
+                            patterns = [
+                                str(pasta_nfse / f"{numero}-*.xml"),
+                                str(pasta_nfse / f"NFSe_{numero}.xml"),
+                                str(pasta_nfse / f"{numero}.xml"),
+                            ]
+                            
+                            for pattern in patterns:
+                                arquivos = glob.glob(pattern)
+                                if arquivos:
+                                    xml_path = Path(arquivos[0])
+                                    pdf_path = xml_path.with_suffix('.pdf')
+                                    print(f"[CORREÇÃO-NFSE]   ✅ XML encontrado: {xml_path}")
+                                    break
+                            
+                            if xml_path.exists():
+                                break  # Encontrou, para de procurar
                 
                 # Verifica também no banco xmls_baixados (NÃO aplicável para NFS-e)
                 arquivo_existe = xml_path.exists() or pdf_path.exists()
@@ -2977,9 +3328,17 @@ class MainWindow(QMainWindow):
                     try:
                         with self.db._connect() as conn:
                             cursor = conn.cursor()
-                            cursor.execute("SELECT xml_completo FROM xmls_baixados WHERE chave = ?", (chave,))
-                            if cursor.fetchone():
-                                arquivo_existe = True
+                            cursor.execute(
+                                "SELECT caminho_arquivo, xml_completo FROM xmls_baixados WHERE chave = ?",
+                                (chave,)
+                            )
+                            row_xb = cursor.fetchone()
+                            if row_xb:
+                                caminho_xb, xml_completo_xb = row_xb
+                                if caminho_xb and Path(caminho_xb).exists():
+                                    arquivo_existe = True
+                                elif xml_completo_xb:
+                                    arquivo_existe = True
                     except Exception:
                         pass
                 
@@ -3043,59 +3402,123 @@ class MainWindow(QMainWindow):
             from PyQt5.QtCore import QThread
             import subprocess
             
+            from PyQt5.QtCore import pyqtSignal as _pyqtSignal
+
             class NFSeBuscaWorker(QThread):
+                # Sinal emitido ao concluir: (sucesso: bool)
+                finished_nfse = _pyqtSignal(bool)
+
                 def __init__(self, busca_completa=False, parent=None):
                     super().__init__(parent)
                     self.busca_completa = busca_completa
                     
                 def run(self):
+                    sucesso = False
                     try:
+                        import sys as _sys
                         modo = "COMPLETA" if self.busca_completa else "INCREMENTAL"
                         print(f"\n{'='*70}")
                         print(f"[NFS-e] 🔄 INICIANDO BUSCA {modo} DE NFS-e")
-                        print(f"[NFS-e] 📋 Executando script separado: buscar_nfse_auto.py")
-                        print(f"[NFS-e] ⏰ Aguarde... (pode levar alguns minutos)")
                         print(f"{'='*70}\n")
-                        
-                        # Executa buscar_nfse_auto.py como subprocesso
-                        script_path = BASE_DIR / 'buscar_nfse_auto.py'
-                        if script_path.exists():
-                            # Usa o mesmo interpretador Python da aplicação
-                            import sys
-                            
-                            # Monta comando com ou sem --completa
-                            cmd = [sys.executable, str(script_path)]
-                            if self.busca_completa:
-                                cmd.append('--completa')
-                            
-                            result = subprocess.run(
-                                cmd,
-                                capture_output=True,
-                                text=True,
-                                encoding='utf-8',  # Força UTF-8 para evitar erro de decode no Windows
-                                errors='ignore',   # Ignora caracteres inválidos
-                                timeout=600  # 10 minutos de timeout (busca completa pode demorar)
-                            )
-                            
-                            print(f"\n{'='*70}")
-                            if result.returncode == 0:
+
+                        # ── MODO .EXE (frozen) ──────────────────────────────────────────────
+                        if getattr(_sys, 'frozen', False):
+                            print(f"[NFS-e] 📋 Modo .exe: chamando busca diretamente (sem subprocess)")
+                            print(f"[NFS-e] ⏰ Aguarde... (pode levar alguns minutos)")
+                            try:
+                                from buscar_nfse_auto import buscar_todos_certificados
+                                buscar_todos_certificados(busca_completa=self.busca_completa)
+                                print(f"\n{'='*70}")
                                 print(f"[NFS-e] ✅ Busca {modo} de NFS-e concluída com sucesso!")
-                                print(f"[NFS-e] 📊 Clique em 'Atualizar' para visualizar as NFS-e")
-                            else:
-                                print(f"[NFS-e] ⚠️  Busca de NFS-e finalizada com código {result.returncode}")
-                                if result.stderr:
-                                    print(f"[NFS-e] Detalhes: {result.stderr[:200]}")
-                            print(f"{'='*70}\n")
+                                print(f"{'='*70}\n")
+                                sucesso = True
+                            except Exception as e_frozen:
+                                print(f"[NFS-e] ❌ Erro na busca direta (modo .exe): {e_frozen}")
+                                import traceback
+                                traceback.print_exc()
                         else:
-                            print(f"[NFS-e] ⚠️  Script não encontrado: {script_path}")
-                    except subprocess.TimeoutExpired:
+                            # ── MODO DESENVOLVIMENTO (subprocess) ──────────────────────────
+                            print(f"[NFS-e] 📋 Modo dev: executando script buscar_nfse_auto.py")
+                            print(f"[NFS-e] ⏰ Aguarde... (pode levar alguns minutos)")
+
+                            script_path = BASE_DIR / 'buscar_nfse_auto.py'
+                            if script_path.exists():
+                                cmd = [_sys.executable, str(script_path)]
+                                if self.busca_completa:
+                                    cmd.append('--completa')
+
+                                _timeout_sec = 600 if self.busca_completa else 300
+                                print(f"[NFS-e] ⏱️  Timeout configurado: {_timeout_sec}s ({_timeout_sec//60} min)")
+                                print(f"[NFS-e] 🚀 Iniciando subprocess: {' '.join(cmd)}\n")
+
+                                result = subprocess.run(
+                                    cmd,
+                                    capture_output=True,
+                                    text=True,
+                                    encoding='utf-8',
+                                    errors='ignore',
+                                    timeout=_timeout_sec
+                                )
+
+                                # ── Imprime TODA a saída do subprocess (logger vai para stderr) ──
+                                _stdout = (result.stdout or '').strip()
+                                _stderr = (result.stderr or '').strip()
+                                if _stdout:
+                                    print(f"\n[NFS-e][STDOUT]\n{_stdout}")
+                                if _stderr:
+                                    print(f"\n[NFS-e][LOG]\n{_stderr}")
+
+                                print(f"\n{'='*70}")
+                                if result.returncode == 0:
+                                    print(f"[NFS-e] ✅ Busca {modo} de NFS-e concluída com sucesso!")
+                                    sucesso = True
+                                else:
+                                    print(f"[NFS-e] ⚠️  Busca de NFS-e finalizada com código {result.returncode}")
+                                print(f"{'='*70}\n")
+                            else:
+                                print(f"[NFS-e] ⚠️  Script não encontrado em modo dev: {script_path}")
+                    except subprocess.TimeoutExpired as e_timeout:
+                        # Imprime o que foi capturado ANTES do timeout
+                        _to_stdout = (e_timeout.stdout or '').strip()
+                        _to_stderr = (e_timeout.stderr or '').strip()
+                        if _to_stdout:
+                            print(f"\n[NFS-e][STDOUT antes do timeout]\n{_to_stdout}")
+                        if _to_stderr:
+                            print(f"\n[NFS-e][LOG antes do timeout]\n{_to_stderr}")
                         print(f"[NFS-e] ⚠️  Timeout na busca de NFS-e ({10 if self.busca_completa else 5} minutos excedidos)")
                     except Exception as e:
                         print(f"[NFS-e] ❌ Erro ao executar busca de NFS-e: {e}")
+                    finally:
+                        self.finished_nfse.emit(sucesso)
             
+            def _on_nfse_finished(sucesso: bool):
+                """Chamado ao término da busca NFS-e. Ajusta filtro de data e recarrega tabela."""
+                try:
+                    if not sucesso:
+                        return
+                    # Recarrega notas
+                    self.notes = self.db.load_notes(limit=5000)
+                    # Renderiza a tabela com os dados atualizados
+                    self.refresh_table()
+                    self.refresh_emitidos_table()
+                    print(f"[NFS-e] ✅ Tabelas atualizadas após busca NFS-e")
+                except Exception as e_handler:
+                    print(f"[NFS-e] Erro ao atualizar interface após busca: {e_handler}")
+
             # Executa em thread separada (não bloqueia UI)
             if not hasattr(self, '_nfse_worker') or not self._nfse_worker.isRunning():
+                # Evita iniciar threads durante shutdown
+                if self._is_shutting_down:
+                    return
+                
                 self._nfse_worker = NFSeBuscaWorker(busca_completa=busca_completa, parent=self)
+                self._nfse_worker.finished_nfse.connect(_on_nfse_finished)
+                # CRITÍCO: conecta o sinal nativo QThread.finished ao deleteLater.
+                # QThread.finished é emitido só depois que run() retornou E o Qt fez
+                # todo o seu próprio cleanup interno — é o único momento seguro
+                # para destruir o objeto sem provocar "QThread: Destroyed while
+                # thread is still running".
+                self._nfse_worker.finished.connect(self._nfse_worker.deleteLater)
                 self._nfse_worker.start()
                 modo = "COMPLETA" if busca_completa else "INCREMENTAL"
                 print(f"[NFS-e] Thread de busca {modo} NFS-e iniciada")
@@ -3110,8 +3533,9 @@ class MainWindow(QMainWindow):
         try:
             from PyQt5.QtCore import QDate
             # Remove valores dos campos de data (desabilita filtro)
-            self.date_inicio.setDate(QDate.currentDate().addMonths(-3))
-            self.date_fim.setDate(QDate.currentDate())
+            _hoje = QDate.currentDate()
+            self.date_inicio.setDate(QDate(_hoje.year(), _hoje.month(), 1).addMonths(-1))
+            self.date_fim.setDate(_hoje)
             self.set_status("Filtro de data limpo", 1500)
         except Exception as e:
             print(f"[DEBUG] Erro ao limpar filtros de data: {e}")
@@ -3171,6 +3595,23 @@ class MainWindow(QMainWindow):
             certs = self.db.load_certificates()
             company_cnpjs = {normalizar_cnpj(c.get('cnpj_cpf') or '') for c in certs}
             company_cnpjs.discard('')  # Remove string vazia se houver
+            
+            # 🆕 FALLBACK: Se não há certificados, busca informantes do banco
+            if not company_cnpjs:
+                print("[FILTRO] ⚠️ Nenhum certificado cadastrado! Buscando informantes do banco...")
+                try:
+                    with self.db._connect() as conn:
+                        cursor = conn.execute("SELECT DISTINCT informante FROM notas_detalhadas WHERE informante IS NOT NULL AND informante != ''")
+                        informantes_db = {normalizar_cnpj(row[0]) for row in cursor.fetchall()}
+                        informantes_db.discard('')
+                        if informantes_db:
+                            company_cnpjs = informantes_db
+                            print(f"[FILTRO] ✅ Usando {len(company_cnpjs)} informantes do banco como fallback")
+                            print(f"[FILTRO] 📋 Informantes: {sorted(company_cnpjs)}")
+                        else:
+                            print("[FILTRO] ❌ Nenhum informante encontrado no banco!")
+                except Exception as e:
+                    print(f"[FILTRO] ❌ Erro ao buscar informantes: {e}")
         except Exception as e:
             print(f"[DEBUG] Erro ao carregar certificados para filtro: {e}")
             company_cnpjs = set()
@@ -3182,38 +3623,54 @@ class MainWindow(QMainWindow):
             if xml_status == 'EVENTO':
                 continue
             
-            # FILTRO PRINCIPAL: Exclui notas emitidas pela própria empresa E destinadas à própria empresa
-            # Esta aba deve mostrar "Emitidos por terceiros" OU "Emitidos para terceiros"
+            # FILTRO PRINCIPAL: Esta aba mostra apenas "Emitidos POR TERCEIROS"
+            # (terceiro é o emitente — a empresa é a destinatária / tomadora / receptora)
+            # Notas onde a empresa é o EMITENTE pertencem à aba "Emitidos pela empresa".
             cnpj_emitente_normalizado = normalizar_cnpj(it.get('cnpj_emitente') or '')
             nota_destinatario_norm = normalizar_cnpj(it.get('cnpj_destinatario') or '')
-            
-            # Só exclui se foi emitida pela empresa E destinada à própria empresa (operação interna)
-            if cnpj_emitente_normalizado in company_cnpjs and nota_destinatario_norm in company_cnpjs:
-                continue  # Pula notas de operação interna (emitida E destinada à própria empresa)
-            
-            # 🆕 FILTRO CRÍTICO: Mostra notas DESTINADAS à empresa OU EMITIDAS pela empresa para terceiros
-            # Verifica informante (quem baixou) OU cnpj_destinatario (destinatário no XML)
-            # Isso garante que NFS-e recebidas e emitidas para terceiros apareçam corretamente
             nota_informante_norm = normalizar_cnpj(it.get('informante') or '')
-            
+            tipo_it = str(it.get('tipo', '')).upper().replace('-', '').replace('_', '')
+            is_nfse_it = 'NFS' in tipo_it
+
             # Se tem um certificado específico selecionado, filtra por ele
             if selected_cert:
                 selected_cert_norm = normalizar_cnpj(str(selected_cert))
-                # Nota deve ter sido baixada por este certificado OU emitida por ele OU destinada a ele
+
+                # 🔑 REGRA 1 (cert específico): exclui notas onde ESTA empresa é a EMITENTE.
+                # Usa apenas o cert selecionado — NÃO exclui notas de outras empresas registradas,
+                # pois a empresa selecionada pode ser a DESTINATÁRIA de notas emitidas por elas.
+                if cnpj_emitente_normalizado == selected_cert_norm:
+                    continue  # Esta empresa é a emitente → vai para a aba "Emitidos pela empresa"
+
+                # 🔑 REGRA 2 (NFS-e, cert específico): cnpj_emitente vazio mas esta empresa é o informante
+                # e o destinatário não é uma empresa registrada → emitida por esta empresa
+                if is_nfse_it and not cnpj_emitente_normalizado:
+                    if nota_informante_norm == selected_cert_norm and nota_destinatario_norm not in company_cnpjs:
+                        continue  # NFS-e emitida por esta empresa → vai para aba emitidos
+
+                # Nota deve ter sido destinada a este certificado OU baixada por ele
                 nota_pertence = (
-                    nota_informante_norm == selected_cert_norm or
-                    cnpj_emitente_normalizado == selected_cert_norm or
-                    nota_destinatario_norm == selected_cert_norm
+                    nota_destinatario_norm == selected_cert_norm or
+                    nota_informante_norm == selected_cert_norm
                 )
                 if not nota_pertence:
                     continue
             else:
-                # "Todos" selecionado: mostra notas relacionadas a QUALQUER certificado da empresa
-                # Verifica se informante, emitente OU destinatário está nos certificados
-                # (operações internas já foram filtradas acima)
+                # 🔑 REGRA 1 ("Todos"): exclui notas emitidas POR qualquer empresa registrada
+                # APENAS se o destinatário NÃO for outra empresa registrada.
+                # Transações entre empresas do sistema (A→B) devem aparecer para B em "Emitidos por terceiros".
+                if cnpj_emitente_normalizado in company_cnpjs:
+                    if nota_destinatario_norm not in company_cnpjs:
+                        continue  # Emitida pela empresa para terceiro → vai para aba emitidos
+
+                # 🔑 REGRA 2 (NFS-e, todos): cnpj_emitente vazio, informante é empresa, dest não é empresa
+                if is_nfse_it and not cnpj_emitente_normalizado:
+                    if nota_informante_norm in company_cnpjs and nota_destinatario_norm not in company_cnpjs:
+                        continue  # NFS-e emitida pela empresa → vai para aba emitidos
+
+                # "Todos": mostra notas relacionadas a QUALQUER certificado da empresa
                 pertence_empresa = (
                     nota_informante_norm in company_cnpjs or
-                    cnpj_emitente_normalizado in company_cnpjs or
                     nota_destinatario_norm in company_cnpjs
                 )
                 if not pertence_empresa:
@@ -3303,12 +3760,29 @@ class MainWindow(QMainWindow):
             company_cnpjs.discard('')  # Remove string vazia se houver
             print(f"[DEBUG] Certificados encontrados: {len(certs)}")
             print(f"[DEBUG] CNPJs da empresa (normalizados): {company_cnpjs}")
+            
+            # 🆕 FALLBACK: Se não há certificados, busca informantes do banco
+            if not company_cnpjs:
+                print("[FILTRO EMITIDOS] ⚠️ Nenhum certificado cadastrado! Buscando informantes do banco...")
+                try:
+                    with self.db._connect() as conn:
+                        cursor = conn.execute("SELECT DISTINCT informante FROM notas_detalhadas WHERE informante IS NOT NULL AND informante != ''")
+                        informantes_db = {normalizar_cnpj(row[0]) for row in cursor.fetchall()}
+                        informantes_db.discard('')
+                        if informantes_db:
+                            company_cnpjs = informantes_db
+                            print(f"[FILTRO EMITIDOS] ✅ Usando {len(company_cnpjs)} informantes do banco como fallback")
+                            print(f"[FILTRO EMITIDOS] 📋 Informantes: {sorted(company_cnpjs)}")
+                        else:
+                            print("[FILTRO EMITIDOS] ❌ Nenhum informante encontrado no banco!")
+                except Exception as e:
+                    print(f"[FILTRO EMITIDOS] ❌ Erro ao buscar informantes: {e}")
         except Exception as e:
             print(f"[DEBUG] Erro ao carregar certificados: {e}")
             company_cnpjs = set()
         
         if not company_cnpjs:
-            print(f"[DEBUG] Nenhum certificado encontrado, retornando lista vazia")
+            print(f"[DEBUG] Nenhum certificado ou informante encontrado, retornando lista vazia")
             return []
         
         # ALTERAÇÃO: Carrega DIRETAMENTE do banco com filtros SQL em vez de usar self.notes
@@ -3356,9 +3830,18 @@ class MainWindow(QMainWindow):
                 # Aba "Emitidos pela empresa" = cnpj_emitente deve estar nos certificados
                 if selected_cert:
                     # Filtro por certificado específico selecionado
-                    print(f"[DEBUG] Aplicando filtro por certificado selecionado: {selected_cert}")
-                    where_clauses.append("REPLACE(REPLACE(REPLACE(cnpj_emitente, '.', ''), '/', ''), '-', '') = ?")
-                    params.append(normalizar_cnpj(str(selected_cert)))
+                    selected_norm = normalizar_cnpj(str(selected_cert))
+                    print(f"[DEBUG] Aplicando filtro por certificado selecionado: {selected_cert} (normalizado: {selected_norm})")
+                    # Para todos os tipos (NF-e, CT-e, NFS-e): cnpj_emitente é a fonte da verdade.
+                    # O filtro adicional de informante para NFS-e foi removido — causava exclusão
+                    # de NFS-e genuinamente emitidas por X quando o informante era diferente
+                    # (ex.: NFS-e baixada pelo tomador ou por terceiro com outro certificado).
+                    where_clauses.append(
+                        "REPLACE(REPLACE(REPLACE(cnpj_emitente, '.', ''), '/', ''), '-', '') = ?"
+                    )
+                    params.append(selected_norm)
+                    print(f"[DEBUG] Filtro emitidos: cnpj_emitente = {selected_norm}")
+
                 else:
                     # "Todos" selecionado - mostra notas de TODOS OS CERTIFICADOS (não todas as notas do banco!)
                     print(f"[DEBUG] 🏢 FILTRO EMITIDOS - Mostrando notas onde EU SOU O EMITENTE (cnpj_emitente nos certificados)")
@@ -3471,18 +3954,22 @@ class MainWindow(QMainWindow):
             
             # Ordena por razao_social ou informante
             def keyf(c: Dict[str, Any]):
+                nome_cert = (c.get('nome_certificado') or '').strip()
                 razao = (c.get('razao_social') or '').strip()
                 informante = (c.get('informante') or '').strip()
                 cnpj = (c.get('cnpj_cpf') or '').strip()
-                return (razao or informante or cnpj).lower()
+                return (nome_cert or razao or informante or cnpj).lower()
             
             for c in sorted(certs, key=keyf):
                 informante = (c.get('informante') or '').strip()
                 cnpj = (c.get('cnpj_cpf') or '').strip()
                 razao_social = (c.get('razao_social') or '').strip()
+                nome_certificado = (c.get('nome_certificado') or '').strip()
                 
-                # Prioriza razão social, depois informante, depois CNPJ
-                if razao_social:
+                # Prioriza nome_certificado, depois razão social, depois informante, depois CNPJ
+                if nome_certificado:
+                    label = nome_certificado
+                elif razao_social:
                     label = f"{razao_social}"
                 elif informante and informante != cnpj:
                     label = f"{informante}"
@@ -3710,6 +4197,37 @@ class MainWindow(QMainWindow):
         except Exception as e:
             print(f"[ERRO] Erro em _buscar_xml_completo_silencioso: {e}")
     
+    def _update_totais(self, items: list):
+        """Atualiza o label de rodapé com totais dos itens visíveis respeitando o filtro."""
+        try:
+            nfe = cte = nfse = 0
+            total_valor = 0.0
+            for it in items:
+                tipo_raw = (it.get('tipo') or '').upper().replace('-', '').replace('_', '').replace(' ', '')
+                if tipo_raw in ('NFE', 'NFCE'):
+                    nfe += 1
+                elif tipo_raw == 'CTE':
+                    cte += 1
+                elif 'NFS' in tipo_raw:
+                    nfse += 1
+                try:
+                    total_valor += float(it.get('valor') or 0)
+                except Exception:
+                    pass
+            partes = []
+            if nfe:
+                partes.append(f"NF-e: {nfe}")
+            if cte:
+                partes.append(f"CT-e: {cte}")
+            if nfse:
+                partes.append(f"NFS-e: {nfse}")
+            total_docs = nfe + cte + nfse
+            valor_fmt = f"R$ {total_valor:,.2f}".replace(',', 'X').replace('.', ',').replace('X', '.')
+            texto = f"📊 {' | '.join(partes)} | Total: {total_docs} docs | {valor_fmt}"
+            self.lbl_totais.setText(texto)
+        except Exception:
+            pass
+
     def refresh_table(self):
         # Stop any ongoing fill
         try:
@@ -3776,11 +4294,8 @@ class MainWindow(QMainWindow):
                 pass
             
             # Popula diretamente (sem timer, pois geralmente há menos itens)
-            print(f"[DEBUG] Iniciando população de {len(items)} linhas na table_emitidos...")
             for r, it in enumerate(items):
-                print(f"[DEBUG] Populando linha {r}: nota {it.get('numero')}")
                 self._populate_emitidos_row(r, it)
-            print(f"[DEBUG] População concluída!")
             
             # Auto-ajusta largura das colunas ao conteúdo (exceto XML que é fixo)
             try:
@@ -3811,6 +4326,10 @@ class MainWindow(QMainWindow):
                     self.set_status(f"✅ {len(items)} notas emitidas carregadas", 2000)
             else:
                 self.set_status("⚠️ Nenhuma nota emitida encontrada - Verifique o filtro de data!", 3000)
+
+            # Atualiza totais no rodapé para a aba emitidos
+            if self.tabs.currentIndex() == 1:
+                self._update_totais(items)
                 
         finally:
             self._refreshing_emitidos = False
@@ -3851,20 +4370,30 @@ class MainWindow(QMainWindow):
             # Tooltip diferente se tem XML completo ou só resumo
             if xml_status == "COMPLETO":
                 tooltip_text = "❌ Nota Cancelada - XML Completo disponível"
+                xml_sort_order = 2  # Cancelada com XML
             else:
                 tooltip_text = "❌ Nota Cancelada - Apenas Resumo"
+                xml_sort_order = 3  # Cancelada sem XML
         elif xml_status == "COMPLETO":
             status_text = ""  # Apenas ícone, sem texto
             bg_color = QColor(cor_autorizada)  # Cor de autorizada do tema
             tooltip_text = "✅ XML Completo disponível"
             icon_name = 'xml.png'
+            xml_sort_order = 1  # Autorizada com XML (melhor)
+        elif xml_status == "INDISPONIVEL":
+            status_text = ""  # Sem ícone
+            bg_color = QColor(cor_outros).darker(110)  # Cinza levemente mais escuro
+            tooltip_text = "🚫 XML indisponível no SEFAZ (prazo expirado ou NF-e inexistente)"
+            icon_name = None
+            xml_sort_order = 5  # Indisponível (pior)
         else:  # RESUMO
             status_text = ""  # Sem ícone para facilitar identificação
             bg_color = QColor(cor_outros)  # Cor de outros do tema
             tooltip_text = "⚠️ Apenas Resumo - clique para baixar XML completo"
             icon_name = None  # Resumo não mostra ícone
+            xml_sort_order = 4  # Resumo sem XML
         
-        c0 = cell(status_text)
+        c0 = NumericTableWidgetItem(status_text, float(xml_sort_order))
         c0.setBackground(QBrush(bg_color))
         c0.setTextAlignment(Qt.AlignCenter)
         c0.setToolTip(tooltip_text)
@@ -3883,7 +4412,7 @@ class MainWindow(QMainWindow):
         # Coluna Número - ordenação numérica
         numero = it.get("numero") or ""
         # Para RESUMO sem número, tenta extrair da chave (posição 25-34)
-        if not numero and xml_status == "RESUMO":
+        if not numero and xml_status in ("RESUMO", "INDISPONIVEL"):
             chave = it.get("chave") or ""
             if len(chave) >= 34:
                 try:
@@ -3897,19 +4426,20 @@ class MainWindow(QMainWindow):
         self.table.setItem(r, 1, NumericTableWidgetItem(str(numero) if numero else "S/N", float(numero_int)))
         # Coluna Data Emissão - ordenação por timestamp
         data_emissao_raw = it.get("data_emissao") or ""
-        # Para RESUMO sem data, tenta extrair da chave (posição 2-5: AAMM - chave não contém dia)
-        if not data_emissao_raw and xml_status == "RESUMO":
-            chave = it.get("chave") or ""
-            if len(chave) >= 6:
+        # Para qualquer nota sem data, extrai AAMM da chave (posição 2-5) como fallback
+        # Isso garante que notas canceladas (INDISPONIVEL, RESUMO, etc.) sempre mostrem uma data
+        if not data_emissao_raw:
+            _chave_tmp = it.get("chave") or ""
+            if len(_chave_tmp) >= 6:
                 try:
-                    aa = chave[2:4]  # Ano (2 dígitos)
-                    mm = chave[4:6]  # Mês (2 dígitos)
-                    # Chave não contém dia - usa dia 01 como padrão
-                    data_emissao_raw = f"20{aa}-{mm}-01"
-                except:
+                    _aa = _chave_tmp[2:4]  # Ano (2 dígitos)
+                    _mm = _chave_tmp[4:6]  # Mês (2 dígitos)
+                    # Chave não contém dia - usa dia 01 como referência do mês
+                    data_emissao_raw = f"20{_aa}-{_mm}-01"
+                except Exception:
                     data_emissao_raw = ""
         
-        data_emissao_br = self._format_date_br(data_emissao_raw) if data_emissao_raw else "(Resumo)"
+        data_emissao_br = self._format_date_br(data_emissao_raw) if data_emissao_raw else "(Sem data)"
         # Converte data para timestamp para ordenação correta
         try:
             if data_emissao_raw and len(data_emissao_raw) >= 10:
@@ -3917,7 +4447,7 @@ class MainWindow(QMainWindow):
                 dt = datetime.strptime(data_emissao_raw[:10], "%Y-%m-%d")
                 timestamp = dt.timestamp()
             else:
-                timestamp = 9999999999.0  # Coloca RESUMO no final ao ordenar por data
+                timestamp = 9999999999.0  # Coloca sem data no final ao ordenar
         except Exception:
             timestamp = 9999999999.0
         self.table.setItem(r, 2, NumericTableWidgetItem(data_emissao_br, timestamp))
@@ -4038,26 +4568,30 @@ class MainWindow(QMainWindow):
             # Tooltip diferente se tem XML completo ou só resumo
             if xml_status == "COMPLETO":
                 tooltip_text = "❌ Nota Cancelada - XML Completo disponível"
+                xml_sort_order = 2  # Cancelada com XML
             else:
                 tooltip_text = "❌ Nota Cancelada - Apenas Resumo"
+                xml_sort_order = 3  # Cancelada sem XML
         elif xml_status == "COMPLETO":
             status_text = ""
             bg_color = QColor(cor_autorizada)  # Cor de autorizada do tema
             tooltip_text = "✅ XML Completo disponível"
             icon_name = 'xml.png'
+            xml_sort_order = 1  # Autorizada com XML (melhor)
+        elif xml_status == "INDISPONIVEL":
+            status_text = ""  # Sem ícone
+            bg_color = QColor(cor_outros).darker(110)  # Cinza levemente mais escuro
+            tooltip_text = "🚫 XML indisponível no SEFAZ (prazo expirado ou NF-e inexistente)"
+            icon_name = None
+            xml_sort_order = 5  # Indisponível (pior)
         else:  # RESUMO
             status_text = ""  # Sem ícone para facilitar identificação
             bg_color = QColor(cor_outros)  # Cor de outros do tema
             tooltip_text = "⚠️ Apenas Resumo - clique para baixar XML completo"
             icon_name = None  # Resumo não mostra ícone
+            xml_sort_order = 4  # Resumo sem XML
         
-        # DEBUG: Log do ícone escolhido
-        if numero_nota in ['29511', '5629031']:
-            print(f"  icon_name escolhido: {icon_name}")
-            print(f"  bg_color: {bg_color.name()}")
-            print(f"  tooltip: {tooltip_text}")
-        
-        c0 = cell(status_text)
+        c0 = NumericTableWidgetItem(status_text, float(xml_sort_order))
         c0.setBackground(QBrush(bg_color))
         c0.setTextAlignment(Qt.AlignCenter)
         c0.setToolTip(tooltip_text)
@@ -4079,7 +4613,7 @@ class MainWindow(QMainWindow):
         # Coluna Número - ordenação numérica
         numero = it.get("numero") or ""
         # Para RESUMO sem número, tenta extrair da chave (posição 25-34)
-        if not numero and xml_status == "RESUMO":
+        if not numero and xml_status in ("RESUMO", "INDISPONIVEL"):
             chave = it.get("chave") or ""
             if len(chave) >= 34:
                 try:
@@ -4094,26 +4628,27 @@ class MainWindow(QMainWindow):
         
         # Coluna Data Emissão - ordenação por timestamp
         data_emissao_raw = it.get("data_emissao") or ""
-        # Para RESUMO sem data, tenta extrair da chave (posição 2-5: AAMM - chave não contém dia)
-        if not data_emissao_raw and xml_status == "RESUMO":
-            chave = it.get("chave") or ""
-            if len(chave) >= 6:
+        # Para qualquer nota sem data, extrai AAMM da chave (posição 2-5) como fallback
+        # Isso garante que notas canceladas (INDISPONIVEL, RESUMO, etc.) sempre mostrem uma data
+        if not data_emissao_raw:
+            _chave_tmp = it.get("chave") or ""
+            if len(_chave_tmp) >= 6:
                 try:
-                    aa = chave[2:4]  # Ano (2 dígitos)
-                    mm = chave[4:6]  # Mês (2 dígitos)
-                    # Chave não contém dia - usa dia 01 como padrão
-                    data_emissao_raw = f"20{aa}-{mm}-01"
-                except:
+                    _aa = _chave_tmp[2:4]  # Ano (2 dígitos)
+                    _mm = _chave_tmp[4:6]  # Mês (2 dígitos)
+                    # Chave não contém dia - usa dia 01 como referência do mês
+                    data_emissao_raw = f"20{_aa}-{_mm}-01"
+                except Exception:
                     data_emissao_raw = ""
         
-        data_emissao_br = self._format_date_br(data_emissao_raw) if data_emissao_raw else "(Resumo)"
+        data_emissao_br = self._format_date_br(data_emissao_raw) if data_emissao_raw else "(Sem data)"
         try:
             if data_emissao_raw and len(data_emissao_raw) >= 10:
                 from datetime import datetime
                 dt = datetime.strptime(data_emissao_raw[:10], "%Y-%m-%d")
                 timestamp = dt.timestamp()
             else:
-                timestamp = 9999999999.0  # Coloca RESUMO no final
+                timestamp = 9999999999.0  # Coloca sem data no final
         except Exception:
             timestamp = 9999999999.0
         self.table_emitidos.setItem(r, 2, NumericTableWidgetItem(data_emissao_br, timestamp))
@@ -4218,6 +4753,7 @@ class MainWindow(QMainWindow):
                 except Exception:
                     pass
                 self.set_status(f"{total} registros carregados", 2000)
+                self._update_totais(self._table_fill_items)
                 
                 # ⚠️ AUTO-VERIFICAÇÃO REMOVIDA DAQUI
                 # Agora está disponível no Gerenciador de Trabalhos (Ctrl+Shift+G)
@@ -4281,7 +4817,7 @@ class MainWindow(QMainWindow):
             elapsed = (datetime.now() - self._search_stats['start_time']).total_seconds()
             cert_info = f"Cert: ...{self._search_stats['last_cert']}" if self._search_stats['last_cert'] else ""
             
-            summary = f"🔍 NFes: {self._search_stats['nfes_found']} | CTes: {self._search_stats['ctes_found']} | NFSes: {self._search_stats['nfses_found']}"
+            summary = f"🔍 Chaves: {self._search_stats['chaves_found']} | NFes: {self._search_stats['nfes_found']} | CTes: {self._search_stats['ctes_found']} | NFSes: {self._search_stats['nfses_found']}"
             if cert_info:
                 summary += f" | {cert_info}"
             summary += f" | {elapsed:.0f}s"
@@ -4639,32 +5175,48 @@ class MainWindow(QMainWindow):
         xml_status = (item.get('xml_status') or '').upper()
         status_nota = (item.get('status') or '').lower()
         
-        # 🔍 Verifica se é REALMENTE um resumo (sem dados completos)
-        # Resumo = sem número OU sem data de emissão OU sem emitente
-        numero = item.get('numero') or item.get('nNF') or ''
-        data_emissao = item.get('data_emissao') or item.get('dhEmi') or ''
-        emitente = item.get('nome_emitente') or item.get('xNome') or ''
-        
-        is_resumo = (not numero or not data_emissao or not emitente or 
-                     xml_status == 'RESUMO')
+        tipo_doc_early = (item.get('tipo') or '').upper().replace('-', '').replace('_', '')
+        is_nfe_cte = tipo_doc_early in ('NFE', 'CTE')
         
         # Cria menu
         menu = QMenu(self)
         
-        # ⭐ OPÇÃO NO TOPO: XML Completo (só para RESUMO ou dados incompletos)
-        if is_resumo:
-            # Verifica se há múltiplas seleções
-            if len(selected_rows) > 1:
-                action_xml_completo = menu.addAction(f"✅ Baixar XML Completo ({len(selected_rows)} notas)")
-                action_xml_completo.setToolTip(f"Manifestar e baixar {len(selected_rows)} XMLs completos da SEFAZ")
+        # ⭐ OPÇÃO NO TOPO: XML Completo — disponível para TODAS as NF-e e CT-e
+        if is_nfe_cte:
+            # Verifica manifestação existente para tooltip informativo
+            _manifestacoes = []
+            try:
+                _manifestacoes = self.db.get_manifestacoes_by_chave(chave)
+            except Exception:
+                pass
+            _TIPOS_MANIF = {'210200', '210210', '210220', '210240'}
+            _manif_existente = next(
+                (m for m in _manifestacoes if m.get('tipo_evento') in _TIPOS_MANIF), None
+            )
+            
+            if xml_status == 'RESUMO':
+                _lbl_xml = f"📥 Baixar XML Completo ({len(selected_rows)} notas)" if len(selected_rows) > 1 else "📥 Baixar XML Completo"
             else:
-                action_xml_completo = menu.addAction("✅ Baixar XML Completo")
-                action_xml_completo.setToolTip("Manifestar, baixar XML completo da SEFAZ e gerar PDF")
+                _lbl_xml = f"🔄 Re-baixar XML Completo ({len(selected_rows)} notas)" if len(selected_rows) > 1 else "🔄 Re-baixar XML Completo"
+            
+            action_xml_completo = menu.addAction(_lbl_xml)
+            
+            if _manif_existente:
+                _tp = _manif_existente.get('tipo_evento', '')
+                _tp_map = {'210200': 'Confirmação', '210210': 'Ciência', '210220': 'Desconhecimento', '210240': 'Não Realizada'}
+                _tp_desc = _tp_map.get(_tp, _tp)
+                action_xml_completo.setToolTip(
+                    f"✅ Já possui manifestação: {_tp_desc} (evento {_tp})\n"
+                    f"Irá baixar o XML completo diretamente sem nova manifestação."
+                )
+            else:
+                action_xml_completo.setToolTip(
+                    "Sem manifestação registrada.\n"
+                    "Irá enviar Ciência da Operação (210210) e depois baixar o XML completo da SEFAZ."
+                )
             menu.addSeparator()
-            print(f"[DEBUG MENU] ✅ Botão 'Baixar XML Completo' adicionado ({len(selected_rows)} selecionadas)")
         else:
             action_xml_completo = None
-            print(f"[DEBUG MENU] ⚠️ Botão 'Baixar XML Completo' NÃO adicionado (nota completa)")
         
         # Opção: Ver Detalhes Completos (sempre disponível)
         action_detalhes = menu.addAction("📄 Ver Detalhes Completos")
@@ -4675,20 +5227,30 @@ class MainWindow(QMainWindow):
         
         # Opção: Manifestar (só para notas RECEBIDAS - Emitidos por Terceiros)
         # NF-e e CT-e permitem manifestação do destinatário
-        tipo_doc = (item.get('tipo') or '').upper()
-        if tipo_doc in ['NFE', 'NF-E', 'CTE', 'CT-E']:
+        tipo_doc = (item.get('tipo') or '').upper().replace('-', '').replace('_', '')
+        if tipo_doc in ['NFE', 'CTE']:
             menu.addSeparator()
-            if tipo_doc in ['NFE', 'NF-E']:
+            if tipo_doc == 'NFE':
                 action_manifestar = menu.addAction("✉️ Manifestar Destinatário")
             else:  # CTE
                 action_manifestar = menu.addAction("✉️ Manifestar CT-e")
         else:
             action_manifestar = None
-        
+
+        # Opção: Buscar NFS-e na prefeitura (só para NFS-e)
+        if tipo_doc == 'NFSE':
+            menu.addSeparator()
+            action_nfse = menu.addAction("🔄 Buscar NFS-e na prefeitura")
+            action_nfse.setToolTip("Re-consulta a prefeitura para verificar/atualizar esta NFS-e")
+        else:
+            action_nfse = None
+
         # Mostra menu e pega ação
         action = menu.exec_(self.table.viewport().mapToGlobal(pos))
-        
-        if action == action_xml_completo:
+
+        if action is None:
+            return
+        elif action == action_xml_completo:
             # Se múltiplas notas selecionadas, baixa todas
             if len(selected_rows) > 1:
                 self._baixar_xml_e_pdf_multiplos(selected_rows)
@@ -4700,7 +5262,275 @@ class MainWindow(QMainWindow):
             self._mostrar_eventos(item)
         elif action == action_manifestar:
             self._manifestar_nota(item)
+        elif action == action_nfse:
+            self._buscar_nfse_automatico(busca_completa=False)
     
+    def _consultar_eventos_emitidos_lote(self):
+        """
+        Consulta eventos na SEFAZ para todas as notas visíveis na aba 'Emitidos pela empresa'.
+        Marca automaticamente como canceladas as que tiverem evento 110111.
+        """
+        notas = self.filtered_emitidos()
+        if not notas:
+            QMessageBox.information(self, "Consultar Eventos", "Nenhuma nota visível no filtro atual.")
+            return
+
+        # Filtra apenas NF-e e CT-e (NFS-e não tem eventos SEFAZ deste tipo)
+        notas_consultar = [
+            n for n in notas
+            if (n.get('tipo') or '').upper().replace('-', '').replace('_', '') in ('NFE', 'CTE')
+        ]
+        if not notas_consultar:
+            QMessageBox.information(self, "Consultar Eventos",
+                "Nenhuma NF-e ou CT-e no filtro atual (NFS-e não usa este serviço).")
+            return
+
+        total = len(notas_consultar)
+        reply = QMessageBox.question(
+            self, "Consultar Eventos em Lote",
+            f"Serão consultados eventos para {total} documento(s) exibido(s) no filtro atual.\n\n"
+            "• Documentos com cancelamento serão marcados automaticamente.\n"
+            "• A consulta usa à SEFAZ e pode levar alguns minutos.\n\n"
+            "Deseja continuar?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        certs = self.db.load_certificates()
+        if not certs:
+            QMessageBox.warning(self, "Consultar Eventos", "Nenhum certificado configurado.")
+            return
+
+        # Desabilita o botão durante a consulta
+        if hasattr(self, 'btn_consultar_eventos_emitidos'):
+            self.btn_consultar_eventos_emitidos.setEnabled(False)
+
+        # ── Diálogo de progresso ──────────────────────────────────────────────
+        from PyQt5.QtWidgets import QProgressDialog
+        progress = QProgressDialog("Consultando eventos…", "Cancelar", 0, total, self)
+        progress.setWindowTitle("Consultar Eventos — Saídas")
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setValue(0)
+
+        cancelados_marcados = []
+        erros = []
+
+        from PyQt5.QtCore import QThread, pyqtSignal as _pyqtSignal
+
+        class LoteEventosWorker(QThread):
+            progresso = _pyqtSignal(int, str)          # (idx, chave_curta)
+            cancelamento = _pyqtSignal(str, str)       # (chave, informante)
+            concluido = _pyqtSignal(list, list)        # (cancelados, erros)
+
+            def __init__(self, notas, certs):
+                super().__init__()
+                self._notas = notas
+                self._certs = certs
+                self._parar = False
+
+            def stop(self):
+                self._parar = True
+
+            def _cert_para(self, informante):
+                for c in self._certs:
+                    if c.get('informante') == informante or c.get('cnpj_cpf') == informante:
+                        return c
+                return self._certs[0] if self._certs else None
+
+            def run(self):
+                from nfe_search import NFeService
+                _cancelados = []
+                _erros = []
+
+                # Pré-cria um NFeService por certificado único (evita re-download de WSDL por nota)
+                _svc_cache: dict = {}
+
+                def _get_svc(informante):
+                    cert = self._cert_para(informante)
+                    if not cert:
+                        return None, cert
+                    key = cert.get('cnpj_cpf', '') or cert.get('informante', '')
+                    if key not in _svc_cache:
+                        try:
+                            _svc_cache[key] = NFeService(
+                                cert.get('caminho') or cert.get('path', ''),
+                                cert.get('senha', ''),
+                                cert.get('cnpj_cpf', ''),
+                                cert.get('cUF_autor', '35')
+                            )
+                        except Exception as e:
+                            _svc_cache[key] = None
+                            print(f'[EVENTOS-LOTE] Falha ao criar NFeService para {key}: {e}')
+                    return _svc_cache.get(key), cert
+
+                for idx, nota in enumerate(self._notas):
+                    if self._parar:
+                        break
+
+                    chave = nota.get('chave', '')
+                    informante = nota.get('informante', '')
+                    status_atual = (nota.get('status') or '').lower()
+                    self.progresso.emit(idx, chave[:20] + '…')
+
+                    # ── Passo 1: verifica arquivos locais de evento ──────────
+                    ja_cancelado_local = False
+                    try:
+                        from pathlib import Path as _Path
+                        xmls_root = DATA_DIR / "xmls"
+                        # ⚡ Busca OTIMIZADA: caminho direto ao invés de rglob("Eventos")
+                        _ev_folders_lote = []
+                        if informante and len(chave) >= 6:
+                            _aa_l, _mm_l = chave[2:4], chave[4:6]
+                            _direct_l = xmls_root / informante / f"20{_aa_l}-{_mm_l}" / "Eventos"
+                            if _direct_l.is_dir():
+                                _ev_folders_lote.append(_direct_l)
+                        if not _ev_folders_lote:
+                            try:
+                                for _cd_l in xmls_root.iterdir():
+                                    if not _cd_l.is_dir():
+                                        continue
+                                    for _md_l in _cd_l.iterdir():
+                                        if not _md_l.is_dir():
+                                            continue
+                                        _ev_l = _md_l / "Eventos"
+                                        if _ev_l.is_dir():
+                                            _ev_folders_lote.append(_ev_l)
+                            except Exception:
+                                pass
+                        for ev_folder in _ev_folders_lote:
+                            for xf in ev_folder.glob("*.xml"):
+                                if chave in xf.name and '110111' in xf.name:
+                                    ja_cancelado_local = True
+                                    break
+                            if ja_cancelado_local:
+                                break
+                    except Exception:
+                        pass
+
+                    if ja_cancelado_local and 'cancel' not in status_atual:
+                        self.cancelamento.emit(chave, informante)
+                        _cancelados.append(chave)
+                        continue   # Não precisa consultar SEFAZ
+
+                    if ja_cancelado_local:
+                        continue   # Já marcado e arquivo local ok
+
+                    # ── Passo 2: consulta SEFAZ ─────────────────────────────
+                    svc, cert = _get_svc(informante)
+                    if not cert:
+                        _erros.append(f"{chave[:12]}… — sem certificado")
+                        continue
+                    if not svc:
+                        _erros.append(f"{chave[:12]}… — falha ao criar serviço SEFAZ")
+                        continue
+
+                    try:
+                        xml_resp = svc.consultar_eventos_chave(chave)
+                        if not xml_resp:
+                            continue
+
+                        # Parseia e verifica cancelamento
+                        from lxml import etree as _et
+                        import re as _re
+                        root = _et.fromstring(
+                            xml_resp.encode('utf-8') if isinstance(xml_resp, str) else xml_resp
+                        )
+                        ns_nfe = 'http://www.portalfiscal.inf.br/nfe'
+                        ns_cte = 'http://www.portalfiscal.inf.br/cte'
+
+                        for tag_prefix, ns in [('procEventoNFe', ns_nfe), ('procEventoCTe', ns_cte)]:
+                            for ev_el in (
+                                root.findall(f'.//{{{ns}}}{tag_prefix}')
+                                + root.findall(f'.//{tag_prefix}')
+                            ):
+                                tp = (ev_el.findtext(f'.//{{{ns}}}tpEvento') or
+                                      ev_el.findtext('.//tpEvento') or '')
+                                dh = (ev_el.findtext(f'.//{{{ns}}}dhRegEvento') or
+                                      ev_el.findtext(f'.//{{{ns}}}dhEvento') or
+                                      ev_el.findtext('.//dhRegEvento') or
+                                      ev_el.findtext('.//dhEvento') or '')
+                                data_part = _re.sub(r'[^0-9]', '', dh)[:12]
+
+                                # Salva o evento em disco
+                                try:
+                                    cert_cnpj = cert.get('cnpj_cpf', informante or 'desconhecido')
+                                    ano_mes_ev = f"{dh[:4]}-{dh[5:7]}" if len(dh) >= 7 else 'eventos'
+                                    pasta_ev = DATA_DIR / "xmls" / cert_cnpj / ano_mes_ev / "Eventos"
+                                    pasta_ev.mkdir(parents=True, exist_ok=True)
+                                    nome_arq = f"{chave}_{tp}_{data_part}.xml"
+                                    cam = pasta_ev / nome_arq
+                                    if not cam.exists():
+                                        cam.write_bytes(_et.tostring(ev_el, encoding='utf-8', xml_declaration=True))
+                                except Exception:
+                                    pass
+
+                                if tp == '110111' and 'cancel' not in status_atual:
+                                    self.cancelamento.emit(chave, informante)
+                                    _cancelados.append(chave)
+
+                    except Exception as e:
+                        _erros.append(f"{chave[:12]}… — {str(e)[:60]}")
+
+                self.concluido.emit(_cancelados, _erros)
+
+        worker = LoteEventosWorker(notas_consultar, certs)
+
+        def _on_progresso(idx, chave_curta):
+            progress.setValue(idx)
+            progress.setLabelText(f"Consultando {idx + 1}/{total}\n{chave_curta}")
+            QApplication.processEvents()
+
+        def _on_cancelamento(chave, informante):
+            """Chamado na thread de worker — atualiza banco e memória imediatamente."""
+            try:
+                self.db.atualizar_status_nota(chave, "Cancelamento homologado")
+                for n in self.notes:
+                    if n.get('chave') == chave:
+                        n['status'] = "Cancelamento homologado"
+                        break
+                cancelados_marcados.append(chave)
+            except Exception as e:
+                print(f"[EVENTOS-LOTE] Erro ao marcar cancelado {chave[:12]}: {e}")
+
+        def _on_concluido(cancelados, erros):
+            progress.close()
+            if hasattr(self, 'btn_consultar_eventos_emitidos'):
+                self.btn_consultar_eventos_emitidos.setEnabled(True)
+
+            # Refresca tabelas com as novas marcações
+            if cancelados_marcados:
+                self.refresh_table()
+                self.refresh_emitidos_table()
+
+            # Resumo
+            linhas = [f"✅ Consulta concluída para {total} documento(s).\n"]
+            if cancelados_marcados:
+                linhas.append(f"❌ {len(cancelados_marcados)} nota(s) CANCELADA(s) marcada(s) na interface:")
+                for ch in cancelados_marcados[:10]:
+                    linhas.append(f"   • {ch[:20]}…")
+                if len(cancelados_marcados) > 10:
+                    linhas.append(f"   … e mais {len(cancelados_marcados) - 10}")
+            else:
+                linhas.append("✅ Nenhum cancelamento detectado.")
+            if erros:
+                linhas.append(f"\n⚠️ {len(erros)} erro(s):")
+                for er in erros[:5]:
+                    linhas.append(f"   • {er}")
+
+            QMessageBox.information(self, "Consulta de Eventos — Resultado", "\n".join(linhas))
+
+        def _on_progress_cancelado():
+            worker.stop()
+
+        worker.progresso.connect(_on_progresso)
+        worker.cancelamento.connect(_on_cancelamento)
+        worker.concluido.connect(_on_concluido)
+        progress.canceled.connect(_on_progress_cancelado)
+        self._lote_eventos_worker = worker
+        worker.start()
+
     def _on_table_emitidos_context_menu(self, pos):
         """Menu de contexto para a tabela de notas emitidas pela empresa"""
         # Pega o item clicado
@@ -4773,26 +5603,60 @@ class MainWindow(QMainWindow):
         # Opção: Ver Detalhes Completos (sempre disponível)
         action_detalhes = menu.addAction("📄 Ver Detalhes Completos")
         
-        # Opção: Buscar XML Completo (só para RESUMO)
+        # Opção: Baixar XML Completo — disponível para TODAS as NF-e e CT-e
+        tipo_emit = (item.get('tipo') or '').upper().replace('-', '').replace('_', '')
         menu.addSeparator()
-        if xml_status == 'RESUMO':
-            action_buscar = menu.addAction("🔍 Buscar XML Completo na SEFAZ")
+        if tipo_emit in ('NFE', 'CTE'):
+            # Verifica manifestação existente para tooltip informativo
+            _manifestacoes_emit = []
+            try:
+                _manifestacoes_emit = self.db.get_manifestacoes_by_chave(chave)
+            except Exception:
+                pass
+            _TIPOS_MANIF_E = {'210200', '210210', '210220', '210240'}
+            _manif_emit = next(
+                (m for m in _manifestacoes_emit if m.get('tipo_evento') in _TIPOS_MANIF_E), None
+            )
+            _lbl_emit = "🔄 Re-baixar XML Completo" if xml_status == 'COMPLETO' else "📥 Baixar XML Completo"
+            action_buscar = menu.addAction(_lbl_emit)
+            if _manif_emit:
+                _tp_e = _manif_emit.get('tipo_evento', '')
+                _tp_map_e = {'210200': 'Confirmação', '210210': 'Ciência', '210220': 'Desconhecimento', '210240': 'Não Realizada'}
+                action_buscar.setToolTip(
+                    f"✅ Manifestação registrada: {_tp_map_e.get(_tp_e, _tp_e)} ({_tp_e})\n"
+                    f"Irá baixar o XML completo da SEFAZ diretamente."
+                )
+            else:
+                action_buscar.setToolTip(
+                    "Sem manifestação registrada.\n"
+                    "Irá verificar/enviar Ciência da Operação antes de baixar o XML."
+                )
         else:
             action_buscar = None
-        
+
         # Opção: Eventos (sempre disponível)
         menu.addSeparator()
         action_eventos = menu.addAction("📋 Ver Eventos")
-        
+
+        # Opção: Buscar NFS-e na prefeitura (só para NFS-e)
+        if tipo_emit == 'NFSE':
+            menu.addSeparator()
+            action_nfse_emit = menu.addAction("🔄 Buscar NFS-e na prefeitura")
+            action_nfse_emit.setToolTip("Re-consulta a prefeitura para verificar/atualizar esta NFS-e")
+        else:
+            action_nfse_emit = None
+
         # Mostra menu e pega ação
         action = menu.exec_(self.table_emitidos.viewport().mapToGlobal(pos))
-        
-        if action == action_xml_completo:
-            self._baixar_xml_e_pdf(item)  # Novo método direto
+
+        if action is None:
+            return
         elif action == action_detalhes:
             self._mostrar_detalhes_nota(item)
         elif action == action_buscar:
-            self._buscar_xml_completo(item)
+            self._baixar_xml_e_pdf(item)
+        elif action == action_nfse_emit:
+            self._buscar_nfse_automatico(busca_completa=False)
         elif action == action_eventos:
             print(f"\n[DEBUG ANTES MOSTRAR EVENTOS] ========== ANTES DE CHAMAR _mostrar_eventos ==========")
             print(f"[DEBUG ANTES MOSTRAR EVENTOS] item['numero']: {item.get('numero')}")
@@ -4801,126 +5665,353 @@ class MainWindow(QMainWindow):
             self._mostrar_eventos(item)
     
     def _mostrar_detalhes_nota(self, item: Dict[str, Any]):
-        """Exibe uma janela com todos os detalhes da nota fiscal"""
+        """Exibe janela completa com todos os dados da nota buscando nas tabelas ricas do banco."""
         if not item:
             return
-        
-        # Cria janela de diálogo
+
+        chave = item.get('chave', '')
+        tipo_raw = (item.get('tipo') or '').upper().replace('-', '').replace('_', '')
+
+        # ── Busca dados enriquecidos nas tabelas específicas do banco ─────────
+        rich = {}
+        try:
+            with self.db._connect() as _conn:
+                if tipo_raw == 'NFE':
+                    row = _conn.execute("SELECT * FROM nfe_docs WHERE chave=?", (chave,)).fetchone()
+                    if row:
+                        cols = [d[0] for d in _conn.execute("SELECT * FROM nfe_docs LIMIT 0").description]
+                        rich = dict(zip(cols, row))
+                elif tipo_raw == 'CTE':
+                    row = _conn.execute("SELECT * FROM cte_docs WHERE chave=?", (chave,)).fetchone()
+                    if row:
+                        cols = [d[0] for d in _conn.execute("SELECT * FROM cte_docs LIMIT 0").description]
+                        rich = dict(zip(cols, row))
+                elif tipo_raw == 'NFSE':
+                    row = _conn.execute("SELECT * FROM nfse_docs WHERE chave=?", (chave,)).fetchone()
+                    if row:
+                        cols = [d[0] for d in _conn.execute("SELECT * FROM nfse_docs LIMIT 0").description]
+                        rich = dict(zip(cols, row))
+        except Exception:
+            pass
+
+        def _v(*keys):
+            """Retorna o primeiro valor não-vazio dentre as chaves dadas, buscando em rich e item."""
+            for k in keys:
+                v = rich.get(k) or item.get(k)
+                if v and str(v).strip():
+                    return str(v).strip()
+            return ''
+
+        def _fmt_money(v):
+            if not v:
+                return ''
+            try:
+                return f"R$ {float(v):,.2f}".replace(',', 'X').replace('.', ',').replace('X', '.')
+            except Exception:
+                return str(v)
+
+        def _fmt_cnpj(v):
+            v = ''.join(c for c in (v or '') if c.isdigit())
+            if len(v) == 14:
+                return f"{v[:2]}.{v[2:5]}.{v[5:8]}/{v[8:12]}-{v[12:]}"
+            if len(v) == 11:
+                return f"{v[:3]}.{v[3:6]}.{v[6:9]}-{v[9:]}"
+            return v
+
+        def _fmt_cep(v):
+            v = ''.join(c for c in (v or '') if c.isdigit())
+            if len(v) == 8:
+                return f"{v[:5]}-{v[5:]}"
+            return v
+
+        # ── Diálogo ───────────────────────────────────────────────────────────
         dialog = QDialog(self)
-        dialog.setWindowTitle(f"Detalhes - Nota {item.get('numero', 'N/A')}")
-        dialog.setMinimumWidth(700)
-        dialog.setMinimumHeight(600)
-        
-        # Layout principal
+        numero = _v('numero', 'n_nf', 'n_ct', 'n_nfse') or 'N/A'
+        dialog.setWindowTitle(f"Detalhes — Nota {numero}  [{tipo_raw}]")
+        dialog.resize(820, 720)
+
         layout = QVBoxLayout(dialog)
-        
-        # Área de scroll para o conteúdo
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll_widget = QWidget()
-        scroll_layout = QVBoxLayout(scroll_widget)
-        
-        # Função helper para adicionar campo
-        def add_field(label: str, value: Any, is_header: bool = False):
-            container = QWidget()
-            h_layout = QHBoxLayout(container)
-            h_layout.setContentsMargins(5, 5, 5, 5)
-            
-            label_widget = QLabel(f"<b>{label}:</b>")
-            label_widget.setMinimumWidth(180)
-            
-            value_str = str(value or "")
-            value_widget = QLabel(value_str)
-            value_widget.setWordWrap(True)
-            value_widget.setTextInteractionFlags(Qt.TextSelectableByMouse)
-            
-            if is_header:
-                font = value_widget.font()
-                font.setPointSize(font.pointSize() + 2)
-                font.setBold(True)
-                value_widget.setFont(font)
-                label_widget.setFont(font)
-            
-            h_layout.addWidget(label_widget)
-            h_layout.addWidget(value_widget, 1)
-            
-            scroll_layout.addWidget(container)
-        
-        # Função para adicionar separador
-        def add_separator(title: str = ""):
-            line = QFrame()
-            line.setFrameShape(QFrame.HLine)
-            line.setFrameShadow(QFrame.Sunken)
-            scroll_layout.addWidget(line)
-            
-            if title:
-                title_label = QLabel(f"<h3>{title}</h3>")
-                scroll_layout.addWidget(title_label)
-        
-        # === INFORMAÇÕES PRINCIPAIS ===
-        add_field("Número da Nota", item.get('numero', 'N/A'), is_header=True)
-        add_field("Tipo", item.get('tipo', 'N/A'))
-        add_field("Status", item.get('status', 'N/A'))
-        add_field("Status XML", item.get('xml_status', 'N/A'))
-        
-        add_separator("Emissor")
-        add_field("Nome do Emitente", item.get('nome_emitente', 'N/A'))
-        add_field("CNPJ Emitente", item.get('cnpj_emitente', 'N/A'))
-        add_field("UF", self._codigo_uf_to_sigla(item.get('uf', '')))
-        
-        add_separator("Valores")
-        add_field("Valor Total", item.get('valor', 'N/A'))
-        add_field("Base ICMS", item.get('base_icms', 'N/A'))
-        add_field("Valor ICMS", item.get('valor_icms', 'N/A'))
-        
-        add_separator("Datas")
-        add_field("Data de Emissão", self._format_date_br(item.get('data_emissao', '')))
-        add_field("Data de Vencimento", self._format_date_br(item.get('vencimento', '')))
-        add_field("Atualizado em", item.get('atualizado_em', 'N/A'))
-        
-        add_separator("Informações Fiscais")
-        add_field("CFOP", item.get('cfop', 'N/A'))
-        add_field("NCM", item.get('ncm', 'N/A'))
-        add_field("Natureza da Operação", item.get('natureza', 'N/A'))
-        add_field("IE Tomador", item.get('ie_tomador', 'N/A'))
-        
-        add_separator("Informações do Sistema")
-        add_field("Informante (CNPJ Consulta)", item.get('informante', 'N/A'))
-        add_field("Chave de Acesso", item.get('chave', 'N/A'))
-        
-        # CNPJ Destinatário (se disponível)
-        if item.get('cnpj_destinatario'):
-            add_field("CNPJ Destinatário", item.get('cnpj_destinatario', 'N/A'))
-        
-        # Finaliza scroll
-        scroll_layout.addStretch()
-        scroll.setWidget(scroll_widget)
-        layout.addWidget(scroll)
-        
-        # Botões
-        button_box = QWidget()
-        button_layout = QHBoxLayout(button_box)
-        
-        # Botão Copiar Chave
+        layout.setContentsMargins(8, 8, 8, 8)
+
+        # ── Tab widget ────────────────────────────────────────────────────────
+        tabs = QTabWidget()
+        layout.addWidget(tabs, 1)
+
+        def make_tab(title):
+            w = QWidget()
+            sa = QScrollArea()
+            sa.setWidgetResizable(True)
+            inner = QWidget()
+            vl = QVBoxLayout(inner)
+            vl.setContentsMargins(10, 10, 10, 10)
+            vl.setSpacing(2)
+            sa.setWidget(inner)
+            outer = QVBoxLayout(w)
+            outer.setContentsMargins(0, 0, 0, 0)
+            outer.addWidget(sa)
+            tabs.addTab(w, title)
+            return vl
+
+        def add_section(vl, title):
+            lbl = QLabel(f"<b style='font-size:11pt;color:#1a5276'>{title}</b>")
+            vl.addWidget(lbl)
+            line = QFrame(); line.setFrameShape(QFrame.HLine); line.setStyleSheet("color:#aaa")
+            vl.addWidget(line)
+
+        def add_row(vl, label, value, copyable=False):
+            if not value:
+                return
+            row_w = QWidget()
+            hl = QHBoxLayout(row_w)
+            hl.setContentsMargins(4, 1, 4, 1)
+            lbl = QLabel(f"<span style='color:#555'>{label}:</span>")
+            lbl.setMinimumWidth(200)
+            lbl.setMaximumWidth(200)
+            lbl.setWordWrap(True)
+            val = QLabel(f"<b>{value}</b>")
+            val.setWordWrap(True)
+            val.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            hl.addWidget(lbl)
+            hl.addWidget(val, 1)
+            if copyable:
+                btn = QPushButton("📋")
+                btn.setFixedSize(24, 24)
+                btn.setToolTip(f"Copiar {label}")
+                _v_cap = value
+                btn.clicked.connect(lambda _, x=_v_cap: self._copiar_para_clipboard(x))
+                hl.addWidget(btn)
+            vl.addWidget(row_w)
+
+        def add_spacer(vl):
+            vl.addSpacing(8)
+
+        # ── Aba 1: Identificação ──────────────────────────────────────────────
+        vl1 = make_tab("📄 Identificação")
+
+        status_val = _v('status')
+        status_color = '#1a8a1a' if 'autoriz' in status_val.lower() else ('#c0392b' if 'cancel' in status_val.lower() else '#333')
+        xml_color = '#1a8a1a' if _v('xml_status') == 'COMPLETO' else '#e67e22'
+
+        add_section(vl1, "Identificação do Documento")
+        add_row(vl1, "Tipo de Documento", _v('tipo'))
+        add_row(vl1, "Número", numero)
+        add_row(vl1, "Série", _v('serie'))
+        add_row(vl1, "Modelo", _v('mod'))
+        add_row(vl1, "Natureza da Operação", _v('natureza', 'nat_op'))
+        add_row(vl1, "CFOP Principal", _v('cfop'))
+        add_row(vl1, "Finalidade NF-e", {
+            '1':'1-Normal','2':'2-Complementar','3':'3-Ajuste','4':'4-Devolução'
+        }.get(_v('fin_nfe'), _v('fin_nfe')))
+        add_row(vl1, "Indicador Consumidor Final", {'0':'0-Normal','1':'1-Consumidor Final'}.get(_v('ind_final'), _v('ind_final')))
+        add_row(vl1, "Indicador Presença", {
+            '0':'0-N/A','1':'1-Presencial','2':'2-Internet','3':'3-Teleatendimento',
+            '4':'4-NFCE Entrega Domicílio','5':'5-Presencial fora','9':'9-Outros'
+        }.get(_v('ind_pres'), _v('ind_pres')))
+        add_row(vl1, "Tipo de Operação", {'0':'0-Entrada','1':'1-Saída'}.get(_v('tp_nf'), _v('tp_nf')))
+        add_spacer(vl1)
+
+        add_section(vl1, "Status / Protocolo")
+        # status colorido
+        row_w = QWidget(); hl = QHBoxLayout(row_w); hl.setContentsMargins(4,1,4,1)
+        lbl = QLabel("<span style='color:#555'>Status SEFAZ:</span>"); lbl.setMinimumWidth(200); lbl.setMaximumWidth(200)
+        val = QLabel(f"<b style='color:{status_color}'>{status_val or '—'}</b>"); val.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        hl.addWidget(lbl); hl.addWidget(val, 1); vl1.addWidget(row_w)
+        row_w2 = QWidget(); hl2 = QHBoxLayout(row_w2); hl2.setContentsMargins(4,1,4,1)
+        lbl2 = QLabel("<span style='color:#555'>Status XML:</span>"); lbl2.setMinimumWidth(200); lbl2.setMaximumWidth(200)
+        val2 = QLabel(f"<b style='color:{xml_color}'>{_v('xml_status') or '—'}</b>"); val2.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        hl2.addWidget(lbl2); hl2.addWidget(val2, 1); vl1.addWidget(row_w2)
+
+        add_row(vl1, "Número do Protocolo", _v('n_prot'))
+        add_row(vl1, "Data Autorização SEFAZ", _v('dh_recbto'))
+        add_row(vl1, "cStat", _v('c_stat', 'cstat'))
+        add_row(vl1, "xMotivo", _v('x_motivo', 'xmotivo'))
+        add_spacer(vl1)
+
+        add_section(vl1, "Datas")
+        add_row(vl1, "Data de Emissão", self._format_date_br(_v('data_emissao', 'dh_emi')))
+        add_row(vl1, "Data Saída/Entrada", self._format_date_br(_v('dh_sai_ent')))
+        add_row(vl1, "Data de Vencimento", self._format_date_br(_v('vencimento')))
+        add_row(vl1, "Atualizado em", _v('atualizado_em'))
+        add_row(vl1, "Indexado em", _v('indexado_em'))
+        add_spacer(vl1)
+
+        add_section(vl1, "Chave e Referência")
+        add_row(vl1, "Chave de Acesso (44 dígitos)", chave, copyable=True)
+        add_row(vl1, "NSU", _v('nsu', 'nsu'))
+        add_row(vl1, "Informante (CNPJ consulta)", _fmt_cnpj(_v('informante')))
+        add_row(vl1, "Caminho XML", _v('caminho_xml'))
+        add_row(vl1, "Caminho PDF", _v('caminho_pdf', 'pdf_path'))
+        vl1.addStretch()
+
+        # ── Aba 2: Emitente ───────────────────────────────────────────────────
+        vl2 = make_tab("🏭 Emitente")
+        add_section(vl2, "Dados do Emitente")
+        add_row(vl2, "Razão Social", _v('emit_xnome', 'nome_emitente'))
+        add_row(vl2, "Nome Fantasia", _v('emit_xfant'))
+        add_row(vl2, "CNPJ", _fmt_cnpj(_v('emit_cnpj', 'cnpj_emitente')), copyable=True)
+        add_row(vl2, "CPF", _fmt_cnpj(_v('emit_cpf')))
+        add_row(vl2, "Inscrição Estadual", _v('emit_ie', 'ie_tomador'))
+        add_spacer(vl2)
+        add_section(vl2, "Endereço do Emitente")
+        emit_end = ' '.join(filter(None, [_v('emit_xlgr'), _v('emit_nro')]))
+        add_row(vl2, "Logradouro / Número", emit_end)
+        add_row(vl2, "Bairro", _v('emit_xbairro'))
+        add_row(vl2, "Município / UF", ' / '.join(filter(None, [_v('emit_xmun'), _v('emit_uf', 'uf')])))
+        add_row(vl2, "CEP", _fmt_cep(_v('emit_cep')))
+        add_row(vl2, "Código Município", _v('emit_cmun'))
+        add_row(vl2, "CRT (Regime Tributário)", {
+            '1':'1-Simples Nacional','2':'2-Simples Nacional – excesso','3':'3-Regime Normal'
+        }.get(_v('emit_crt'), _v('emit_crt')))
+        vl2.addStretch()
+
+        # ── Aba 3: Destinatário ───────────────────────────────────────────────
+        vl3 = make_tab("🏢 Destinatário")
+        add_section(vl3, "Dados do Destinatário")
+        add_row(vl3, "Razão Social", _v('dest_xnome', 'nome_destinatario'))
+        add_row(vl3, "CNPJ", _fmt_cnpj(_v('dest_cnpj', 'cnpj_destinatario')), copyable=True)
+        add_row(vl3, "CPF", _fmt_cnpj(_v('dest_cpf')))
+        add_row(vl3, "Inscrição Estadual", _v('dest_ie'))
+        add_spacer(vl3)
+        add_section(vl3, "Endereço do Destinatário")
+        dest_end = ' '.join(filter(None, [_v('dest_xlgr'), _v('dest_nro')]))
+        add_row(vl3, "Logradouro / Número", dest_end)
+        add_row(vl3, "Bairro", _v('dest_xbairro'))
+        add_row(vl3, "Município / UF", ' / '.join(filter(None, [_v('dest_xmun'), _v('dest_uf')])))
+        add_row(vl3, "CEP", _fmt_cep(_v('dest_cep')))
+        vl3.addStretch()
+
+        # ── Aba 4: Valores ────────────────────────────────────────────────────
+        vl4 = make_tab("💰 Valores")
+        add_section(vl4, "Totais da Nota")
+        add_row(vl4, "Valor Total (vNF)", _fmt_money(_v('valor', 'v_nf')))
+        add_row(vl4, "Valor dos Produtos", _fmt_money(_v('v_prod')))
+        add_row(vl4, "Valor do Frete", _fmt_money(_v('v_frete')))
+        add_row(vl4, "Valor do Seguro", _fmt_money(_v('v_seg')))
+        add_row(vl4, "Valor do Desconto", _fmt_money(_v('v_desc')))
+        add_row(vl4, "Outras Despesas", _fmt_money(_v('v_outro')))
+        add_spacer(vl4)
+        add_section(vl4, "ICMS")
+        add_row(vl4, "Base de Cálculo ICMS", _fmt_money(_v('base_icms', 'v_bc')))
+        add_row(vl4, "Valor ICMS", _fmt_money(_v('valor_icms', 'v_icms')))
+        add_row(vl4, "ICMS Desonerado", _fmt_money(_v('v_icms_deson')))
+        add_row(vl4, "FCP", _fmt_money(_v('v_fcp')))
+        add_row(vl4, "Base ST", _fmt_money(_v('v_bc_st')))
+        add_row(vl4, "Valor ST", _fmt_money(_v('v_st')))
+        add_row(vl4, "FCP ST", _fmt_money(_v('v_fcp_st')))
+        add_spacer(vl4)
+        add_section(vl4, "Outros Impostos")
+        add_row(vl4, "II (Imposto Importação)", _fmt_money(_v('v_ii')))
+        add_row(vl4, "IPI", _fmt_money(_v('v_ipi')))
+        add_row(vl4, "PIS", _fmt_money(_v('v_pis')))
+        add_row(vl4, "COFINS", _fmt_money(_v('v_cofins')))
+        add_row(vl4, "Total Tributos Aprox.", _fmt_money(_v('v_tot_trib')))
+        add_spacer(vl4)
+        add_section(vl4, "IBS / CBS (Reforma Tributária)")
+        add_row(vl4, "IBS", _fmt_money(_v('v_ibs')))
+        add_row(vl4, "CBS", _fmt_money(_v('v_cbs')))
+        add_row(vl4, "Base IBS/CBS", _fmt_money(_v('v_bc_ibscbs')))
+        add_spacer(vl4)
+        add_section(vl4, "Pagamento")
+        _tpag_map = {
+            '01':'Dinheiro','02':'Cheque','03':'Cartão de Crédito','04':'Cartão de Débito',
+            '05':'Crédito Loja','10':'Vale Alimentação','11':'Vale Refeição','12':'Vale Presente',
+            '13':'Vale Combustível','15':'Boleto Bancário','16':'Depósito Bancário',
+            '17':'PIX','18':'Transferência Bancária','19':'Cashback','90':'Sem pagamento','99':'Outros'
+        }
+        add_row(vl4, "Tipo de Pagamento", _tpag_map.get(_v('t_pag'), _v('t_pag')))
+        add_row(vl4, "Valor do Pagamento", _fmt_money(_v('v_pag')))
+        add_row(vl4, "Data Vencimento", self._format_date_br(_v('vencimento')))
+        vl4.addStretch()
+
+        # ── Aba 5: Transporte (NF-e) / CT-e específico ───────────────────────
+        vl5 = make_tab("🚚 Transporte")
+        if tipo_raw == 'CTE':
+            add_section(vl5, "Identificação CT-e")
+            add_row(vl5, "Modal", {
+                '01':'01-Rodoviário','02':'02-Aéreo','03':'03-Aquaviário',
+                '04':'04-Ferroviário','05':'05-Dutoviário','06':'06-Multimodal'
+            }.get(_v('modal'), _v('modal')))
+            add_row(vl5, "Tipo Serviço", _v('tp_serv'))
+            add_row(vl5, "Município Início", f"{_v('x_mun_ini')} / {_v('uf_ini')}" if _v('x_mun_ini') else '')
+            add_row(vl5, "Município Fim", f"{_v('x_mun_fim')} / {_v('uf_fim')}" if _v('x_mun_fim') else '')
+            add_row(vl5, "Valor Total Prestação", _fmt_money(_v('v_tprest')))
+            add_row(vl5, "Valor a Receber", _fmt_money(_v('v_rec')))
+            add_spacer(vl5)
+            add_section(vl5, "Remetente")
+            add_row(vl5, "Nome", _v('rem_xnome'))
+            add_row(vl5, "CNPJ/CPF", _fmt_cnpj(_v('rem_cnpj') or _v('rem_cpf')))
+            add_row(vl5, "IE", _v('rem_ie'))
+            add_row(vl5, "Município / UF", f"{_v('rem_xmun')} / {_v('rem_uf')}" if _v('rem_xmun') else '')
+            add_spacer(vl5)
+            add_section(vl5, "Tomador")
+            add_row(vl5, "Nome", _v('tom_xnome'))
+            add_row(vl5, "CNPJ/CPF", _fmt_cnpj(_v('tom_cnpj') or _v('tom_cpf')))
+            add_row(vl5, "IE", _v('tom_ie'))
+            add_spacer(vl5)
+            add_section(vl5, "Carga")
+            add_row(vl5, "Valor da Carga", _fmt_money(_v('v_carga')))
+            add_row(vl5, "Produto Predominante", _v('pro_pred'))
+            add_row(vl5, "RNTRC", _v('rntrc'))
+            add_row(vl5, "Placa do Veículo", _v('veic_placa'))
+            nfe_vinc = _v('nfe_vinculadas')
+            if nfe_vinc:
+                try:
+                    import json
+                    chaves_vinc = json.loads(nfe_vinc)
+                    add_row(vl5, "NF-e Vinculadas", f"{len(chaves_vinc)} chave(s)")
+                    for _cv in chaves_vinc[:5]:
+                        add_row(vl5, "  →", _cv, copyable=True)
+                    if len(chaves_vinc) > 5:
+                        add_row(vl5, "  …", f"e mais {len(chaves_vinc)-5}")
+                except Exception:
+                    add_row(vl5, "NF-e Vinculadas", nfe_vinc)
+        else:
+            add_section(vl5, "Transporte / Frete")
+            add_row(vl5, "Modalidade do Frete", {
+                '0':'0-Emitente','1':'1-Destinatário','2':'2-Terceiros',
+                '3':'3-Próprio Remetente','4':'4-Próprio Destinatário','9':'9-Sem frete'
+            }.get(_v('mod_frete'), _v('mod_frete')))
+            add_row(vl5, "Transportadora", _v('transp_xnome'))
+            add_row(vl5, "CNPJ Transportadora", _fmt_cnpj(_v('transp_cnpj')))
+            add_row(vl5, "Valor do Frete", _fmt_money(_v('v_frete')))
+        vl5.addStretch()
+
+        # ── Aba 6: Todos os campos (debug) ────────────────────────────────────
+        vl6 = make_tab("🔍 Todos os Campos")
+        add_section(vl6, "notas_detalhadas")
+        for k, v in sorted(item.items()):
+            if v and str(v).strip():
+                add_row(vl6, k, str(v))
+        if rich:
+            add_spacer(vl6)
+            table_name = {'NFE': 'nfe_docs', 'CTE': 'cte_docs', 'NFSE': 'nfse_docs'}.get(tipo_raw, '')
+            add_section(vl6, table_name)
+            for k, v in sorted(rich.items()):
+                if v and str(v).strip() and k not in item:
+                    add_row(vl6, k, str(v))
+        vl6.addStretch()
+
+        # ── Botões ────────────────────────────────────────────────────────────
+        btn_bar = QWidget()
+        btn_hl = QHBoxLayout(btn_bar)
+        btn_hl.setContentsMargins(4, 4, 4, 4)
+
         btn_copy_chave = QPushButton("📋 Copiar Chave")
-        btn_copy_chave.clicked.connect(lambda: self._copiar_para_clipboard(item.get('chave', '')))
-        button_layout.addWidget(btn_copy_chave)
-        
-        # Botão Copiar CNPJ
-        btn_copy_cnpj = QPushButton("📋 Copiar CNPJ Emitente")
-        btn_copy_cnpj.clicked.connect(lambda: self._copiar_para_clipboard(item.get('cnpj_emitente', '')))
-        button_layout.addWidget(btn_copy_cnpj)
-        
-        button_layout.addStretch()
-        
-        # Botão Fechar
+        btn_copy_chave.clicked.connect(lambda: self._copiar_para_clipboard(chave))
+        btn_hl.addWidget(btn_copy_chave)
+
+        btn_copy_emit = QPushButton("📋 Copiar CNPJ Emitente")
+        cnpj_emit = _v('emit_cnpj', 'cnpj_emitente')
+        btn_copy_emit.clicked.connect(lambda: self._copiar_para_clipboard(cnpj_emit))
+        btn_hl.addWidget(btn_copy_emit)
+
+        btn_hl.addStretch()
+
         btn_close = QPushButton("✖ Fechar")
         btn_close.clicked.connect(dialog.accept)
-        button_layout.addWidget(btn_close)
-        
-        layout.addWidget(button_box)
-        
-        # Exibe o diálogo
+        btn_hl.addWidget(btn_close)
+
+        layout.addWidget(btn_bar)
         dialog.exec_()
     
     def _copiar_para_clipboard(self, texto: str):
@@ -5093,7 +6184,8 @@ class MainWindow(QMainWindow):
             "Confirmar Download",
             f"Deseja baixar XML completo de {len(notas)} nota(s)?\n\n"
             f"Esta operação irá:\n"
-            f"• Manifestar ciência (para NF-e)\n"
+            f"• Enviar Ciência da Operação (210210) somente se a nota ainda não tiver\n"
+            f"  nenhuma manifestação registrada (local ou na SEFAZ)\n"
             f"• Baixar XMLs completos da SEFAZ\n"
             f"• Gerar PDFs automaticamente\n"
             f"• Atualizar interface",
@@ -5225,43 +6317,85 @@ class MainWindow(QMainWindow):
         
         try:
             from nfe_search import NFeService, salvar_xml_por_certificado, extrair_nota_detalhada
+            from nfe_search import cte_consultar_por_chave
             from modules.manifestacao_service import ManifestacaoService
             import time
             
-            # 0️⃣ MANIFESTAR CIÊNCIA (SOMENTE PARA NF-e)
+            # 0️⃣ MANIFESTAR CIÊNCIA DA OPERAÇÃO (SOMENTE PARA NF-e)
             if is_nfe:
-                self.set_status(f"📝 Manifestando ciência da operação...")
+                self.set_status(f"📝 Verificando manifestações da operação...")
                 QApplication.processEvents()
                 
-                # Verifica se já foi manifestado
+                # Eventos que indicam que a nota já foi manifestada pelo destinatário
+                # 210200 = Confirmação | 210210 = Ciência | 210220 = Desconhecimento | 210240 = Não Realizada
+                EVENTOS_MANIFESTACAO = {'210200', '210210', '210220', '210240'}
+                
+                # 1ª guarda: consulta banco local
                 eventos_existentes = self.db.get_manifestacoes_by_chave(chave)
-                ja_manifestado = any(e.get('tipo_evento') == '210200' for e in eventos_existentes)
+                ja_manifestado = any(
+                    e.get('tipo_evento') in EVENTOS_MANIFESTACAO
+                    for e in eventos_existentes
+                )
+                
+                # 2ª guarda: se não achou no banco, consulta a situação da nota na SEFAZ
+                # (garante que eventos registrados fora do sistema também sejam detectados)
+                if not ja_manifestado:
+                    try:
+                        svc_check = NFeService(
+                            cert_path, cert_senha, cert_cnpj,
+                            cert_to_use.get('cUF_autor')
+                        )
+                        sit_xml = svc_check.consultar_eventos_chave(chave)
+                        if sit_xml:
+                            from lxml import etree as _et
+                            sit_root = _et.fromstring(sit_xml.encode('utf-8') if isinstance(sit_xml, str) else sit_xml)
+                            ns_nfe = 'http://www.portalfiscal.inf.br/nfe'
+                            # retConsSitNFe → procEventoNFe → retEvento → infEvento → tpEvento
+                            for ev_el in (
+                                sit_root.findall(f'.//{{{ns_nfe}}}tpEvento')
+                                + sit_root.findall('.//tpEvento')
+                            ):
+                                if ev_el.text in EVENTOS_MANIFESTACAO:
+                                    ja_manifestado = True
+                                    print(f"[CIÊNCIA] Evento {ev_el.text} já registrado na SEFAZ para {chave[:10]}...")
+                                    break
+                    except Exception as e_sit:
+                        print(f"[CIÊNCIA] Consulta situação SEFAZ falhou (prosseguindo): {e_sit}")
                 
                 if not ja_manifestado:
-                    # 🔔 MANIFESTAR CIÊNCIA DA OPERAÇÃO (evento 210200)
+                    # 🔔 CIÊNCIA DA OPERAÇÃO (210210) — primeira manifestação ao receber/baixar a nota
+                    # ⚠️ Use 210210 (Ciência), NÃO 210200 (Confirmação):
+                    #    - 210210 = destinatário ciente da existência da NF-e (não bloqueia cancelamento)
+                    #    - 210200 = destinatário confirma a operação (bloqueia cancelamento emitente)
                     try:
                         manifesta_service = ManifestacaoService(cert_path, cert_senha)
                         
                         sucesso, protocolo, mensagem, xml_resposta = manifesta_service.enviar_manifestacao(
                             chave=chave,
-                            tipo_evento='210200',  # Ciência da Operação
+                            tipo_evento='210210',  # Ciência da Operação
                             cnpj_destinatario=cert_cnpj,
-                            justificativa=None  # Evento 210200 não requer justificativa
+                            justificativa=None  # Evento 210210 não requer justificativa
                         )
                         
                         if not sucesso:
                             print(f"[INFO] Manifestação não realizada: {mensagem}")
+                            # cStat 650 = Ciência rejeitada porque a NF-e já está cancelada ou denegada
+                            # Marca imediatamente no banco para não depender de "Verificar Eventos" posterior
+                            if '650' in (mensagem or ''):
+                                try:
+                                    with self.db._connect() as _conn_cancel650:
+                                        _conn_cancel650.execute(
+                                            "UPDATE notas_detalhadas SET status = ? WHERE chave = ?",
+                                            ("Cancelamento de NF-e homologado", chave)
+                                        )
+                                    logger.info(f"✅ Nota {chave[:10]}\u2026 marcada como cancelada no banco (manifestação 650)")
+                                except Exception as _e_cancel650:
+                                    logger.warning(f"\u26a0\ufe0f Não foi possível marcar nota como cancelada (650): {_e_cancel650}")
                             self.set_status("ℹ️ Pulando manifestação (continuando com download)", 2000)
-                            # ⚠️ NÃO mostra popup - continua silenciosamente com download
-                            # Continua tentando baixar mesmo sem manifestar
                         else:
-                            # ✅ NÃO salva retEnvEvento (apenas confirmação, não contém nota)
-                            # Removido: salvar_xml_por_certificado(xml_resposta, ...) 
-                            
-                            # Registra no banco
                             self.db.register_manifestacao(
                                 chave=chave,
-                                tipo_evento='210200',
+                                tipo_evento='210210',
                                 informante=informante or cert_cnpj,
                                 status="REGISTRADA",
                                 protocolo=protocolo
@@ -5274,9 +6408,14 @@ class MainWindow(QMainWindow):
                     except Exception as e:
                         print(f"[INFO] Erro ao manifestar: {e}")
                         self.set_status("ℹ️ Pulando manifestação (continuando com download)", 2000)
-                        # ⚠️ NÃO mostra popup - continua silenciosamente
                 else:
-                    self.set_status("✅ Já manifestado anteriormente", 1000)
+                    # Já existe manifestação — vai direto para download sem enviar nova ciência
+                    tipo_ev_desc = next(
+                        (e.get('tipo_evento') for e in eventos_existentes if e.get('tipo_evento') in EVENTOS_MANIFESTACAO),
+                        'desconhecido'
+                    )
+                    print(f"[CIÊNCIA] Nota {chave[:10]}… já possui evento {tipo_ev_desc} — pulando nova manifestação")
+                    self.set_status("✅ Manifestação prévia encontrada — baixando XML...", 1000)
                     QApplication.processEvents()
             elif is_cte:
                 self.set_status("ℹ️ CT-e não requer manifestação prévia", 1000)
@@ -5286,84 +6425,252 @@ class MainWindow(QMainWindow):
             self.set_status(f"🔄 Baixando XML completo da chave {chave[:10]}...")
             QApplication.processEvents()
             
-            svc = NFeService(
-                cert_path,
-                cert_senha,
-                cert_cnpj,
-                cert_to_use.get('cUF_autor')
-            )
-            
             # Busca XML via Distribuição DFe (método mais confiável)
             xml_completo = None
             resposta_sefaz = None
             cstat_sefaz = None
             motivo_sefaz = None
             
-            try:
-                resposta_sefaz = svc.fetch_by_chave_dist(chave)
-                if resposta_sefaz:
-                    # Extrai cStat e xMotivo da resposta SEFAZ
-                    from lxml import etree
-                    import base64
-                    import gzip
-                    
-                    try:
-                        root = etree.fromstring(resposta_sefaz.encode('utf-8'))
-                        ns = {'nfe': 'http://www.portalfiscal.inf.br/nfe'}
-                        
-                        # Busca cStat/xMotivo do retDistDFeInt
-                        cstat_sefaz = root.findtext('.//nfe:cStat', namespaces=ns) or root.findtext('.//cStat')
-                        motivo_sefaz = root.findtext('.//nfe:xMotivo', namespaces=ns) or root.findtext('.//xMotivo')
-                        
-                        logger.info(f"📋 Resposta SEFAZ - cStat: {cstat_sefaz} | xMotivo: {motivo_sefaz}")
-                    except Exception as e:
-                        logger.warning(f"⚠️ Erro ao extrair cStat/xMotivo: {e}")
-                    
-                    # Verifica se tem o XML completo em texto claro
-                    if '<nfeProc' in resposta_sefaz or '<procNFe' in resposta_sefaz:
-                        xml_completo = resposta_sefaz
-                        logger.info(f"✅ XML completo encontrado na resposta (texto claro)")
+            # Tenta todos os certificados: começa pelo cert do informante
+            _cnpj_emit_chave = chave[6:20]
+            _certs_para_tentar = [cert_to_use] + [
+                c for c in certs
+                if c.get('cnpj_cpf') != cert_cnpj
+            ]
+
+            # Cache de serviços para evitar re-download do WSDL por certificado
+            _svc_nfe_cache: dict = {}
+            # CNPJs que receberam 656 nesta tentativa (rate limit) — usados na mensagem de erro
+            _certs_656_agora: list = []
+
+            for _cert_atual in _certs_para_tentar:
+                _path_atual = _cert_atual.get('caminho')
+                _senha_atual = _cert_atual.get('senha')
+                _cnpj_atual = _cert_atual.get('cnpj_cpf')
+                _cuf_atual = _cert_atual.get('cUF_autor')
+
+                # Pula certs com rate limit ativo (656) — TTL 1 hora
+                if _cnpj_atual in self._dist_rl_cache:
+                    _rl_age = (datetime.now() - self._dist_rl_cache[_cnpj_atual]).total_seconds()
+                    if _rl_age < 3600:
+                        logger.info(f"\u23ed Cert {_cnpj_atual}: rate limit ativo h\u00e1 {int(_rl_age/60)}min \u2014 pulando")
+                        continue
                     else:
-                        # Tenta descompactar documentos zipados (docZip)
+                        del self._dist_rl_cache[_cnpj_atual]  # expirado
+
+                # Pula combinações cert+chave que já retornaram 640 nesta sessão
+                if (_cnpj_atual, chave) in self._dist_640_cache:
+                    logger.debug(f"\u23ed Cert {_cnpj_atual} + chave {chave[:10]}\u2026: 640 em cache \u2014 pulando")
+                    continue
+
+                svc = None
+
+                try:
+                    if is_cte:
+                        # CT-e: SOAP direto sem WSDL (cte_consultar_por_chave cria apenas
+                        # sessão PKCS12 — evita 2 downloads de WSDL por certificado)
+                        resposta_sefaz = cte_consultar_por_chave(
+                            chave, _path_atual, _senha_atual, _cnpj_atual
+                        )
+                    else:
+                        # NF-e: usa NFeService (Zeep / DistribuiçãoDFe)
+                        if _cnpj_atual not in _svc_nfe_cache:
+                            _svc_nfe_cache[_cnpj_atual] = NFeService(
+                                _path_atual, _senha_atual, _cnpj_atual, _cuf_atual
+                            )
+                        svc = _svc_nfe_cache[_cnpj_atual]
+                        resposta_sefaz = svc.fetch_by_chave_dist(chave)
+
+                    if resposta_sefaz:
+                        # Extrai cStat e xMotivo da resposta SEFAZ
+                        from lxml import etree
+                        import base64
+                        import gzip
+
                         try:
                             root = etree.fromstring(resposta_sefaz.encode('utf-8'))
-                            ns = {'nfe': 'http://www.portalfiscal.inf.br/nfe'}
-                            
-                            # Procura por loteDistDFeInt com docZip
-                            docZips = root.findall('.//nfe:docZip', namespaces=ns) or root.findall('.//docZip')
-                            
-                            if docZips:
-                                logger.info(f"📦 Encontrados {len(docZips)} documento(s) compactado(s)")
-                                
-                                for docZip in docZips:
-                                    try:
-                                        # Decodifica base64 e descompacta gzip
-                                        zip_b64 = docZip.text
-                                        if zip_b64:
-                                            zip_bytes = base64.b64decode(zip_b64)
-                                            xml_bytes = gzip.decompress(zip_bytes)
-                                            xml_descompactado = xml_bytes.decode('utf-8')
-                                            
-                                            # Verifica se é procNFe/nfeProc
-                                            if '<procNFe' in xml_descompactado or '<nfeProc' in xml_descompactado:
-                                                xml_completo = xml_descompactado
-                                                logger.info(f"✅ XML completo descompactado com sucesso")
-                                                break
-                                    except Exception as e:
-                                        logger.warning(f"⚠️ Erro ao descompactar docZip: {e}")
-                                        continue
-                            else:
-                                logger.warning(f"⚠️ Resposta não contém XML completo nem docZip")
+                            # CT-e usa namespace cte, NF-e usa nfe
+                            _ns_uri = 'http://www.portalfiscal.inf.br/cte' if is_cte else 'http://www.portalfiscal.inf.br/nfe'
+
+                            # Busca cStat/xMotivo do retDistDFeInt
+                            cstat_sefaz = root.findtext(f'.//{{{_ns_uri}}}cStat') or root.findtext('.//cStat')
+                            motivo_sefaz = root.findtext(f'.//{{{_ns_uri}}}xMotivo') or root.findtext('.//xMotivo')
+
+                            logger.info(f"📋 Resposta SEFAZ [{_cnpj_atual}] - cStat: {cstat_sefaz} | xMotivo: {motivo_sefaz}")
                         except Exception as e:
-                            logger.warning(f"⚠️ Erro ao processar documentos zipados: {e}")
-            except Exception as e:
-                logger.error(f"❌ Erro ao buscar por distribuição: {e}")
+                            logger.warning(f"⚠️ Erro ao extrair cStat/xMotivo: {e}")
+
+                        if cstat_sefaz == '656':
+                            logger.warning(f"⚠️ Rate limit SEFAZ (656) para {_cnpj_atual} — tentando próximo certificado")
+                            self._dist_rl_cache[_cnpj_atual] = datetime.now()  # bloqueia por 1h
+                            _certs_656_agora.append(_cnpj_atual)  # registra para mensagem de erro
+                            continue  # Tenta próximo cert
+
+                        # Rejeições terminais para DistribuiçãoDFe.
+                        # 632=fora do prazo  633=NF-e inexistente  634=NF-e inutilizada
+                        # 653=NF-e cancelada, arquivo indisponível (DistribuiçãoDFe e NFeConsultaProtocolo4)
+                        # ⚠️ 632 NÃO bloqueia NFeConsultaProtocolo4 — serviço diferente, sem
+                        # limite de 60 dias. Tentamos via fetch_prot_nfe antes de desistir.
+                        # ⚠️ 653 SIM bloqueia NFeConsultaProtocolo4 — retorna apenas protNFe
+                        # (682 bytes, sem infNFe). Não há como reconstruir nfeProc. Desistir imediatamente.
+                        if cstat_sefaz in ('632', '633', '634', '653'):
+                            logger.warning(f"⏰ SEFAZ rejeição definitiva cStat={cstat_sefaz} para {chave[:10]}… — DistribuiçãoDFe indisponível")
+                            if is_nfe and cstat_sefaz == '632':
+                                # Tenta NFeConsultaProtocolo4 com o cert atual
+                                # (funciona mesmo após 60 dias; disponível para emitente e estados autorizadores)
+                                if svc is not None:
+                                    try:
+                                        logger.info(f"🔄 cStat 632: tentando NFeConsultaProtocolo4 com cert {_cnpj_atual}...")
+                                        resp_prot = svc.fetch_prot_nfe(chave)
+                                        if resp_prot and ('<nfeProc' in resp_prot or '<procNFe' in resp_prot):
+                                            xml_completo = resp_prot
+                                            logger.info(f"✅ XML completo via NFeConsultaProtocolo4 (cStat 632 contornado)")
+                                    except Exception as _e_prot632:
+                                        logger.debug(f"fetch_prot_nfe após 632 falhou: {_e_prot632}")
+                            break  # Nenhum outro cert vai mudar o resultado na DistribuiçãoDFe
+
+                        # 640 = CNPJ do cert não tem permissão para esta NF-e — tenta próximo
+                        if cstat_sefaz == '640':
+                            logger.info(f"🚫 Cert {_cnpj_atual} sem permissão (cStat 640) — tentando próximo")
+                            self._dist_640_cache.add((_cnpj_atual, chave))  # não retenta nesta sessão
+                            continue
+
+                        # Tags de documento completo:
+                        # CT-e: cteProc (padrão dist), procCTe (variante), ou CTe+protCTe (retConsSitCTe)
+                        # NF-e: nfeProc / procNFe
+                        _tags_doc = ('<cteProc', '<procCTe', '<CTe ') if is_cte else ('<nfeProc', '<procNFe')
+
+                        # Para CT-e via CTeConsultaV4, o XML completo é o retConsSitCTe inteiro
+                        # (contém <cteProc>/<procCTe> ou <CTe> + <protCTe> embutido)
+                        if is_cte and resposta_sefaz and any(t in resposta_sefaz for t in ('<cteProc', '<procCTe', '<CTe ')):
+                            xml_completo = resposta_sefaz
+                            logger.info(f"✅ CT-e completo encontrado via CTeConsultaV4")
+                            break
+
+                        # Verifica se tem o XML completo em texto claro
+                        if any(t in resposta_sefaz for t in _tags_doc):
+                            xml_completo = resposta_sefaz
+                            logger.info(f"✅ XML completo encontrado na resposta (texto claro)")
+                            break
+                        else:
+                            # Tenta descompactar documentos zipados (docZip)
+                            try:
+                                root = etree.fromstring(resposta_sefaz.encode('utf-8'))
+                                _ns_uri = 'http://www.portalfiscal.inf.br/cte' if is_cte else 'http://www.portalfiscal.inf.br/nfe'
+
+                                # Procura por loteDistDFeInt com docZip
+                                docZips = root.findall(f'.//{{{_ns_uri}}}docZip') or root.findall('.//docZip')
+
+                                if docZips:
+                                    logger.info(f"📦 Encontrados {len(docZips)} documento(s) compactado(s)")
+
+                                    for docZip in docZips:
+                                        try:
+                                            # Decodifica base64 e descompacta gzip
+                                            zip_b64 = docZip.text
+                                            if zip_b64:
+                                                zip_bytes = base64.b64decode(zip_b64)
+                                                xml_bytes = gzip.decompress(zip_bytes)
+                                                xml_descompactado = xml_bytes.decode('utf-8')
+
+                                                if any(t in xml_descompactado for t in _tags_doc):
+                                                    xml_completo = xml_descompactado
+                                                    logger.info(f"✅ XML completo descompactado com sucesso")
+                                                    break
+                                        except Exception as e:
+                                            logger.warning(f"⚠️ Erro ao descompactar docZip: {e}")
+                                            continue
+                                else:
+                                    # Só alerta quando não há cStat explicativo — se cStat
+                                    # já indicou rejeição, o aviso seria enganoso
+                                    if not cstat_sefaz:
+                                        logger.warning(f"⚠️ Resposta não contém XML completo nem docZip")
+                            except Exception as e:
+                                logger.warning(f"⚠️ Erro ao processar documentos zipados: {e}")
+
+                        if xml_completo:
+                            break
+                except Exception as e:
+                    logger.error(f"❌ Erro ao buscar por distribuição [{_cnpj_atual}]: {e}")
+
+                # Fallback para fetch_prot_nfe — NFeConsultaProtocolo4 não tem limite de 60 dias.
+                # Tenta com QUALQUER cert (não apenas o emitente): alguns estados devolvem
+                # nfeProc para destinatário / terceiro autorizado pelo emitente.
+                if not xml_completo and is_nfe and svc is not None and cstat_sefaz not in ('656', '653', None):
+                    try:
+                        logger.info(f"🔄 Tentando fetch_prot_nfe com cert {_cnpj_atual}...")
+                        resp_prot = svc.fetch_prot_nfe(chave)
+                        if resp_prot and ('<nfeProc' in resp_prot or '<procNFe' in resp_prot):
+                            xml_completo = resp_prot
+                            logger.info(f"✅ XML completo obtido via fetch_prot_nfe (cert {_cnpj_atual})")
+                            break
+                    except Exception as e_prot:
+                        logger.warning(f"⚠️ fetch_prot_nfe falhou: {e_prot}")
+
+                if xml_completo:
+                    break
             
+            # ── CT-e: fallback via CTeDistribuicaoDFe consNSU ────────────────
+            # CTeConsultaV4 retorna apenas protCTe (status) — NÃO inclui o XML do
+            # CT-e na resposta em grande parte dos estados (MS, SP/SVRS, etc.).
+            # O procCTe só pode ser obtido via CTeDistribuicaoDFe com o NSU armazenado.
+            if is_cte and not xml_completo:
+                try:
+                    with self.db._connect() as _conn_nsu:
+                        _row_nsu = _conn_nsu.execute(
+                            "SELECT nsu FROM notas_detalhadas WHERE chave=?", (chave,)
+                        ).fetchone()
+                    _nsu_cte = str(_row_nsu[0]).strip() if _row_nsu and _row_nsu[0] else ''
+
+                    if _nsu_cte:
+                        logger.info(f"🔄 CT-e: tentando CTeDistribuicaoDFe consNSU={_nsu_cte}...")
+                        from modules.cte_service import CTeService
+                        _cuf_inf = cert_to_use.get('cUF_autor') or chave[:2]
+                        _cte_dl = CTeService(cert_path, cert_senha, cert_cnpj, _cuf_inf)
+                        _resp_dist = _cte_dl.fetch_by_nsu(_nsu_cte)
+
+                        if _resp_dist:
+                            _tags_cte_full = ('<procCTe', '<cteProc', '<CTe ')
+                            for _nsu_r, _xml_doc, _schema in _cte_dl.extrair_docs(_resp_dist):
+                                if any(t in _xml_doc for t in _tags_cte_full):
+                                    xml_completo = _xml_doc
+                                    logger.info(f"✅ CT-e completo via CTeDistribuicaoDFe consNSU={_nsu_cte}")
+                                    break
+                                elif '<resCTe' in _xml_doc:
+                                    logger.info(f"⏭️ CT-e NSU={_nsu_cte} ainda é resCTe — procCTe não distribuído")
+                                    break
+                        if not xml_completo:
+                            logger.info(f"⚠️ CTeDistribuicaoDFe não retornou procCTe para NSU={_nsu_cte}")
+                    else:
+                        logger.warning(f"⚠️ NSU não disponível no banco para CT-e {chave[:10]}…")
+                except Exception as _e_cte_dl:
+                    logger.warning(f"⚠️ CTeDistribuicaoDFe fallback falhou: {_e_cte_dl}")
+
             if not xml_completo:
                 erro_msg = "XML não disponível no SEFAZ"
                 if cstat_sefaz and motivo_sefaz:
                     erro_msg = f"{cstat_sefaz}: {motivo_sefaz}"
-                
+
+                # 656 em certs autorizados + todos os demais com 640:
+                # a mensagem de "640" seria enganosa — o cert CERTO existe mas está no rate limit
+                if _certs_656_agora:
+                    _cnpjs_rl_fmt = ', '.join(_certs_656_agora[:3])
+                    erro_msg = (f"Rate limit SEFAZ (656) para o(s) certificado(s) autorizado(s): "
+                                f"{_cnpjs_rl_fmt}. Aguarde ~1 hora e tente novamente.")
+
+                # 653 = SEFAZ confirma que a NF-e está cancelada — marca imediatamente no banco
+                # sem precisar que o usuário clique em "Verificar Eventos"
+                if cstat_sefaz == '653':
+                    try:
+                        with self.db._connect() as _conn_cancel:
+                            _conn_cancel.execute(
+                                "UPDATE notas_detalhadas SET status = ? WHERE chave = ?",
+                                ("Cancelamento de NF-e homologado", chave)
+                            )
+                        logger.info(f"✅ Nota {chave[:10]}\u2026 marcada como cancelada no banco (cStat 653)")
+                    except Exception as _e_cancel:
+                        logger.warning(f"\u26a0\ufe0f Não foi possível marcar nota como cancelada: {_e_cancel}")
+
                 self.set_status("❌ XML não disponível no SEFAZ", 3000)
                 
                 if silent_mode:
@@ -5372,7 +6679,15 @@ class MainWindow(QMainWindow):
                 # Monta mensagem com detalhes da SEFAZ
                 msg_detalhes = "Não foi possível obter o XML completo da SEFAZ.\n\n"
                 
-                if cstat_sefaz and motivo_sefaz:
+                if _certs_656_agora:
+                    msg_detalhes += "⏱️ Limite de consultas SEFAZ atingido (cStat 656).\n"
+                    msg_detalhes += f"   Certificado(s) com rate limit: {', '.join(_certs_656_agora[:3])}\n"
+                    msg_detalhes += "   (Os demais certificados não têm permissão — isso é normal.)\n"
+                    msg_detalhes += "   Aguarde aproximadamente 1 hora e tente novamente.\n\n"
+                elif cstat_sefaz == '656':
+                    msg_detalhes += "⏱️ Limite de consultas SEFAZ atingido (cStat 656).\n"
+                    msg_detalhes += "   Aguarde aproximadamente 1 hora e tente novamente.\n\n"
+                elif cstat_sefaz and motivo_sefaz:
                     msg_detalhes += f"📋 Resposta SEFAZ:\n"
                     msg_detalhes += f"   • cStat: {cstat_sefaz}\n"
                     msg_detalhes += f"   • Motivo: {motivo_sefaz}\n\n"
@@ -5472,8 +6787,8 @@ class MainWindow(QMainWindow):
             if data_emissao and len(data_emissao) >= 7:
                 year_month = data_emissao[:7]
             else:
-                from datetime import datetime
-                year_month = datetime.now().strftime("%Y-%m")
+                from datetime import datetime as _dt_ym
+                year_month = _dt_ym.now().strftime("%Y-%m")
             
             xmls_root = DATA_DIR / "xmls" / (informante or cert_to_use.get('cnpj_cpf')) / tipo / year_month
             xml_file = xmls_root / f"{chave}.xml"
@@ -5564,14 +6879,16 @@ class MainWindow(QMainWindow):
             except Exception as e:
                 print(f"[AUTO-DOWNLOAD] ⚠️ Erro fetch_by_chave_dist: {e}")
             
-            # Fallback para método alternativo
+            # Fallback: tenta via ConsultaProtocolo (disponível ~180 dias)
             if not xml_completo:
                 try:
-                    xml_completo = svc.fetch_by_key(chave)
-                    if xml_completo:
-                        print(f"[AUTO-DOWNLOAD] ✅ XML obtido via fetch_by_key")
+                    xml_completo = svc.fetch_prot_nfe(chave)
+                    if xml_completo and (('<nfeProc' in xml_completo) or ('<procNFe' in xml_completo)):
+                        print(f"[AUTO-DOWNLOAD] ✅ XML obtido via ConsultaProtocolo")
+                    else:
+                        xml_completo = None
                 except Exception as e:
-                    print(f"[AUTO-DOWNLOAD] ⚠️ Erro fetch_by_key: {e}")
+                    print(f"[AUTO-DOWNLOAD] ⚠️ Erro fetch_prot_nfe: {e}")
             
             if not xml_completo or (('<nfeProc' not in xml_completo) and ('<procNFe' not in xml_completo)):
                 print(f"[AUTO-DOWNLOAD] ❌ XML não disponível")
@@ -5879,11 +7196,32 @@ class MainWindow(QMainWindow):
         
         try:
             if xmls_root.exists():
-                for eventos_folder in xmls_root.rglob("Eventos"):
-                    for xml_file in eventos_folder.glob("*.xml"):
+                # ⚡ Busca OTIMIZADA: caminho direto (informante/AAMM/Eventos) ao invés de rglob
+                evento_folders_check = []
+                _inf_cancel = item.get('informante', '')
+                if _inf_cancel and len(chave) >= 6:
+                    _aa_c, _mm_c = chave[2:4], chave[4:6]
+                    _direct = xmls_root / _inf_cancel / f"20{_aa_c}-{_mm_c}" / "Eventos"
+                    if _direct.is_dir():
+                        evento_folders_check.append(_direct)
+                if not evento_folders_check:
+                    try:
+                        for _cd in xmls_root.iterdir():
+                            if not _cd.is_dir():
+                                continue
+                            for _md in _cd.iterdir():
+                                if not _md.is_dir():
+                                    continue
+                                _ev = _md / "Eventos"
+                                if _ev.is_dir():
+                                    evento_folders_check.append(_ev)
+                    except Exception:
+                        pass
+                for ev_folder in evento_folders_check:
+                    for xml_file in ev_folder.glob("*.xml"):
                         try:
                             xml_content = xml_file.read_text(encoding='utf-8')
-                            if chave in xml_content and '110111' in xml_content:  # 110111 = evento de cancelamento
+                            if chave in xml_content and '110111' in xml_content:
                                 evento_encontrado = True
                                 self.set_status("✅ Evento de cancelamento já está salvo localmente", 3000)
                                 return
@@ -6176,7 +7514,105 @@ class MainWindow(QMainWindow):
             import traceback
             traceback.print_exc()
             QMessageBox.warning(dialog_parent, "Erro", f"Erro ao abrir PDF:\n{e}")
-    
+
+    def _abrir_comprovante_evento(self, evento: dict, chave_nota: str, informante: str, dialog_parent):
+        """
+        Duplo-clique em evento na lista 'Eventos e Vínculos':
+        - Eventos de manifestação → gera e abre o PDF comprovante SEFAZ
+        - Outros eventos          → comportamento original (_abrir_pdf_evento)
+        """
+        try:
+            import re as _re
+            TIPOS_MANIF = {'210200', '210210', '210220', '210240', '610110', '610112'}
+
+            # ── Extrai código do tipo de evento ────────────────────────────
+            tipo_evento_code = ''
+            arquivo  = evento.get('arquivo', '')
+            tipo_str = evento.get('tipo', '')
+            desc_str = evento.get('descricao', '')
+
+            # banco:  arquivo = 'Manifestação 210210'
+            if arquivo.startswith('Manifestação '):
+                tipo_evento_code = arquivo.replace('Manifestação ', '').strip()
+            else:
+                # tenta 6 dígitos de código de manifesto no nome do arquivo
+                m = _re.search(r'\b(210200|210210|210220|210240|610110|610112)\b',
+                               arquivo + ' ' + tipo_str + ' ' + desc_str)
+                if m:
+                    tipo_evento_code = m.group(1)
+
+            # ── Se não é manifestação, usa comportamento original ──────────
+            if tipo_evento_code not in TIPOS_MANIF:
+                self._abrir_pdf_evento(evento, dialog_parent)
+                return
+
+            # ── Protocolo ─────────────────────────────────────────────────
+            protocolo = ''
+            status = evento.get('status', '')
+            if desc_str.startswith('Protocolo: '):
+                protocolo = desc_str.replace('Protocolo: ', '').strip()
+            elif ' - ' in status:
+                protocolo = status.split(' - ')[0].strip()
+            else:
+                protocolo = status.strip()
+
+            # ── Data ISO ──────────────────────────────────────────────────
+            from datetime import datetime as _dt
+            data_str = evento.get('data', '')
+            data_iso = ''
+            try:
+                if ' - ' in data_str:
+                    data_iso = _dt.strptime(data_str, '%d/%m/%Y - %H:%M:%S').isoformat()
+                elif 'T' in data_str:
+                    data_iso = data_str
+                else:
+                    data_iso = _dt.now().isoformat(timespec='seconds')
+            except Exception:
+                data_iso = _dt.now().isoformat(timespec='seconds')
+
+            # ── Mensagem SEFAZ ────────────────────────────────────────────
+            if ' - ' in status:
+                mensagem = status.split(' - ', 1)[1].strip()
+            else:
+                mensagem = status or 'Evento registrado com sucesso'
+
+            # ── Gera comprovante PDF ──────────────────────────────────────
+            self.set_status("🔄 Gerando comprovante PDF...", 0)
+            QApplication.processEvents()
+
+            dados = {
+                'chave':             chave_nota,
+                'tipo_evento':       tipo_evento_code,
+                'protocolo':         protocolo,
+                'cnpj_manifestante': informante,
+                'data_hora':         data_iso,
+                'mensagem_sefaz':    mensagem,
+            }
+            pdf_path = self._gerar_pdf_comprovante_manifestacao(dados)
+
+            if pdf_path and os.path.exists(pdf_path):
+                import subprocess, sys
+                if sys.platform == 'win32':
+                    subprocess.Popen(
+                        ["cmd", "/c", "start", "", pdf_path],
+                        shell=False, creationflags=subprocess.CREATE_NO_WINDOW
+                    )
+                else:
+                    subprocess.Popen(["xdg-open", pdf_path])
+                self.set_status("✅ Comprovante aberto", 2000)
+            else:
+                QMessageBox.warning(
+                    dialog_parent, "Erro",
+                    "Não foi possível gerar o comprovante PDF.\n"
+                    "Verifique se o reportlab está instalado."
+                )
+                self.set_status("❌ Erro ao gerar comprovante", 2000)
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            QMessageBox.warning(dialog_parent, "Erro", f"Erro ao abrir comprovante:\n{e}")
+
     def _mostrar_eventos(self, item: Dict[str, Any]):
         """Mostra os eventos vinculados a uma NFe/CT-e"""
         
@@ -6204,23 +7640,51 @@ class MainWindow(QMainWindow):
                 return data_str[:19] if len(data_str) >= 19 else data_str
         
         chave = item.get('chave', '')
-        if not chave or len(chave) != 44:
+        tipo_item = str(item.get('tipo', '')).upper().replace('-', '').replace('_', '')
+        is_nfse_item = 'NFS' in tipo_item
+
+        # NF-e/CT-e/MDF-e: chave sempre 44 dígitos.
+        # NFS-e (Padrão Nacional ADN): chave de 50 caracteres ou NSU de 15 dígitos
+        # (registros antigos com fallback de NSU são phantoms — bloqueados abaixo).
+        if not chave:
             QMessageBox.warning(self, "Eventos", "Chave de acesso inválida!")
             return
-        
+        if not is_nfse_item and len(chave) != 44:
+            QMessageBox.warning(self, "Eventos", "Chave de acesso inválida!")
+            return
+        # Phantoms: NFS-e com chave = NSU de 15 dígitos e tudo zero → sem eventos reais
+        if is_nfse_item and len(chave) == 15 and chave.startswith('0'):
+            QMessageBox.information(
+                self, "Eventos",
+                "Este registro é um documento de cancelamento armazenado temporariamente.\n\n"
+                "Execute a limpeza de registros fantasma (limpar_fantasmas_nfse.py) para removê-lo."
+            )
+            return
+
         informante = item.get('informante', '')
-        
-        # Detecta o tipo pela chave (posições 20-21 = modelo)
-        # Modelo 55 = NFe, Modelo 57 = CTe, Modelo 58 = MDFe
-        modelo_chave = chave[20:22] if len(chave) >= 22 else '55'
-        if modelo_chave == '57':
-            tipo = 'CTE'
-        elif modelo_chave == '58':
-            tipo = 'MDFE'
+
+        # Detecta tipo:
+        # NFS-e identificada pelo campo tipo; NF-e/CT-e/MDF-e pelo modelo na chave
+        if is_nfse_item:
+            tipo = 'NFSE'
+            modelo_chave = '99'  # não aplicável
         else:
-            tipo = 'NFE'  # Padrão = NFe (modelo 55)
+            modelo_chave = chave[20:22] if len(chave) >= 22 else '55'
+            if modelo_chave == '57':
+                tipo = 'CTE'
+            elif modelo_chave == '58':
+                tipo = 'MDFE'
+            else:
+                tipo = 'NFE'  # Padrão = NFe (modelo 55)
         
-        numero = item.get('numero', chave[:10])
+        # nNF para NF-e, nCT para CT-e, numero para NFS-e; fallback extrai da chave
+        numero = (
+            item.get('nNF') or item.get('nCT') or item.get('numero')
+            or (str(int(chave[25:34])) if len(chave) == 44 else '')
+            or chave[:10]
+        )
+        # Para NFS-e o titulo usa 'NFS-e' em vez de 'NFE'
+        tipo_label = 'NFS-e' if tipo == 'NFSE' else tipo
         
         print(f"\n[DEBUG] ========== BUSCANDO EVENTOS ==========")
         print(f"[DEBUG] Chave: {chave}")
@@ -6228,237 +7692,500 @@ class MainWindow(QMainWindow):
         print(f"[DEBUG] Tipo detectado: {tipo}")
         print(f"[DEBUG] Número: {numero}")
         
-        # Mostra indicador de busca
-        self.set_status("🔍 Procurando eventos...")
-        QApplication.processEvents()  # Atualiza UI
-        
-        # Busca eventos nos XMLs locais
-        eventos_encontrados = []
-        eventos_unicos = set()  # Para evitar duplicatas (usa nome do arquivo como chave)
-        
-        try:
-            # 1️⃣ Busca manifestações registradas no banco
-            print(f"[DEBUG] 1️⃣ Buscando manifestações no banco...")
-            try:
-                manifestacoes = self.db.get_manifestacoes_by_chave(chave)
-                print(f"[DEBUG] Encontradas {len(manifestacoes)} manifestações no banco")
-                for manif in manifestacoes:
-                    tipo_evento = manif.get('tipo_evento', '')
-                    protocolo = manif.get('protocolo', 'N/A')
-                    data_envio = manif.get('enviado_em', 'N/A')
-                    status = manif.get('status', 'N/A')
-                    
-                    # Mapeia tipo de evento para descrição amigável
-                    tipos_eventos = {
-                        '210200': '📬 Confirmação da Operação',
-                        '210210': '❓ Ciência da Operação',
-                        '210220': '⛔ Desconhecimento da Operação',
-                        '210240': '🚫 Operação não Realizada',
-                    }
-                    
-                    evento_desc = tipos_eventos.get(tipo_evento, f"Manifestação {tipo_evento}")
-                    
-                    # Cria chave única para evitar duplicatas
-                    chave_unica = f"MANIF_{tipo_evento}_{protocolo}_{data_envio}"
-                    if chave_unica not in eventos_unicos:
-                        eventos_unicos.add(chave_unica)
-                        eventos_encontrados.append({
-                            'arquivo': f'Manifestação {tipo_evento}',
-                            'tipo': evento_desc,
-                            'descricao': f"Protocolo: {protocolo}",
-                            'data': formatar_data_evento(data_envio),
-                            'status': status,
-                            'caminho': None  # Manifestação registrada no banco
-                        })
-            except Exception as e:
-                print(f"[DEBUG] Erro ao buscar manifestações: {e}")
-            
-            # 2️⃣ Procura EVENTOS diretos do documento
-            print(f"[DEBUG] 2️⃣ Buscando eventos em pastas Eventos...")
-            xmls_root = DATA_DIR / "xmls"
-            if xmls_root.exists():
-                eventos_folders = list(xmls_root.rglob("Eventos"))
-                print(f"[DEBUG] Encontradas {len(eventos_folders)} pastas de Eventos")
-                # Busca eventos diretos (cancelamento, manifestação, etc)
-                for eventos_folder in eventos_folders:
-                    xml_files = list(eventos_folder.glob("*.xml"))
-                    if xml_files:
-                        print(f"[DEBUG] Verificando {len(xml_files)} arquivos em {eventos_folder}")
-                    for xml_file in xml_files:
-                        try:
-                            xml_content = xml_file.read_text(encoding='utf-8')
-                            
-                            # Verifica se a chave do documento está neste evento
-                            if chave not in xml_content:
-                                continue
-                            
-                            print(f"[DEBUG] ✅ Evento encontrado: {xml_file.name}")
-                                
-                            # Extrai informações do evento
-                            from lxml import etree
-                            tree = etree.fromstring(xml_content.encode('utf-8'))
-                            
-                            # Tenta diferentes estruturas de evento
-                            ns = {'nfe': 'http://www.portalfiscal.inf.br/nfe'}
-                            
-                            # Tipo de evento
-                            tp_evento = tree.findtext('.//nfe:tpEvento', namespaces=ns)
-                            if not tp_evento:
-                                # Tenta sem namespace
-                                tp_evento = tree.findtext('.//tpEvento') or 'N/A'
-                            
-                            # Descrição do evento
-                            desc_evento = tree.findtext('.//nfe:descEvento', namespaces=ns) or tree.findtext('.//nfe:xEvento', namespaces=ns)
-                            if not desc_evento:
-                                desc_evento = tree.findtext('.//descEvento') or tree.findtext('.//xEvento') or 'N/A'
-                            
-                            # Data/hora do evento
-                            dh_evento = tree.findtext('.//nfe:dhEvento', namespaces=ns) or tree.findtext('.//nfe:dhRegEvento', namespaces=ns) or tree.findtext('.//nfe:dhRecbto', namespaces=ns)
-                            if not dh_evento:
-                                dh_evento = tree.findtext('.//dhEvento') or tree.findtext('.//dhRegEvento') or tree.findtext('.//dhRecbto') or 'N/A'
-                            
-                            # Status
-                            cstat = tree.findtext('.//nfe:cStat', namespaces=ns)
-                            if not cstat:
-                                cstat = tree.findtext('.//cStat') or 'N/A'
-                            
-                            xmotivo = tree.findtext('.//nfe:xMotivo', namespaces=ns)
-                            if not xmotivo:
-                                xmotivo = tree.findtext('.//xMotivo') or 'N/A'
-                            
-                            # Mapeia tipo de evento para descrição amigável
-                            tipos_eventos = {
-                                '110111': '❌ Cancelamento',
-                                '110110': '✏️ Carta de Correção',
+        # ── Diálogo de loading enquanto a busca ocorre em background ──────────────
+        from PyQt5.QtWidgets import QProgressDialog
+        from PyQt5.QtCore import QThread, pyqtSignal as _pyqtSignal
+
+        loading_dlg = QProgressDialog("🔍 Buscando eventos…", None, 0, 0, self)
+        loading_dlg.setWindowTitle("Aguarde")
+        loading_dlg.setWindowModality(Qt.WindowModal)
+        loading_dlg.setMinimumDuration(0)
+        loading_dlg.setCancelButton(None)
+        loading_dlg.setMinimumWidth(320)
+        loading_dlg.show()
+        QApplication.processEvents()
+
+        class _BuscarEventosWorker(QThread):
+            """Realiza toda busca de eventos em background para não travar a UI."""
+            concluido = _pyqtSignal(list)   # emite lista de eventos encontrados
+
+            def __init__(self, chave, informante, tipo, db, data_dir, numero=''):
+                super().__init__()
+                self._chave = chave
+                self._informante = informante
+                self._tipo = tipo
+                self._db = db
+                self._data_dir = data_dir
+                self._numero = numero
+
+            def run(self):
+                chave = self._chave
+                informante = self._informante
+                tipo = self._tipo
+                numero = self._numero
+                DATA_DIR = self._data_dir
+
+                eventos_encontrados = []
+                eventos_unicos = set()
+
+                def formatar_data_ev(data_str: str) -> str:
+                    if not data_str or data_str == 'N/A':
+                        return 'N/A'
+                    try:
+                        data_limpa = data_str.split('-03:00')[0].split('+')[0]
+                        if 'T' in data_limpa:
+                            from datetime import datetime as _dt
+                            d = _dt.fromisoformat(data_limpa[:19])
+                            return d.strftime('%d/%m/%Y - %H:%M:%S')
+                        if '/' in data_limpa:
+                            return data_limpa
+                        return data_str[:19] if len(data_str) >= 19 else data_str
+                    except Exception:
+                        return data_str[:19] if len(data_str) >= 19 else data_str
+
+                try:
+                    # 1️⃣ Busca manifestações registradas no banco
+                    print(f"[DEBUG] 1️⃣ Buscando manifestações no banco...")
+                    try:
+                        manifestacoes = self._db.get_manifestacoes_by_chave(chave)
+                        print(f"[DEBUG] Encontradas {len(manifestacoes)} manifestações no banco")
+                        for manif in manifestacoes:
+                            tipo_evento = manif.get('tipo_evento', '')
+                            protocolo = manif.get('protocolo', 'N/A')
+                            data_envio = manif.get('enviado_em', 'N/A')
+                            status_m = manif.get('status', 'N/A')
+                            tipos_ev_map = {
                                 '210200': '📬 Confirmação da Operação',
                                 '210210': '❓ Ciência da Operação',
                                 '210220': '⛔ Desconhecimento da Operação',
                                 '210240': '🚫 Operação não Realizada',
-                                '110140': '🔒 EPEC (Contingência)',
-                                # Eventos de CTe vinculados a NFe
-                                '610130': '🚛 CTe Autorizado',
-                                '610131': '🚛 CTe Cancelado',
-                                '610500': '📦 MDFe Autorizado',
-                                '610510': '📦 MDFe Cancelado',
-                                '610514': '📦 MDFe com CTe',
-                                '610600': '🚛 CTe Vinculado à NFe',
-                                '610601': '🚛 CTe Desvinculado da NFe',
-                                '610610': '📦 MDFe Vinculado à NFe',
-                                '610611': '📦 MDFe Desvinculado da NFe',
-                                '610614': '📦 MDFe Autorizado com CTe',
-                                '610615': '📦 MDFe Cancelado com CTe',
                             }
-                            
-                            evento_desc = tipos_eventos.get(tp_evento, f"Evento {tp_evento}")
-                            
-                            # Cria chave única para evitar duplicatas (usa DADOS do evento, não nome do arquivo)
-                            chave_unica = f"EVENTO_{tp_evento}_{dh_evento}_{desc_evento}"
+                            evento_desc = tipos_ev_map.get(tipo_evento, f"Manifestação {tipo_evento}")
+                            chave_unica = f"MANIF_{tipo_evento}_{protocolo}_{data_envio}"
                             if chave_unica not in eventos_unicos:
                                 eventos_unicos.add(chave_unica)
                                 eventos_encontrados.append({
-                                    'arquivo': xml_file.name,
+                                    'arquivo': f'Manifestação {tipo_evento}',
                                     'tipo': evento_desc,
-                                    'descricao': desc_evento,
-                                    'data': formatar_data_evento(dh_evento),
-                                    'status': f"{cstat} - {xmotivo}",
-                                    'caminho': str(xml_file),
-                                    'relacao': 'Evento Direto'
+                                    'descricao': f"Protocolo: {protocolo}",
+                                    'data': formatar_data_ev(data_envio),
+                                    'status': status_m,
+                                    'caminho': None
                                 })
-                        except Exception:
-                            continue
-        except Exception as e:
-            print(f"[DEBUG] Erro ao buscar eventos em pastas: {e}")
-        
-        # 3️⃣ Busca DOCUMENTOS que referenciam este documento
-        # Para NFe: busca CTes e MDFes que mencionem essa chave
-        # Para CTe: busca NFes e MDFes que mencionem essa chave
-        try:
-            xmls_root = DATA_DIR / "xmls"
-            if xmls_root.exists():
-                pastas_busca = []
-                if tipo == "NFE":
-                    pastas_busca = ["CTe", "MDFe"]
-                elif tipo == "CTE":
-                    pastas_busca = ["NFe", "MDFe"]
-                elif tipo == "MDFE":
-                    pastas_busca = ["NFe", "CTe"]
-                else:
-                    pastas_busca = []
-                
-                for pasta_tipo in pastas_busca:
-                    for pasta_doc in xmls_root.rglob(pasta_tipo):
-                        if not pasta_doc.is_dir():
-                            continue
-                        
-                        for xml_file in pasta_doc.glob("*.xml"):
+                    except Exception as e:
+                        print(f"[DEBUG] Erro ao buscar manifestações: {e}")
+
+                    # 2️⃣ Procura EVENTOS diretos do documento
+                    print(f"[DEBUG] 2️⃣ Buscando eventos em pastas Eventos...")
+                    xmls_root = DATA_DIR / "xmls"
+                    if xmls_root.exists():
+                        # ⚡ Busca OTIMIZADA: caminho direto (informante/AAMM/Eventos)
+                        eventos_folders = []
+                        if informante and len(chave) >= 6:
+                            _aa_ch, _mm_ch = chave[2:4], chave[4:6]
+                            _direct_ev = xmls_root / informante / f"20{_aa_ch}-{_mm_ch}" / "Eventos"
+                            if _direct_ev.is_dir():
+                                eventos_folders.append(_direct_ev)
+                        if not eventos_folders:
+                            # Fallback: varre TODOS os meses apenas do informante específico
+                            # (evita iterar CNPJs de outros certificados desnecessariamente)
                             try:
-                                xml_content = xml_file.read_text(encoding='utf-8')
-                                
-                                # Verifica se a chave do documento original está referenciada neste XML
-                                if chave not in xml_content:
+                                _cnpj_dirs = []
+                                if informante:
+                                    _inf_dir = xmls_root / informante
+                                    if _inf_dir.is_dir():
+                                        _cnpj_dirs = [_inf_dir]
+                                if not _cnpj_dirs:
+                                    _cnpj_dirs = [d for d in xmls_root.iterdir() if d.is_dir()]
+                                for _cnpj_d in _cnpj_dirs:
+                                    for _month_d in _cnpj_d.iterdir():
+                                        if not _month_d.is_dir():
+                                            continue
+                                        _ev_dir = _month_d / "Eventos"
+                                        if _ev_dir.is_dir():
+                                            eventos_folders.append(_ev_dir)
+                            except Exception:
+                                pass
+                        print(f"[DEBUG] Encontradas {len(eventos_folders)} pastas de Eventos")
+                        tipos_eventos_map = {
+                            '110111': '❌ Cancelamento',
+                            '110110': '✏️ Carta de Correção',
+                            '210200': '📬 Confirmação da Operação',
+                            '210210': '❓ Ciência da Operação',
+                            '210220': '⛔ Desconhecimento da Operação',
+                            '210240': '🚫 Operação não Realizada',
+                            '110140': '🔒 EPEC (Contingência)',
+                            '610130': '🚛 CTe Autorizado', '610131': '🚛 CTe Cancelado',
+                            '610500': '📦 MDFe Autorizado', '610510': '📦 MDFe Cancelado',
+                            '610514': '📦 MDFe com CTe', '610600': '🚛 CTe Vinculado à NFe',
+                            '610601': '🚛 CTe Desvinculado da NFe',
+                            '610610': '📦 MDFe Vinculado à NFe',
+                            '610611': '📦 MDFe Desvinculado da NFe',
+                            '610614': '📦 MDFe Autorizado com CTe',
+                            '610615': '📦 MDFe Cancelado com CTe',
+                            'STATUS': '📋 Status SEFAZ (ConsultaProtocolo)',
+                        }
+                        for eventos_folder in eventos_folders:
+                            xml_files = list(eventos_folder.glob("*.xml"))
+                            if xml_files:
+                                print(f"[DEBUG] Verificando {len(xml_files)} arquivos em {eventos_folder}")
+                            for xml_file in xml_files:
+                                try:
+                                    xml_content = xml_file.read_text(encoding='utf-8')
+                                    if chave not in xml_content:
+                                        continue
+                                    print(f"[DEBUG] ✅ Evento encontrado: {xml_file.name}")
+                                    from lxml import etree
+                                    tree = etree.fromstring(xml_content.encode('utf-8'))
+                                    ns = {'nfe': 'http://www.portalfiscal.inf.br/nfe'}
+
+                                    # Detecta arquivo de status sintético (gerado pelo "Consultar SEFAZ")
+                                    is_sintetico = tree.tag == 'statusSEFAZ'
+                                    if is_sintetico:
+                                        tp_evento  = tree.findtext('tpEvento') or 'STATUS'
+                                        cstat      = tree.findtext('cStat') or 'N/A'
+                                        xmotivo    = tree.findtext('xMotivo') or 'N/A'
+                                        dh_evento  = tree.findtext('dhRecbto') or 'N/A'
+                                        desc_evento = f"cStat {cstat}: {xmotivo}"
+                                    else:
+                                        tp_evento = tree.findtext('.//nfe:tpEvento', namespaces=ns) or tree.findtext('.//tpEvento') or 'N/A'
+                                        desc_evento = (tree.findtext('.//nfe:descEvento', namespaces=ns)
+                                                       or tree.findtext('.//nfe:xEvento', namespaces=ns)
+                                                       or tree.findtext('.//descEvento')
+                                                       or tree.findtext('.//xEvento') or 'N/A')
+                                        dh_evento = (tree.findtext('.//nfe:dhEvento', namespaces=ns)
+                                                     or tree.findtext('.//nfe:dhRegEvento', namespaces=ns)
+                                                     or tree.findtext('.//nfe:dhRecbto', namespaces=ns)
+                                                     or tree.findtext('.//dhEvento')
+                                                     or tree.findtext('.//dhRegEvento')
+                                                     or tree.findtext('.//dhRecbto') or 'N/A')
+                                        cstat   = tree.findtext('.//nfe:cStat', namespaces=ns) or tree.findtext('.//cStat') or 'N/A'
+                                        xmotivo = tree.findtext('.//nfe:xMotivo', namespaces=ns) or tree.findtext('.//xMotivo') or 'N/A'
+                                    evento_desc2 = tipos_eventos_map.get(tp_evento, f"Evento {tp_evento}")
+                                    chave_unica = f"EVENTO_{tp_evento}_{dh_evento}_{desc_evento}"
+                                    if chave_unica not in eventos_unicos:
+                                        eventos_unicos.add(chave_unica)
+                                        eventos_encontrados.append({
+                                            'arquivo': xml_file.name,
+                                            'tipo': evento_desc2,
+                                            'descricao': desc_evento,
+                                            'data': formatar_data_ev(dh_evento),
+                                            'status': f"{cstat} - {xmotivo}",
+                                            'caminho': str(xml_file),
+                                            'relacao': 'Evento Direto'
+                                        })
+                                except Exception:
                                     continue
-                                
-                                # Parse do XML para extrair informações
-                                from lxml import etree
-                                tree = etree.fromstring(xml_content.encode('utf-8'))
-                                
-                                # Extrai chave e número do documento vinculado
-                                ns_cte = {'cte': 'http://www.portalfiscal.inf.br/cte'}
-                                ns_nfe = {'nfe': 'http://www.portalfiscal.inf.br/nfe'}
-                                ns_mdfe = {'mdfe': 'http://www.portalfiscal.inf.br/mdfe'}
-                                
-                                chave_vinculada = None
-                                numero_vinculado = None
-                                emitente_vinculado = None
-                                data_vinculada = None
-                                
-                                if pasta_tipo == "CTe":
-                                    chave_vinculada = tree.findtext('.//cte:chCTe', namespaces=ns_cte) or tree.findtext('.//chCTe')
-                                    numero_vinculado = tree.findtext('.//cte:nCT', namespaces=ns_cte) or tree.findtext('.//nCT')
-                                    emitente_vinculado = tree.findtext('.//cte:xNome', namespaces=ns_cte) or tree.findtext('.//xNome')
-                                    data_vinculada = tree.findtext('.//cte:dhEmi', namespaces=ns_cte) or tree.findtext('.//dhEmi')
-                                elif pasta_tipo == "NFe":
-                                    chave_vinculada = tree.findtext('.//nfe:chNFe', namespaces=ns_nfe) or tree.findtext('.//chNFe')
-                                    numero_vinculado = tree.findtext('.//nfe:nNF', namespaces=ns_nfe) or tree.findtext('.//nNF')
-                                    emitente_vinculado = tree.findtext('.//nfe:xNome', namespaces=ns_nfe) or tree.findtext('.//xNome')
-                                    data_vinculada = tree.findtext('.//nfe:dhEmi', namespaces=ns_nfe) or tree.findtext('.//dhEmi')
-                                elif pasta_tipo == "MDFe":
-                                    chave_vinculada = tree.findtext('.//mdfe:chMDFe', namespaces=ns_mdfe) or tree.findtext('.//chMDFe')
-                                    numero_vinculado = tree.findtext('.//mdfe:nMDF', namespaces=ns_mdfe) or tree.findtext('.//nMDF')
-                                    emitente_vinculado = tree.findtext('.//mdfe:xNome', namespaces=ns_mdfe) or tree.findtext('.//xNome')
-                                    data_vinculada = tree.findtext('.//mdfe:dhEmi', namespaces=ns_mdfe) or tree.findtext('.//dhEmi')
-                                
-                                if not numero_vinculado:
-                                    numero_vinculado = xml_file.stem[:10]  # Pega do nome do arquivo
-                                
-                                # Cria chave única para evitar duplicatas (usa chave do documento vinculado)
-                                chave_unica = f"VINCULO_{chave_vinculada or xml_file.name}_{numero_vinculado}_{data_vinculada}"
+
+                    # 3️⃣ Busca DOCUMENTOS que referenciam este documento
+                    print(f"[DEBUG] 3️⃣ Buscando documentos vinculados...")
+                    if xmls_root.exists():
+                        pastas_busca = []
+                        if tipo == "NFE":
+                            pastas_busca = ["CTe", "MDFe"]
+                        elif tipo == "CTE":
+                            pastas_busca = ["NFe", "MDFe"]
+                        elif tipo == "MDFE":
+                            pastas_busca = ["NFe", "CTe"]
+                        for pasta_tipo in pastas_busca:
+                            # ⚡ FIX CRÍTICO: usa xmls_caminhos (caminhos indexados no DB) em vez de
+                            # varrer TODOS os CNPJs × TODOS os meses no filesystem.
+                            # Restringe ao informante e ao tipo de pasta relevante.
+                            candidatos = []
+                            try:
+                                import sqlite3 as _sqlite3
+                                db_path_str = str(DATA_DIR / "notas.db")
+                                if not os.path.exists(db_path_str):
+                                    db_path_str = str(DATA_DIR.parent / "notas.db")
+                                with _sqlite3.connect(db_path_str) as _conn:
+                                    _rows = _conn.execute(
+                                        "SELECT caminho FROM xmls_caminhos WHERE cnpj_cpf = ? AND tipo = ?",
+                                        (informante, pasta_tipo)
+                                    ).fetchall()
+                                candidatos = [Path(r[0]) for r in _rows if r[0] and os.path.exists(r[0])]
+                                print(f"[DEBUG] xmls_caminhos: {len(candidatos)} arquivos {pasta_tipo} para {informante}")
+                            except Exception as _e:
+                                print(f"[DEBUG] Fallback filesystem para {pasta_tipo}: {_e}")
+                                # Fallback: varre APENAS o informante (não todos os CNPJs)
+                                _inf_root = xmls_root / informante if informante else None
+                                _scan_roots = [_inf_root] if _inf_root and _inf_root.is_dir() else [d for d in xmls_root.iterdir() if d.is_dir()]
+                                for _cnpj_d in _scan_roots:
+                                    for _month_d in _cnpj_d.iterdir():
+                                        if not _month_d.is_dir():
+                                            continue
+                                        _p = _month_d / pasta_tipo
+                                        if _p.is_dir():
+                                            candidatos.extend(_p.glob("*.xml"))
+                            for xml_file in candidatos:
+                                try:
+                                    xml_content = xml_file.read_text(encoding='utf-8')
+                                    if chave not in xml_content:
+                                        continue
+                                    from lxml import etree
+                                    tree = etree.fromstring(xml_content.encode('utf-8'))
+                                    ns_cte = {'cte': 'http://www.portalfiscal.inf.br/cte'}
+                                    ns_nfe = {'nfe': 'http://www.portalfiscal.inf.br/nfe'}
+                                    ns_mdfe = {'mdfe': 'http://www.portalfiscal.inf.br/mdfe'}
+                                    chave_vinculada = numero_vinculado = emitente_vinculado = data_vinculada = None
+                                    if pasta_tipo == "CTe":
+                                        chave_vinculada = tree.findtext('.//cte:chCTe', namespaces=ns_cte) or tree.findtext('.//chCTe')
+                                        numero_vinculado = tree.findtext('.//cte:nCT', namespaces=ns_cte) or tree.findtext('.//nCT')
+                                        emitente_vinculado = tree.findtext('.//cte:xNome', namespaces=ns_cte) or tree.findtext('.//xNome')
+                                        data_vinculada = tree.findtext('.//cte:dhEmi', namespaces=ns_cte) or tree.findtext('.//dhEmi')
+                                    elif pasta_tipo == "NFe":
+                                        chave_vinculada = tree.findtext('.//nfe:chNFe', namespaces=ns_nfe) or tree.findtext('.//chNFe')
+                                        numero_vinculado = tree.findtext('.//nfe:nNF', namespaces=ns_nfe) or tree.findtext('.//nNF')
+                                        emitente_vinculado = tree.findtext('.//nfe:xNome', namespaces=ns_nfe) or tree.findtext('.//xNome')
+                                        data_vinculada = tree.findtext('.//nfe:dhEmi', namespaces=ns_nfe) or tree.findtext('.//dhEmi')
+                                    elif pasta_tipo == "MDFe":
+                                        chave_vinculada = tree.findtext('.//mdfe:chMDFe', namespaces=ns_mdfe) or tree.findtext('.//chMDFe')
+                                        numero_vinculado = tree.findtext('.//mdfe:nMDF', namespaces=ns_mdfe) or tree.findtext('.//nMDF')
+                                        emitente_vinculado = tree.findtext('.//mdfe:xNome', namespaces=ns_mdfe) or tree.findtext('.//xNome')
+                                        data_vinculada = tree.findtext('.//mdfe:dhEmi', namespaces=ns_mdfe) or tree.findtext('.//dhEmi')
+                                    if not numero_vinculado:
+                                        numero_vinculado = xml_file.stem[:10]
+                                    chave_unica = f"VINCULO_{chave_vinculada or xml_file.name}_{numero_vinculado}_{data_vinculada}"
+                                    if chave_unica not in eventos_unicos:
+                                        eventos_unicos.add(chave_unica)
+                                        eventos_encontrados.append({
+                                            'arquivo': xml_file.name,
+                                            'tipo': f'🔗 {pasta_tipo} Vinculado',
+                                            'descricao': f"{pasta_tipo} Nº {numero_vinculado} - {emitente_vinculado or 'N/A'}",
+                                            'data': formatar_data_ev(data_vinculada) if data_vinculada else 'N/A',
+                                            'status': f"Chave: {chave_vinculada[:10]}..." if chave_vinculada else xml_file.name[:30],
+                                            'caminho': str(xml_file),
+                                            'relacao': f'{pasta_tipo} Vinculado'
+                                        })
+                                except Exception as ex:
+                                    print(f"[DEBUG] Erro ao processar {xml_file.name}: {ex}")
+                except Exception as e:
+                    print(f"[DEBUG] Erro geral na busca de eventos: {e}")
+
+                # ── NFS-e: extrai eventos diretamente do XML armazenado ─────────────────
+                if tipo == 'NFSE':
+                    try:
+                        ns_nfse = 'http://www.sped.fazenda.gov.br/nfse'
+                        xmls_root = DATA_DIR / 'xmls'
+                        # Padrões de nome do arquivo NFS-e
+                        padroes = []
+                        if numero:
+                            padroes += [f'NFSe_{numero}.xml', f'{numero}.xml',
+                                        f'NFSe_{numero.zfill(15)}.xml']
+                        padroes += [f'*{numero}*.xml'] if numero else []
+
+                        nfse_xml_path = None
+                        nfse_xml_content = None
+
+                        # Busca caminho direto pelo informante/mês
+                        if informante and len(chave) >= 6:
+                            _aa, _mm = chave[2:4], chave[4:6]
+                            for fmt in [f'20{_aa}-{_mm}', f'{_mm}-20{_aa}']:
+                                for subdir in ['NFSE', 'NFSe', 'nfse']:
+                                    pasta = xmls_root / informante / fmt / subdir
+                                    if not pasta.is_dir():
+                                        continue
+                                    for pat in padroes:
+                                        matches = list(pasta.glob(pat))
+                                        if matches:
+                                            nfse_xml_path = matches[0]
+                                            break
+                                    if nfse_xml_path:
+                                        break
+                                if nfse_xml_path:
+                                    break
+
+                        # Fallback: varre todos os meses do informante
+                        if not nfse_xml_path and informante and numero:
+                            inf_dir = xmls_root / informante
+                            if inf_dir.is_dir():
+                                for month_d in sorted(inf_dir.iterdir(), reverse=True):
+                                    if not month_d.is_dir():
+                                        continue
+                                    for subdir in ['NFSE', 'NFSe', 'nfse']:
+                                        pasta = month_d / subdir
+                                        if not pasta.is_dir():
+                                            continue
+                                        for pat in padroes:
+                                            matches = list(pasta.glob(pat))
+                                            if matches:
+                                                nfse_xml_path = matches[0]
+                                                break
+                                        if nfse_xml_path:
+                                            break
+                                    if nfse_xml_path:
+                                        break
+
+                        if nfse_xml_path and nfse_xml_path.exists():
+                            print(f'[DEBUG] NFS-e XML encontrado: {nfse_xml_path.name}')
+                            nfse_xml_content = nfse_xml_path.read_text(encoding='utf-8', errors='ignore')
+                            try:
+                                from lxml import etree as _et
+                                tree = _et.fromstring(nfse_xml_content.encode('utf-8'))
+                                ns = {'n': ns_nfse}
+                                cstat   = tree.findtext(f'.//{{{ns_nfse}}}cStat')   or 'N/A'
+                                dh_proc = tree.findtext(f'.//{{{ns_nfse}}}dhProc')  or 'N/A'
+                                n_nfse  = tree.findtext(f'.//{{{ns_nfse}}}nNFSe')  or numero or 'N/A'
+                                # cStat 100 = Autorizada
+                                cstat_desc = {'100': '✅ Autorizada', '101': '❌ Cancelada',
+                                              '105': '🔄 Substituída', '106': '🔄 Substituída e Cancelada'}.get(cstat, f'cStat {cstat}')
+                                chave_unica = f'NFSE_AUTH_{n_nfse}_{dh_proc}'
                                 if chave_unica not in eventos_unicos:
                                     eventos_unicos.add(chave_unica)
                                     eventos_encontrados.append({
-                                        'arquivo': xml_file.name,
-                                        'tipo': f'🔗 {pasta_tipo} Vinculado',
-                                        'descricao': f"{pasta_tipo} Nº {numero_vinculado} - {emitente_vinculado or 'N/A'}",
-                                        'data': formatar_data_evento(data_vinculada) if data_vinculada else 'N/A',
-                                        'status': f"Chave: {chave_vinculada[:10]}..." if chave_vinculada else xml_file.name[:30],
-                                        'caminho': str(xml_file),
-                                        'relacao': f'{pasta_tipo} Vinculado'
+                                        'arquivo': nfse_xml_path.name,
+                                        'tipo': '📋 Autorização NFS-e',
+                                        'descricao': f'NFS-e Nº {n_nfse} — {cstat_desc}',
+                                        'data': formatar_data_ev(dh_proc),
+                                        'status': f'{cstat} - Processamento NFS-e',
+                                        'caminho': str(nfse_xml_path),
+                                        'relacao': 'Evento Direto'
                                     })
-                            except Exception as ex:
-                                print(f"[DEBUG] Erro ao processar {xml_file.name}: {ex}")
-                                continue
-        except Exception as e:
-            print(f"[DEBUG] Erro ao buscar documentos vinculados: {e}")
-        
-        # Limpa status após busca
+                            except Exception as _e:
+                                print(f'[DEBUG] Erro ao parsear NFS-e XML: {_e}')
+
+                        # Busca eventoCancelamento / eventoSubstituicao nas pastas NFSE
+                        if informante and numero:
+                            inf_dir = xmls_root / informante
+                            if inf_dir.is_dir():
+                                for month_d in sorted(inf_dir.iterdir(), reverse=True):
+                                    if not month_d.is_dir():
+                                        continue
+                                    for subdir in ['NFSE', 'NFSe', 'nfse']:
+                                        pasta = month_d / subdir
+                                        if not pasta.is_dir():
+                                            continue
+                                        for xml_f in pasta.glob('*.xml'):
+                                            if xml_f == nfse_xml_path:
+                                                continue
+                                            try:
+                                                txt = xml_f.read_text(encoding='utf-8', errors='ignore')
+                                                has_cancel = 'eventoCancelamento' in txt
+                                                has_subst  = 'eventoSubstituicao' in txt
+                                                if not (has_cancel or has_subst):
+                                                    continue
+                                                if numero not in txt and chave not in txt:
+                                                    continue
+                                                from lxml import etree as _et
+                                                ev_tree = _et.fromstring(txt.encode('utf-8'))
+                                                dh_ev = (ev_tree.findtext(f'.//{{{ns_nfse}}}dhCancNFSe')
+                                                         or ev_tree.findtext(f'.//{{{ns_nfse}}}dhEmi')
+                                                         or ev_tree.findtext('.//dhCancNFSe')
+                                                         or ev_tree.findtext('.//dhEmi') or 'N/A')
+                                                motivo = (ev_tree.findtext(f'.//{{{ns_nfse}}}xJustCancNFSe')
+                                                          or ev_tree.findtext('.//xJustCancNFSe')
+                                                          or ev_tree.findtext(f'.//{{{ns_nfse}}}xMotivo')
+                                                          or ev_tree.findtext('.//xMotivo') or 'N/A')
+                                                tipo_ev    = '❌ Cancelamento NFS-e' if has_cancel else '🔄 Substituição NFS-e'
+                                                chave_unica = f'NFSE_EV_{xml_f.name}'
+                                                if chave_unica not in eventos_unicos:
+                                                    eventos_unicos.add(chave_unica)
+                                                    eventos_encontrados.append({
+                                                        'arquivo': xml_f.name,
+                                                        'tipo': tipo_ev,
+                                                        'descricao': f'Motivo: {motivo}',
+                                                        'data': formatar_data_ev(dh_ev),
+                                                        'status': 'Cancelamento homologado' if has_cancel else 'Substituição',
+                                                        'caminho': str(xml_f),
+                                                        'relacao': 'Evento Direto'
+                                                    })
+                                            except Exception:
+                                                continue
+
+                        # Se não encontrou evento no XML mas DB diz cancelada → evento sintético
+                        try:
+                            with self._db._connect() as _conn:
+                                row = _conn.execute(
+                                    'SELECT status FROM notas_detalhadas WHERE chave=?', (chave,)
+                                ).fetchone()
+                            if row and 'cancel' in (row[0] or '').lower():
+                                ja_tem_cancel = any(
+                                    'Cancelamento' in e.get('tipo', '') or 'cancel' in e.get('status', '').lower()
+                                    for e in eventos_encontrados
+                                )
+                                if not ja_tem_cancel:
+                                    eventos_encontrados.append({
+                                        'arquivo': 'status_banco',
+                                        'tipo': '❌ Cancelamento NFS-e',
+                                        'descricao': f'Cancelamento registrado no sistema (evento recebido via NSU)',
+                                        'data': 'N/A',
+                                        'status': row[0],
+                                        'caminho': None,
+                                        'relacao': 'Evento Direto'
+                                    })
+                        except Exception:
+                            pass
+
+                        print(f'[DEBUG] NFS-e eventos encontrados: {len(eventos_encontrados)}')
+                    except Exception as e_nfse:
+                        print(f'[DEBUG] Erro ao buscar eventos NFS-e: {e_nfse}')
+
+                self.concluido.emit(eventos_encontrados)
+
+        _worker = _BuscarEventosWorker(chave, informante, tipo, self.db, DATA_DIR, numero)
+
+        def _on_busca_concluida(eventos_encontrados):
+            loading_dlg.close()
+            self._mostrar_eventos_dialog(item, chave, tipo, tipo_label, numero, informante, eventos_encontrados)
+
+        _worker.concluido.connect(_on_busca_concluida)
+        _worker.finished.connect(_worker.deleteLater)
+        # Guarda referências explícitas para evitar garbage collection pelo PyQt5
+        self._eventos_worker = _worker
+        self._eventos_on_concluida = _on_busca_concluida
+        _worker.start()
+        # A UI retorna imediatamente; o diálogo abrirá quando o worker terminar
+
+        # Toda a lógica de busca foi migrada para _BuscarEventosWorker.run()
+        # O diálogo de resultados é aberto em _mostrar_eventos_dialog() via sinal concluido
+
+    def _mostrar_eventos_dialog(self, item, chave, tipo, tipo_label, numero, informante, eventos_encontrados):
+        """Cria e exibe o diálogo de eventos após a busca em background."""
+        # Status no rodapé
         if eventos_encontrados:
             self.set_status(f"✅ {len(eventos_encontrados)} evento(s) encontrado(s)", 2000)
         else:
             self.set_status("ℹ️ Nenhum evento encontrado", 2000)
-        
+
+        # ── Detecta cancelamento nos eventos locais e atualiza status se necessário ──
+        try:
+            status_atual = (item.get('status') or '').lower()
+            ja_cancelado = 'cancel' in status_atual
+            if not ja_cancelado:
+                for ev in eventos_encontrados:
+                    arquivo_ev = ev.get('arquivo', '')
+                    tipo_ev = ev.get('tipo', '')
+                    if '110111' in arquivo_ev or 'Cancelamento' in tipo_ev:
+                        print(f"[EVENTOS] ❌ Cancelamento detectado localmente para {chave[:10]}… — atualizando status")
+                        self.db.atualizar_status_nota(chave, "Cancelamento homologado")
+                        for n in self.notes:
+                            if n.get('chave') == chave:
+                                n['status'] = "Cancelamento homologado"
+                                break
+                        self.refresh_table()
+                        self.refresh_emitidos_table()
+                        self.set_status("❌ Nota CANCELADA — status atualizado na interface", 4000)
+                        break
+        except Exception as e_det:
+            print(f"[EVENTOS] Erro ao detectar cancelamento local: {e_det}")
+
+        def formatar_data_evento(data_str: str) -> str:
+            if not data_str or data_str == 'N/A':
+                return 'N/A'
+            try:
+                data_limpa = data_str.split('-03:00')[0].split('+')[0]
+                if 'T' in data_limpa:
+                    from datetime import datetime
+                    dt = datetime.fromisoformat(data_limpa[:19])
+                    return dt.strftime('%d/%m/%Y - %H:%M:%S')
+                if '/' in data_limpa:
+                    return data_limpa
+                return data_str[:19] if len(data_str) >= 19 else data_str
+            except Exception:
+                return data_str[:19] if len(data_str) >= 19 else data_str
+
         # Cria dialog para mostrar eventos
         dialog = QDialog(self)
-        dialog.setWindowTitle(f"Eventos e Vínculos - {tipo} {numero}")
+        dialog.setWindowTitle(f"Eventos e Vínculos - {tipo_label} {numero}")
         dialog.resize(1000, 600)
         
         layout = QVBoxLayout(dialog)
@@ -6468,7 +8195,7 @@ class MainWindow(QMainWindow):
         header_frame.setStyleSheet("QFrame { background-color: #f0f0f0; border: 1px solid #ccc; border-radius: 4px; padding: 10px; }")
         header_layout = QVBoxLayout(header_frame)
         
-        titulo = QLabel(f"<h3>📄 {tipo} Nº {numero}</h3>")
+        titulo = QLabel(f"<h3>📄 {tipo_label} Nº {numero}</h3>")
         titulo.setStyleSheet("font-weight: bold;")
         header_layout.addWidget(titulo)
         
@@ -6479,8 +8206,8 @@ class MainWindow(QMainWindow):
         layout.addWidget(header_frame)
         
         if not eventos_encontrados:
-            no_eventos_label = QLabel("ℹ️ Nenhum evento ou documento vinculado encontrado.")
-            no_eventos_label.setStyleSheet("padding: 20px; color: #666; font-size: 12pt;")
+            no_eventos_label = QLabel("ℹ️ Nenhum evento ou documento vinculado encontrado localmente.")
+            no_eventos_label.setStyleSheet("padding: 10px; color: #666; font-size: 11pt;")
             no_eventos_label.setAlignment(Qt.AlignCenter)
             layout.addWidget(no_eventos_label)
         else:
@@ -6560,9 +8287,10 @@ class MainWindow(QMainWindow):
                 eventos_table.horizontalHeader().setStretchLastSection(False)
                 eventos_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
                 
-                # Adiciona handler de duplo-clique para abrir PDF
+                # Adiciona handler de duplo-clique: eventos de manifesto → comprovante PDF
                 eventos_table.cellDoubleClicked.connect(
-                    lambda row, col: self._abrir_pdf_evento(eventos_proprios[row], dialog)
+                    lambda row, col, ch=chave, inf=informante:
+                        self._abrir_comprovante_evento(eventos_proprios[row], ch, inf, dialog)
                 )
                 
                 tab_eventos_layout.addWidget(eventos_table)
@@ -6639,6 +8367,281 @@ class MainWindow(QMainWindow):
             btn_abrir_pasta.clicked.connect(lambda: self._abrir_pasta_eventos(informante))
             layout.addWidget(btn_abrir_pasta)
         
+        # ── Botão: para NFS-e mostra aviso; para NF-e/CT-e consulta SEFAZ ──
+        if tipo == 'NFSE':
+            btn_consultar_sefaz = QPushButton("🔄  Atualizar NFS-e (buscar novos eventos via NSU)")
+            btn_consultar_sefaz.setStyleSheet(
+                "QPushButton { background-color: #27ae60; color: white; font-size: 10pt; "
+                "padding: 7px 18px; border-radius: 5px; margin-top: 6px; } "
+                "QPushButton:hover { background-color: #2ecc71; } "
+                "QPushButton:disabled { background-color: #aaa; }"
+            )
+            btn_consultar_sefaz.setToolTip(
+                "NFS-e (Padrão Nacional ADN) não possui endpoint de consulta por chave.\n"
+                "Clique para re-executar a busca incremental NSU — novos cancelamentos\n"
+                "e substituições serão baixados e aparecerão aqui."
+            )
+        else:
+            btn_consultar_sefaz = QPushButton("🔍  Consultar / Atualizar Eventos na SEFAZ")
+            btn_consultar_sefaz.setStyleSheet(
+                "QPushButton { background-color: #2980b9; color: white; font-size: 10pt; "
+                "padding: 7px 18px; border-radius: 5px; margin-top: 6px; } "
+                "QPushButton:hover { background-color: #3498db; } "
+                "QPushButton:disabled { background-color: #aaa; }"
+            )
+            btn_consultar_sefaz.setToolTip("Consulta a SEFAZ pela chave de acesso e baixa os eventos disponíveis")
+        layout.addWidget(btn_consultar_sefaz, alignment=Qt.AlignCenter)
+
+        status_consulta_sefaz = QLabel("")
+        status_consulta_sefaz.setAlignment(Qt.AlignCenter)
+        status_consulta_sefaz.setStyleSheet("color: #555; font-size: 9pt; padding: 4px;")
+        layout.addWidget(status_consulta_sefaz)
+
+        def _consultar_eventos_sefaz():
+            """Consulta SEFAZ, salva eventos localmente e reabre o diálogo com os novos dados."""
+            btn_consultar_sefaz.setEnabled(False)
+            status_consulta_sefaz.setText("🔄 Consultando SEFAZ…")
+            QApplication.processEvents()
+
+            # Encontra certificado adequado para esta chave
+            certs = self.db.load_certificates()
+            cert_to_use = None
+            if informante:
+                for c in certs:
+                    if c.get('informante') == informante or c.get('cnpj_cpf') == informante:
+                        cert_to_use = c
+                        break
+            if not cert_to_use and certs:
+                cert_to_use = certs[0]
+
+            if not cert_to_use:
+                status_consulta_sefaz.setText("❌ Nenhum certificado configurado para consultar a SEFAZ.")
+                btn_consultar_sefaz.setEnabled(True)
+                return
+
+            from PyQt5.QtCore import QThread, pyqtSignal as _pyqtSignal
+
+            class ConsultaEventosWorker(QThread):
+                done = _pyqtSignal(str, str)   # xml_resposta, erro
+
+                def __init__(self, cert, chave_nfe):
+                    super().__init__()
+                    self._cert = cert
+                    self._chave = chave_nfe
+
+                def run(self):
+                    try:
+                        from nfe_search import NFeService
+                        svc = NFeService(
+                            self._cert.get('caminho') or self._cert.get('path', ''),
+                            self._cert.get('senha', ''),
+                            self._cert.get('cnpj_cpf', ''),
+                            self._cert.get('cUF_autor', '35')
+                        )
+                        xml_resp = svc.consultar_eventos_chave(self._chave)
+                        self.done.emit(xml_resp or '', '')
+                    except Exception as e:
+                        import traceback
+                        self.done.emit('', f"{e}\n{traceback.format_exc()}")
+
+            def _on_consulta_done(xml_resp, erro):
+                try:
+                    if erro:
+                        status_consulta_sefaz.setText(f"❌ Erro: {erro[:120]}")
+                        btn_consultar_sefaz.setEnabled(True)
+                        return
+
+                    if not xml_resp:
+                        status_consulta_sefaz.setText("ℹ️ A SEFAZ não retornou eventos para esta chave.")
+                        btn_consultar_sefaz.setEnabled(True)
+                        return
+
+                    # ── Salva eventos do XML de resposta como arquivos locais ──
+                    eventos_salvos = 0
+                    foi_cancelada = False   # detecta evento 110111 (cancelamento)
+                    cstat_sefaz = ''
+                    xmotivo_sefaz = ''
+                    dh_recbto_sefaz = ''
+                    nprot_sefaz = ''
+                    try:
+                        from lxml import etree as _et
+                        from pathlib import Path
+                        import re as _re
+
+                        root = _et.fromstring(xml_resp.encode('utf-8') if isinstance(xml_resp, str) else xml_resp)
+                        ns_nfe = 'http://www.portalfiscal.inf.br/nfe'
+                        ns_cte = 'http://www.portalfiscal.inf.br/cte'
+
+                        # ── Extrai cStat / xMotivo do nível raiz (retConsSitNFe / retConsSitCTe) ──
+                        # Mesmo que não existam procEventoNFe, SEFAZ retorna o status global da nota
+                        try:
+                            cstat_sefaz   = (root.findtext(f'.//{{{ns_nfe}}}cStat')   or root.findtext('.//cStat')   or '')
+                            xmotivo_sefaz = (root.findtext(f'.//{{{ns_nfe}}}xMotivo') or root.findtext('.//xMotivo') or '')
+                            dh_recbto_sefaz = (root.findtext(f'.//{{{ns_nfe}}}dhRecbto') or root.findtext('.//dhRecbto') or '')
+                            nprot_sefaz   = (root.findtext(f'.//{{{ns_nfe}}}nProt')   or root.findtext('.//nProt')   or '')
+                            # cStat 101/151 = Cancelamento NF-e/CT-e homologado
+                            if cstat_sefaz in ('101', '151'):
+                                foi_cancelada = True
+                            # cStat 217 = "NF-e não consta na base de dados" — MS SEFAZ retorna
+                            # esse código para notas canceladas cujo arquivo não está mais disponível.
+                            # Só trata como cancelamento se a nota já está INDISPONIVEL (marcada via cStat=653).
+                            if cstat_sefaz == '217' and not foi_cancelada:
+                                try:
+                                    with self.db._connect() as _c217:
+                                        _row217 = _c217.execute(
+                                            "SELECT xml_status FROM notas_detalhadas WHERE chave=?",
+                                            (chave,)
+                                        ).fetchone()
+                                        if _row217 and _row217[0] == 'INDISPONIVEL':
+                                            foi_cancelada = True
+                                except Exception:
+                                    pass
+                        except Exception:
+                            pass
+
+                        # procEventoNFe ou procEventoCTe contêm cada evento individualmente
+                        for tag_prefix, ns in [('procEventoNFe', ns_nfe), ('procEventoCTe', ns_cte)]:
+                            for ev_el in (
+                                root.findall(f'.//{{{ns}}}{tag_prefix}')
+                                + root.findall(f'.//{tag_prefix}')
+                            ):
+                                try:
+                                    # Extrai tipo e data do evento para montar nome de arquivo
+                                    tp = (ev_el.findtext(f'.//{{{ns}}}tpEvento') or
+                                          ev_el.findtext('.//tpEvento') or 'EVENTO')
+                                    dh = (ev_el.findtext(f'.//{{{ns}}}dhRegEvento') or
+                                          ev_el.findtext(f'.//{{{ns}}}dhEvento') or
+                                          ev_el.findtext('.//dhRegEvento') or
+                                          ev_el.findtext('.//dhEvento') or '')
+                                    data_part = _re.sub(r'[^0-9]', '', dh)[:12]
+
+                                    # Detecta cancelamento
+                                    if tp == '110111':
+                                        foi_cancelada = True
+
+                                    # Pasta de destino: xmls/<informante>/<ano-mes>/Eventos/
+                                    cert_cnpj = cert_to_use.get('cnpj_cpf', informante or 'desconhecido')
+                                    ano_mes_ev = f"{dh[:4]}-{dh[5:7]}" if len(dh) >= 7 else 'eventos'
+                                    pasta_ev = DATA_DIR / "xmls" / cert_cnpj / ano_mes_ev / "Eventos"
+                                    pasta_ev.mkdir(parents=True, exist_ok=True)
+
+                                    nome_arquivo = f"{chave}_{tp}_{data_part}.xml"
+                                    caminho_xml = pasta_ev / nome_arquivo
+                                    if not caminho_xml.exists():
+                                        xml_bytes = _et.tostring(ev_el, encoding='utf-8', xml_declaration=True)
+                                        caminho_xml.write_bytes(xml_bytes)
+                                        eventos_salvos += 1
+                                except Exception as e_ev:
+                                    print(f"[EVENTOS] Erro ao salvar evento individual: {e_ev}")
+                    except Exception as e_parse:
+                        print(f"[EVENTOS] Erro ao parsear XML de resposta: {e_parse}")
+
+                    # ── Se nota foi cancelada, atualiza status no banco e na UI ──
+                    if foi_cancelada:
+                        try:
+                            self.db.atualizar_status_nota(chave, "Cancelamento homologado")
+                            # Atualiza in-memory para refletir imediatamente
+                            for n in self.notes:
+                                if n.get('chave') == chave:
+                                    n['status'] = "Cancelamento homologado"
+                                    break
+                            self.refresh_table()
+                            self.refresh_emitidos_table()
+                            print(f"[EVENTOS] ❌ Nota {chave[:10]}… marcada como cancelada na interface")
+                        except Exception as e_cancel:
+                            print(f"[EVENTOS] Erro ao atualizar status de cancelamento: {e_cancel}")
+
+                    # ── Se SEFAZ retornou cStat mas sem procEventoNFe, cria evento sintético ──
+                    # Isso acontece em notas canceladas antigas onde o evento de cancelamento
+                    # não é mais retornado em procEventoNFe mas o cStat=101 indica cancelamento.
+                    if cstat_sefaz and eventos_salvos == 0:
+                        try:
+                            _desc_ev = f"cStat {cstat_sefaz}: {xmotivo_sefaz}" if xmotivo_sefaz else f"cStat {cstat_sefaz}"
+                            _tipo_ev = '110111' if foi_cancelada else 'STATUS'
+                            _data_part = _re.sub(r'[^0-9]', '', dh_recbto_sefaz)[:12] if dh_recbto_sefaz else 'status'
+                            cert_cnpj = cert_to_use.get('cnpj_cpf', informante or 'desconhecido')
+                            _ano_mes = f"{dh_recbto_sefaz[:4]}-{dh_recbto_sefaz[5:7]}" if len(dh_recbto_sefaz) >= 7 else 'status'
+                            pasta_ev = DATA_DIR / "xmls" / cert_cnpj / _ano_mes / "Eventos"
+                            pasta_ev.mkdir(parents=True, exist_ok=True)
+                            # Se foi_cancelada=True via 217+INDISPONIVEL, remove STATUS sintético antigo
+                            # (evita duplicar com um arquivo STATUS e um 110111 para a mesma nota)
+                            if foi_cancelada and _tipo_ev == '110111':
+                                for _old_status in pasta_ev.glob(f"{chave}_STATUS_*_status.xml"):
+                                    try:
+                                        _old_status.unlink()
+                                        print(f"[EVENTOS] 🗑️ Removido STATUS sintético antigo: {_old_status.name}")
+                                    except Exception:
+                                        pass
+                            # Salva XML sintético com o status/cancelamento retornado pela SEFAZ
+                            nome_arquivo = f"{chave}_{_tipo_ev}_{_data_part}_status.xml"
+                            caminho_xml = pasta_ev / nome_arquivo
+                            if not caminho_xml.exists():
+                                _xml_sintetico = (
+                                    f'<?xml version="1.0" encoding="UTF-8"?>'
+                                    f'<statusSEFAZ><chave>{chave}</chave>'
+                                    f'<cStat>{cstat_sefaz}</cStat>'
+                                    f'<xMotivo>{xmotivo_sefaz}</xMotivo>'
+                                    f'<dhRecbto>{dh_recbto_sefaz}</dhRecbto>'
+                                    f'<nProt>{nprot_sefaz}</nProt>'
+                                    f'<tpEvento>{_tipo_ev}</tpEvento>'
+                                    f'</statusSEFAZ>'
+                                )
+                                caminho_xml.write_text(_xml_sintetico, encoding='utf-8')
+                                eventos_salvos += 1
+                                if foi_cancelada:
+                                    print(f"[EVENTOS] ❌ Cancelamento confirmado cStat={cstat_sefaz} salvo como evento 110111")
+                                else:
+                                    print(f"[EVENTOS] 📋 Status SEFAZ cStat={cstat_sefaz} salvo como evento sintético")
+                        except Exception as e_sint:
+                            print(f"[EVENTOS] Erro ao salvar evento sintético: {e_sint}")
+
+                    if eventos_salvos > 0:
+                        msg_base = f"✅ {eventos_salvos} evento(s) baixado(s)!"
+                        if foi_cancelada:
+                            msg_base += " ❌ Nota CANCELADA — interface atualizada."
+                        status_consulta_sefaz.setText(msg_base + " Reabrindo…")
+                        QApplication.processEvents()
+                        # Fecha e reabre com os novos dados.
+                        # QTimer.singleShot garante que _mostrar_eventos só é chamado DEPOIS
+                        # que dialog.exec_() retornar completamente, evitando re-entrada no
+                        # event loop que provoca o fechamento imediato do novo diálogo.
+                        dialog.close()
+                        from PyQt5.QtCore import QTimer
+                        QTimer.singleShot(0, lambda: self._mostrar_eventos(item))
+                    elif cstat_sefaz:
+                        # SEFAZ respondeu mas não havia eventos novos para salvar
+                        _msg = f"ℹ️ SEFAZ: cStat={cstat_sefaz} — {xmotivo_sefaz}" if xmotivo_sefaz else f"ℹ️ SEFAZ: cStat={cstat_sefaz}"
+                        status_consulta_sefaz.setText(_msg)
+                        btn_consultar_sefaz.setEnabled(True)
+                        QApplication.processEvents()
+                    else:
+                        status_consulta_sefaz.setText("ℹ️ Nenhum evento novo encontrado na SEFAZ.")
+                        btn_consultar_sefaz.setEnabled(True)
+                        QApplication.processEvents()
+                        # Nada novo — mantém o diálogo aberto para o usuário fechar
+                except Exception as e_cb:
+                    print(f"[EVENTOS] Erro no callback: {e_cb}")
+                    status_consulta_sefaz.setText(f"❌ {e_cb}")
+                    btn_consultar_sefaz.setEnabled(True)
+
+            self._consulta_eventos_worker = ConsultaEventosWorker(cert_to_use, chave)
+            self._consulta_eventos_worker.done.connect(_on_consulta_done)
+            self._consulta_eventos_worker.start()
+
+        if tipo == 'NFSE':
+            # NFS-e: o botão re-executa a busca incremental de NFS-e para este informante
+            def _atualizar_nfse():
+                btn_consultar_sefaz.setEnabled(False)
+                status_consulta_sefaz.setText("🔄 Buscando novos eventos NFS-e via NSU…")
+                QApplication.processEvents()
+                dialog.close()
+                # Dispara a busca completa de NFS-e (incremental NSU)
+                QTimer.singleShot(200, lambda: self._buscar_nfse_automatico(busca_completa=False))
+
+            btn_consultar_sefaz.clicked.connect(_atualizar_nfse)
+        else:
+            btn_consultar_sefaz.clicked.connect(_consultar_eventos_sefaz)
+
         # Botão fechar
         btn_fechar = QPushButton("Fechar")
         btn_fechar.clicked.connect(dialog.close)
@@ -6675,142 +8678,294 @@ class MainWindow(QMainWindow):
         
         # CASO 1: Manifestação manual (sem documento selecionado)
         if item is None:
+            from PyQt5.QtWidgets import QRadioButton, QButtonGroup, QFileDialog
+
             dialog_input = QDialog(self)
             dialog_input.setWindowTitle("✉️ Manifestar Documento (Manual)")
-            dialog_input.setMinimumWidth(500)
-            dialog_input.setMaximumWidth(550)
-            
+            dialog_input.setMinimumWidth(560)
+            dialog_input.setMaximumWidth(620)
+
             layout = QVBoxLayout(dialog_input)
-            layout.setSpacing(10)
-            layout.setContentsMargins(15, 15, 15, 15)
-            
+            layout.setSpacing(12)
+            layout.setContentsMargins(20, 20, 20, 20)
+
             # Título
-            title = QLabel("<h3 style='color: #2c3e50;'>📝 Manifestação Manual</h3>")
+            title = QLabel("<h3 style='color: #2c3e50; margin: 0 0 2px 0;'>📝 Manifestação Manual</h3>")
             layout.addWidget(title)
-            
-            info = QLabel("<span style='color: #666; font-size: 9pt;'>Preencha os dados abaixo para manifestar um documento.</span>")
+
+            info = QLabel("<span style='color: #666; font-size: 9pt;'>Preencha os dados abaixo para manifestar um documento fiscal.</span>")
             info.setWordWrap(True)
             layout.addWidget(info)
-            
-            # Seleção de certificado
+
+            sep = QFrame()
+            sep.setFrameShape(QFrame.HLine)
+            sep.setStyleSheet("color: #dce3ea;")
+            layout.addWidget(sep)
+
+            # ── Certificado ──────────────────────────────────────────────
             cert_label = QLabel("<b>Certificado Digital:</b>")
             cert_label.setStyleSheet("font-size: 9pt;")
             layout.addWidget(cert_label)
-            
+
+            # Radio: do sistema × do arquivo
+            radio_row = QHBoxLayout()
+            rb_sistema = QRadioButton("Certificado cadastrado no sistema")
+            rb_arquivo = QRadioButton("Selecionar arquivo .pfx/.p12")
+            rb_sistema.setChecked(True)
+            rb_sistema.setStyleSheet("font-size: 9pt;")
+            rb_arquivo.setStyleSheet("font-size: 9pt;")
+            radio_row.addWidget(rb_sistema)
+            radio_row.addWidget(rb_arquivo)
+            radio_row.addStretch()
+            layout.addLayout(radio_row)
+
+            # Painel: certificados cadastrados
+            panel_sistema = QWidget()
+            ps_layout = QVBoxLayout(panel_sistema)
+            ps_layout.setContentsMargins(0, 0, 0, 0)
+            ps_layout.setSpacing(4)
             cert_combo = QComboBox()
             cert_combo.setMinimumHeight(28)
             certs = self.db.load_certificates()
             for cert in certs:
                 nome_cert = cert.get('nome_certificado', 'Sem Nome')
                 cnpj = cert.get('cnpj_cpf', '')
-                cert_combo.addItem(f"{nome_cert} - {cnpj}", cert)
-            
-            if cert_combo.count() == 0:
-                QMessageBox.warning(self, "Erro", "Nenhum certificado cadastrado!\n\nCadastre um certificado primeiro.")
-                return
-            
-            layout.addWidget(cert_combo)
-            
-            # Senha do certificado
+                cert_combo.addItem(f"{nome_cert} — {cnpj}", cert)
+            ps_layout.addWidget(cert_combo)
+            layout.addWidget(panel_sistema)
+
+            # Painel: certificado externo
+            panel_arquivo = QWidget()
+            pa_layout = QVBoxLayout(panel_arquivo)
+            pa_layout.setContentsMargins(0, 0, 0, 0)
+            pa_layout.setSpacing(4)
+            arquivo_row = QHBoxLayout()
+            arquivo_row.setSpacing(6)
+            cert_arquivo_input = QLineEdit()
+            cert_arquivo_input.setMinimumHeight(28)
+            cert_arquivo_input.setReadOnly(True)
+            cert_arquivo_input.setPlaceholderText("Nenhum arquivo selecionado...")
+            cert_arquivo_input.setStyleSheet("font-size: 9pt; color: #555;")
+            btn_browse = QPushButton("📂 Procurar…")
+            btn_browse.setMinimumHeight(28)
+            btn_browse.setStyleSheet("""
+                QPushButton {
+                    background-color: #ecf0f1;
+                    color: #2c3e50;
+                    border: 1px solid #bdc3c7;
+                    padding: 4px 10px;
+                    border-radius: 4px;
+                    font-size: 9pt;
+                    font-weight: bold;
+                }
+                QPushButton:hover { background-color: #dfe6e9; }
+            """)
+            def browse_cert():
+                path, _ = QFileDialog.getOpenFileName(
+                    dialog_input,
+                    "Selecionar Certificado Digital",
+                    "",
+                    "Certificados (*.pfx *.p12);;Todos os arquivos (*)"
+                )
+                if path:
+                    cert_arquivo_input.setText(path)
+            btn_browse.clicked.connect(browse_cert)
+            arquivo_row.addWidget(cert_arquivo_input, 1)
+            arquivo_row.addWidget(btn_browse)
+            pa_layout.addLayout(arquivo_row)
+            panel_arquivo.setVisible(False)
+            layout.addWidget(panel_arquivo)
+
+            def on_radio_changed():
+                panel_sistema.setVisible(rb_sistema.isChecked())
+                panel_arquivo.setVisible(rb_arquivo.isChecked())
+                dialog_input.adjustSize()
+
+            rb_sistema.toggled.connect(on_radio_changed)
+            rb_arquivo.toggled.connect(on_radio_changed)
+
+            # ── Senha ─────────────────────────────────────────────────────
             senha_label = QLabel("<b>Senha do Certificado:</b>")
             senha_label.setStyleSheet("font-size: 9pt;")
             layout.addWidget(senha_label)
-            
+
+            senha_row = QHBoxLayout()
             senha_input = QLineEdit()
             senha_input.setMinimumHeight(28)
             senha_input.setEchoMode(QLineEdit.Password)
             senha_input.setPlaceholderText("Digite a senha do certificado")
-            layout.addWidget(senha_input)
-            
-            # Chave de acesso
+            senha_input.setStyleSheet("font-size: 9pt;")
+            btn_toggle_senha = QPushButton("👁")
+            btn_toggle_senha.setFixedSize(28, 28)
+            btn_toggle_senha.setCheckable(True)
+            btn_toggle_senha.setStyleSheet("""
+                QPushButton {
+                    background-color: #ecf0f1;
+                    border: 1px solid #bdc3c7;
+                    border-radius: 4px;
+                    font-size: 10pt;
+                }
+                QPushButton:checked { background-color: #dfe6e9; }
+            """)
+            def toggle_senha(checked):
+                senha_input.setEchoMode(QLineEdit.Normal if checked else QLineEdit.Password)
+            btn_toggle_senha.toggled.connect(toggle_senha)
+            senha_row.addWidget(senha_input, 1)
+            senha_row.addWidget(btn_toggle_senha)
+            layout.addLayout(senha_row)
+
+            # ── Chave de acesso ───────────────────────────────────────────
             chave_label = QLabel("<b>Chave de Acesso (44 dígitos):</b>")
             chave_label.setStyleSheet("font-size: 9pt;")
             layout.addWidget(chave_label)
-            
+
             chave_input = QLineEdit()
             chave_input.setMinimumHeight(28)
-            chave_input.setPlaceholderText("Digite a chave de acesso do documento")
+            chave_input.setPlaceholderText("Ex: 35220101773924000193550010000174301238642438")
             chave_input.setMaxLength(44)
+            chave_input.setStyleSheet("font-size: 9pt; letter-spacing: 0.5px;")
+            chave_lbl_count = QLabel("<span style='color: #aaa; font-size: 8pt;'>0 / 44 dígitos</span>")
+            def on_chave_changed(txt):
+                # Remove espaços automaticamente (ex: colar chave com espaços)
+                limpo = txt.replace(' ', '')
+                if limpo != txt:
+                    chave_input.blockSignals(True)
+                    chave_input.setText(limpo)
+                    chave_input.setCursorPosition(len(limpo))
+                    chave_input.blockSignals(False)
+                    txt = limpo
+                qtd = len(txt)
+                cor = '#27ae60' if qtd == 44 else ('#e74c3c' if qtd > 44 else '#aaa')
+                chave_lbl_count.setText(f"<span style='color: {cor}; font-size: 8pt;'>{qtd} / 44 dígitos</span>")
+            chave_input.textChanged.connect(on_chave_changed)
             layout.addWidget(chave_input)
-            
-            # Botões
+            layout.addWidget(chave_lbl_count)
+
+            # ── Aviso se sem certificados cadastrados ─────────────────────
+            if cert_combo.count() == 0:
+                rb_arquivo.setChecked(True)
+                rb_sistema.setEnabled(False)
+
+            sep2 = QFrame()
+            sep2.setFrameShape(QFrame.HLine)
+            sep2.setStyleSheet("color: #dce3ea;")
+            layout.addWidget(sep2)
+
+            # ── Botões ────────────────────────────────────────────────────
             buttons_layout = QHBoxLayout()
             buttons_layout.setSpacing(10)
-            
+
             btn_cancelar = QPushButton("❌ Cancelar")
-            btn_cancelar.setMinimumHeight(32)
+            btn_cancelar.setMinimumHeight(34)
             btn_cancelar.setStyleSheet("""
                 QPushButton {
                     background-color: #95a5a6;
                     color: white;
                     border: none;
-                    padding: 6px 16px;
-                    border-radius: 4px;
+                    padding: 6px 18px;
+                    border-radius: 5px;
                     font-weight: bold;
                     font-size: 9pt;
                 }
-                QPushButton:hover {
-                    background-color: #7f8c8d;
-                }
+                QPushButton:hover { background-color: #7f8c8d; }
             """)
             btn_cancelar.clicked.connect(dialog_input.reject)
             buttons_layout.addWidget(btn_cancelar)
-            
+
             btn_continuar = QPushButton("➡️ Continuar")
-            btn_continuar.setMinimumHeight(32)
+            btn_continuar.setMinimumHeight(34)
             btn_continuar.setStyleSheet("""
                 QPushButton {
-                    background-color: #3498db;
+                    background-color: #2980b9;
                     color: white;
                     border: none;
-                    padding: 6px 16px;
-                    border-radius: 4px;
+                    padding: 6px 18px;
+                    border-radius: 5px;
                     font-weight: bold;
                     font-size: 9pt;
                 }
-                QPushButton:hover {
-                    background-color: #2980b9;
-                }
+                QPushButton:hover { background-color: #1f6fa3; }
             """)
-            
+
             def continuar_manifestacao():
-                chave = chave_input.text().strip()
-                senha = senha_input.text().strip()
-                
-                if len(chave) != 44:
+                chave_val = chave_input.text().strip()
+                senha_val = senha_input.text().strip()
+
+                if len(chave_val) != 44:
                     QMessageBox.warning(dialog_input, "Erro", "A chave deve ter exatamente 44 dígitos!")
                     return
-                
-                if not senha:
+                if not senha_val:
                     QMessageBox.warning(dialog_input, "Erro", "Digite a senha do certificado!")
                     return
-                
-                cert_data = cert_combo.currentData()
-                if not cert_data:
-                    QMessageBox.warning(dialog_input, "Erro", "Selecione um certificado!")
-                    return
-                
+
+                if rb_sistema.isChecked():
+                    cert_data = cert_combo.currentData()
+                    if not cert_data:
+                        QMessageBox.warning(dialog_input, "Erro", "Selecione um certificado!")
+                        return
+                    cert_path_val = cert_data.get('caminho')
+                    cert_cnpj_val = cert_data.get('cnpj_cpf', '')
+                else:
+                    cert_path_val = cert_arquivo_input.text().strip()
+                    if not cert_path_val:
+                        QMessageBox.warning(dialog_input, "Erro", "Selecione um arquivo de certificado!")
+                        return
+                    if not os.path.exists(cert_path_val):
+                        QMessageBox.warning(dialog_input, "Erro", f"Arquivo não encontrado:\n{cert_path_val}")
+                        return
+                    # Extrai CNPJ do certificado usando a senha fornecida
+                    try:
+                        from cryptography.hazmat.primitives.serialization.pkcs12 import load_key_and_certificates
+                        with open(cert_path_val, 'rb') as f_cert:
+                            pfx_data = f_cert.read()
+                        _key, _crt, _chain = load_key_and_certificates(pfx_data, senha_val.encode())
+                        subject = _crt.subject
+                        cert_cn = subject.get_attributes_for_oid(
+                            __import__('cryptography.x509.oid', fromlist=['NameOID']).NameOID.COMMON_NAME
+                        )
+                        cn_val = cert_cn[0].value if cert_cn else ''
+                        # CNPJ está nos últimos 14 dígitos do CN  (ex: "EMPRESA LTDA:01773924000193")
+                        import re as _re
+                        cnpj_match = _re.search(r'(\d{14})', cn_val)
+                        cert_cnpj_val = cnpj_match.group(1) if cnpj_match else ''
+                        if not cert_cnpj_val:
+                            # Fallback: usa serialNumber se disponível
+                            try:
+                                from cryptography.x509.oid import NameOID
+                                sn = _crt.subject.get_attributes_for_oid(NameOID.SERIAL_NUMBER)
+                                if sn:
+                                    digits_sn = ''.join(c for c in sn[0].value if c.isdigit())
+                                    if len(digits_sn) >= 14:
+                                        cert_cnpj_val = digits_sn[-14:]
+                            except Exception:
+                                pass
+                    except Exception as e_cert:
+                        QMessageBox.warning(
+                            dialog_input, "Senha inválida",
+                            f"Não foi possível ler o certificado com a senha fornecida.\n\nDetalhe: {e_cert}"
+                        )
+                        return
+
                 dialog_input.accept()
-                
-                # Cria item virtual para prosseguir
+
                 item_virtual = {
-                    'chave': chave,
-                    'informante': cert_data.get('cnpj_cpf', ''),
-                    'tipo': 'NFE',  # Detecta automaticamente depois
-                    'numero': chave[-9:],
+                    'chave': chave_val,
+                    'informante': cert_cnpj_val,
+                    'tipo': 'NFE',
+                    'numero': chave_val[-9:],
                     'nome_emitente': 'Desconhecido',
                     '_manual': True,
-                    '_cert_path': cert_data.get('caminho'),
-                    '_cert_senha': senha,
-                    '_cert_cnpj': cert_data.get('cnpj_cpf')
+                    '_cert_path': cert_path_val,
+                    '_cert_senha': senha_val,
+                    '_cert_cnpj': cert_cnpj_val,
+                    '_gerar_comprovante': True,
                 }
-                
-                # Continua com o fluxo normal
+
                 self._manifestar_nota(item_virtual)
-            
+
             btn_continuar.clicked.connect(continuar_manifestacao)
             buttons_layout.addWidget(btn_continuar)
-            
+
             layout.addLayout(buttons_layout)
             dialog_input.exec_()
             return
@@ -7237,6 +9392,17 @@ class MainWindow(QMainWindow):
             
             progress.close()
             
+            # ── Gera comprovante PDF ──────────────────────────────────────
+            from datetime import datetime as _dt
+            pdf_comprovante = self._gerar_pdf_comprovante_manifestacao({
+                'chave':              chave,
+                'tipo_evento':        tipo_evento,
+                'protocolo':          protocolo,
+                'cnpj_manifestante':  cert_cnpj or informante,
+                'data_hora':          _dt.now().isoformat(timespec='seconds'),
+                'mensagem_sefaz':     mensagem,
+            })
+
             # Mensagem de sucesso com informação sobre download
             msg_texto = f"Manifestação enviada com sucesso!\n\nProtocolo: {protocolo}\n\n"
             if should_download_xml:
@@ -7249,6 +9415,19 @@ class MainWindow(QMainWindow):
                 "✅ Sucesso",
                 msg_texto
             )
+
+            # Abre o comprovante PDF automaticamente
+            if pdf_comprovante and os.path.exists(pdf_comprovante):
+                try:
+                    if sys.platform == "win32":
+                        subprocess.Popen(
+                            ["cmd", "/c", "start", "", pdf_comprovante],
+                            shell=False, creationflags=subprocess.CREATE_NO_WINDOW  # type: ignore[attr-defined]
+                        )
+                    else:
+                        subprocess.Popen(["xdg-open", pdf_comprovante])
+                except Exception as e_open:
+                    print(f"[COMPROVANTE] ⚠️ Não foi possível abrir o PDF: {e_open}")
             
             # 📥 DOWNLOAD AUTOMÁTICO do XML completo (se necessário)
             if should_download_xml:
@@ -7282,13 +9461,382 @@ class MainWindow(QMainWindow):
             )
             import traceback
             traceback.print_exc()
-    
+
+    def _gerar_pdf_comprovante_manifestacao(self, dados: dict) -> str | None:
+        """
+        Gera PDF de comprovante de manifestação no estilo visual da página
+        'Consulta NF-e Completa' da SEFAZ (layout com campos rotulados, abas,
+        paleta laranja-âmbar e tabela de eventos).
+        """
+        try:
+            from reportlab.platypus import (
+                SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle,
+                HRFlowable,
+            )
+            from reportlab.lib.pagesizes import A4
+            from reportlab.lib.styles import ParagraphStyle
+            from reportlab.lib.enums import TA_CENTER, TA_LEFT
+            from reportlab.lib.units import cm, mm
+            from reportlab.lib import colors
+            from datetime import datetime
+
+            # ── Paleta de cores (baseada na página SEFAZ) ──────────────────
+            C_HEADER     = colors.HexColor('#C8924A')   # laranja-âmbar do cabeçalho
+            C_WHITE      = colors.white
+            C_LABEL      = colors.HexColor('#555555')   # rótulo cinza
+            C_VALUE      = colors.HexColor('#1A1A1A')   # valor escuro
+            C_BORDER     = colors.HexColor('#CCCCCC')   # bordas da tabela
+            C_FIELD_BG   = colors.HexColor('#FFFFFF')   # fundo de célula
+            C_SECTION    = colors.HexColor('#CC7700')   # laranja para título de seção
+            C_EVT_HDR    = colors.HexColor('#D4A870')   # cabeçalho da tabela de eventos
+            C_TAB_INACT  = colors.HexColor('#E8E8E8')   # aba inativa
+            C_ROW_ALT    = colors.HexColor('#FAFAFA')   # linha alternada
+
+            # ── Extrai dados da manifestação ───────────────────────────────
+            chave         = str(dados.get('chave', ''))
+            tipo_evento   = str(dados.get('tipo_evento', ''))
+            protocolo     = str(dados.get('protocolo', ''))
+            cnpj_manif    = str(dados.get('cnpj_manifestante', ''))
+            data_hora_raw = str(dados.get('data_hora', ''))
+            msg_sefaz     = str(dados.get('mensagem_sefaz', 'Evento registrado com sucesso'))
+
+            EVENTO_NAMES = {
+                '210200': 'Ciência da Operação',
+                '210210': 'Confirmação da Operação',
+                '210220': 'Desconhecimento da Operação',
+                '210240': 'Operação não Realizada',
+                '610110': 'Ciência CT-e',
+                '610112': 'Confirmação CT-e',
+            }
+            evento_nome = EVENTO_NAMES.get(tipo_evento, f'Evento {tipo_evento}')
+
+            # ── Derivados da chave ─────────────────────────────────────────
+            modelo    = chave[20:22] if len(chave) >= 22 else '55'
+            tipo_doc  = 'CT-e' if modelo == '57' else 'NF-e'
+            serie     = chave[22:25].lstrip('0') if len(chave) >= 25 else '1'
+            num_doc   = chave[25:34].lstrip('0') if len(chave) >= 34 else '—'
+            cnpj_emit = chave[6:20] if len(chave) >= 20 else ''
+            uf_cod    = chave[:2] if len(chave) >= 2 else ''
+            UF_MAP = {
+                '11':'RO','12':'AC','13':'AM','14':'RR','15':'PA','16':'AP','17':'TO',
+                '21':'MA','22':'PI','23':'CE','24':'RN','25':'PB','26':'PE','27':'AL',
+                '28':'SE','29':'BA','31':'MG','32':'ES','33':'RJ','35':'SP','41':'PR',
+                '42':'SC','43':'RS','50':'MS','51':'MT','52':'GO','53':'DF',
+            }
+            uf_emit = UF_MAP.get(uf_cod, '—')
+
+            def fmt_cnpj(c):
+                c = ''.join(filter(str.isdigit, c))
+                return f'{c[:2]}.{c[2:5]}.{c[5:8]}/{c[8:12]}-{c[12:]}' if len(c) == 14 else (c or '—')
+
+            def fmt_chave(c):
+                c = ''.join(filter(str.isdigit, c))
+                return ' '.join(c[i:i+4] for i in range(0, len(c), 4))
+
+            # Data/hora
+            try:
+                if 'T' in data_hora_raw:
+                    dt = datetime.fromisoformat(data_hora_raw.replace('Z', '+00:00'))
+                else:
+                    dt = datetime.strptime(data_hora_raw[:19], '%Y-%m-%d %H:%M:%S')
+                data_fmt = dt.strftime('%d/%m/%Y às %H:%M:%S')
+            except Exception:
+                data_fmt = data_hora_raw or datetime.now().strftime('%d/%m/%Y às %H:%M:%S')
+
+            # ── Lookup no banco para dados extras ──────────────────────────
+            emit_nome  = '—'
+            dest_nome  = '—'
+            dest_cnpj  = '—'
+            valor_nf   = '—'
+            data_emis  = '—'
+            ie_emit    = '—'
+            nat_oper   = '—'
+            try:
+                with sqlite3.connect(str(DB_PATH)) as _c:
+                    _c.row_factory = sqlite3.Row
+                    _row = _c.execute(
+                        "SELECT * FROM notas_detalhadas WHERE chave = ?", (chave,)
+                    ).fetchone()
+                    if _row:
+                        _d = dict(_row)
+                        emit_nome = _d.get('nome_emitente') or '—'
+                        dest_nome = _d.get('nome_destinatario') or '—'
+                        dest_cnpj = _d.get('cnpj_destinatario') or _d.get('dest_cnpj') or '—'
+                        v = _d.get('valor_total') or _d.get('vNF')
+                        if v:
+                            try:
+                                valor_nf = f"{float(v):,.2f}".replace(',','X').replace('.',',').replace('X','.')
+                            except Exception:
+                                valor_nf = str(v)
+                        raw_de = (_d.get('data_emissao') or '')[:10]
+                        if raw_de:
+                            try:
+                                data_emis = datetime.strptime(raw_de, '%Y-%m-%d').strftime('%d/%m/%Y')
+                            except Exception:
+                                data_emis = raw_de
+                        ie_emit  = _d.get('ie_emit') or _d.get('inscricao_estadual') or '—'
+                        nat_oper = _d.get('nat_op') or _d.get('natureza_operacao') or '—'
+            except Exception:
+                pass
+
+            # ── Caminho de saída ───────────────────────────────────────────
+            out_dir = DATA_DIR / 'comprovantes_manifestacao'
+            out_dir.mkdir(parents=True, exist_ok=True)
+            ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+            out_path = out_dir / f'ComprovManif_{chave[:10]}_{ts}.pdf'
+
+            # ── Fábrica de estilos ─────────────────────────────────────────
+            def S(name, **kw):
+                return ParagraphStyle(name, **kw)
+
+            s_lbl = S('Lbl', fontName='Helvetica-Bold', fontSize=7.5,
+                       textColor=C_LABEL, leading=10)
+            s_val = S('Val', fontName='Helvetica', fontSize=9,
+                       textColor=C_VALUE, leading=12)
+            s_val_mono = S('ValM', fontName='Courier', fontSize=8.5,
+                            textColor=C_VALUE, leading=11, wordWrap='LTR')
+            s_sec = S('Sec', fontName='Helvetica-Bold', fontSize=10,
+                       textColor=C_SECTION, spaceBefore=6, spaceAfter=2)
+            s_sec_c = S('SecC', fontName='Helvetica-Bold', fontSize=10,
+                         textColor=C_SECTION, alignment=TA_CENTER,
+                         spaceBefore=4, spaceAfter=2)
+            s_hdr_txt = S('HdrTxt', fontName='Helvetica-Bold', fontSize=13,
+                           textColor=C_WHITE, alignment=TA_LEFT)
+            s_sit_txt = S('SitTxt', fontName='Helvetica-Bold', fontSize=10,
+                           textColor=C_WHITE)
+            s_evt_hdr = S('EvtHdr', fontName='Helvetica-Bold', fontSize=8,
+                           textColor=C_VALUE)
+            s_evt_val = S('EvtVal', fontName='Helvetica', fontSize=8.5,
+                           textColor=C_VALUE, leading=11)
+            s_tab_on  = S('TabOn',  fontName='Helvetica-Bold', fontSize=9,
+                           textColor=C_WHITE, alignment=TA_CENTER)
+            s_tab_off = S('TabOff', fontName='Helvetica',      fontSize=9,
+                           textColor=C_LABEL, alignment=TA_CENTER)
+            s_footer  = S('Ftr', fontName='Helvetica', fontSize=7,
+                           textColor=colors.HexColor('#AAAAAA'), alignment=TA_CENTER)
+
+            # Campo: rótulo + valor empilhados (lista de Paragraphs → cell)
+            def fld(label, value, mono=False):
+                s = s_val_mono if mono else s_val
+                return [Paragraph(label, s_lbl),
+                        Paragraph(str(value) if value else '—', s)]
+
+            # Estilo base para tabelas de campos
+            base_style = TableStyle([
+                ('BOX',           (0, 0), (-1, -1), 0.5, C_BORDER),
+                ('INNERGRID',     (0, 0), (-1, -1), 0.5, C_BORDER),
+                ('BACKGROUND',    (0, 0), (-1, -1), C_FIELD_BG),
+                ('TOPPADDING',    (0, 0), (-1, -1), 4),
+                ('BOTTOMPADDING', (0, 0), (-1, -1), 5),
+                ('LEFTPADDING',   (0, 0), (-1, -1), 6),
+                ('RIGHTPADDING',  (0, 0), (-1, -1), 6),
+                ('VALIGN',        (0, 0), (-1, -1), 'TOP'),
+            ])
+
+            # ── Documento ─────────────────────────────────────────────────
+            story = []
+            W, H = A4
+            LM = RM = 1.5 * cm
+            usable = W - LM - RM
+
+            # ── 1. Cabeçalho laranja ──────────────────────────────────────
+            hdr_tbl = Table(
+                [[Paragraph('Consulta NF-e Completa', s_hdr_txt)]],
+                colWidths=[usable]
+            )
+            hdr_tbl.setStyle(TableStyle([
+                ('BACKGROUND',    (0, 0), (-1, -1), C_HEADER),
+                ('TOPPADDING',    (0, 0), (-1, -1), 10),
+                ('BOTTOMPADDING', (0, 0), (-1, -1), 10),
+                ('LEFTPADDING',   (0, 0), (-1, -1), 12),
+            ]))
+            story.append(hdr_tbl)
+            story.append(Spacer(1, 4 * mm))
+
+            # ── 2. Dados Gerais ───────────────────────────────────────────
+            story.append(Paragraph('Dados Gerais', s_sec))
+            story.append(HRFlowable(width=usable, thickness=1,
+                                    color=C_HEADER, spaceAfter=3))
+            c1, c2, c3 = usable * 0.65, usable * 0.20, usable * 0.15
+            dg_tbl = Table(
+                [[fld('Chave de Acesso', fmt_chave(chave), mono=True),
+                  fld('Número', num_doc),
+                  fld('Versão XML', '4.00')]],
+                colWidths=[c1, c2, c3]
+            )
+            dg_tbl.setStyle(base_style)
+            story.append(dg_tbl)
+            story.append(Spacer(1, 4 * mm))
+
+            # ── 3. Abas (NF-e ativa + demais) ────────────────────────────
+            tab_labels = [tipo_doc, 'Emitente', 'Destinatário', 'Situação']
+            tab_cells  = [
+                Paragraph(tab_labels[0], s_tab_on),
+                *[Paragraph(t, s_tab_off) for t in tab_labels[1:]]
+            ]
+            tab_tbl = Table([tab_cells], colWidths=[usable / 4] * 4)
+            tab_tbl.setStyle(TableStyle([
+                ('BACKGROUND',    (0, 0), (0, 0),   C_HEADER),
+                ('BACKGROUND',    (1, 0), (-1, -1), C_TAB_INACT),
+                ('BOX',           (0, 0), (-1, -1), 0.5, C_BORDER),
+                ('INNERGRID',     (0, 0), (-1, -1), 0.5, C_BORDER),
+                ('TOPPADDING',    (0, 0), (-1, -1), 5),
+                ('BOTTOMPADDING', (0, 0), (-1, -1), 5),
+            ]))
+            story.append(tab_tbl)
+            story.append(Spacer(1, 3 * mm))
+
+            # ── 4. Dados da NF-e ──────────────────────────────────────────
+            story.append(Paragraph(f'Dados da {tipo_doc}', s_sec_c))
+            story.append(HRFlowable(width=usable, thickness=0.5,
+                                    color=C_BORDER, spaceAfter=3))
+            cw = [usable*0.09, usable*0.09, usable*0.14,
+                  usable*0.24, usable*0.24, usable*0.20]
+            nfe_tbl = Table(
+                [[fld('Modelo', modelo),
+                  fld('Série', serie or '1'),
+                  fld('Número', num_doc),
+                  fld('Data de Emissão', data_emis),
+                  fld('Data/Hora de Saída ou da Entrada', data_emis),
+                  fld('Valor Total da Nota Fiscal', valor_nf)]],
+                colWidths=cw
+            )
+            nfe_tbl.setStyle(base_style)
+            story.append(nfe_tbl)
+            story.append(Spacer(1, 4 * mm))
+
+            # ── 5. Emitente ───────────────────────────────────────────────
+            story.append(Paragraph('Emitente', s_sec))
+            story.append(HRFlowable(width=usable, thickness=1,
+                                    color=C_HEADER, spaceAfter=3))
+            cw2 = [usable*0.22, usable*0.54, usable*0.16, usable*0.08]
+            emt_tbl = Table(
+                [[fld('CNPJ', fmt_cnpj(cnpj_emit)),
+                  fld('Nome / Razão Social', emit_nome),
+                  fld('Inscrição Estadual', ie_emit),
+                  fld('UF', uf_emit)]],
+                colWidths=cw2
+            )
+            emt_tbl.setStyle(base_style)
+            story.append(emt_tbl)
+            story.append(Spacer(1, 4 * mm))
+
+            # ── 6. Destinatário ───────────────────────────────────────────
+            story.append(Paragraph('Destinatário', s_sec))
+            story.append(HRFlowable(width=usable, thickness=1,
+                                    color=C_HEADER, spaceAfter=3))
+            dst_cnpj_show = dest_cnpj if dest_cnpj != '—' else cnpj_manif
+            dst_tbl = Table(
+                [[fld('CNPJ', fmt_cnpj(dst_cnpj_show)),
+                  fld('Nome / Razão Social', dest_nome),
+                  fld('Inscrição Estadual', '—'),
+                  fld('UF', '—')]],
+                colWidths=cw2
+            )
+            dst_tbl.setStyle(base_style)
+            story.append(dst_tbl)
+            story.append(Spacer(1, 4 * mm))
+
+            # ── 7. Emissão ────────────────────────────────────────────────
+            story.append(Paragraph('Emissão', s_sec))
+            story.append(HRFlowable(width=usable, thickness=1,
+                                    color=C_HEADER, spaceAfter=3))
+            cwe = [usable*0.30, usable*0.18, usable*0.18, usable*0.14, usable*0.20]
+            ems_tbl = Table(
+                [[fld('Processo', '0 - com aplicativo do Contribuinte'),
+                  fld('Versão do Processo', '—'),
+                  fld('Tipo de Emissão', '1 - Normal'),
+                  fld('Finalidade', '1 - Normal'),
+                  fld('Natureza da Operação', nat_oper)]],
+                colWidths=cwe
+            )
+            ems_tbl.setStyle(base_style)
+            story.append(ems_tbl)
+            story.append(Spacer(1, 4 * mm))
+
+            # ── 8. Situação Atual (barra laranja + tabela de eventos) ─────
+            sit_tbl = Table(
+                [[Paragraph(
+                    f'Situação Atual: AUTORIZADA (Manifestação registrada em produção)',
+                    s_sit_txt
+                )]],
+                colWidths=[usable]
+            )
+            sit_tbl.setStyle(TableStyle([
+                ('BACKGROUND',    (0, 0), (-1, -1), C_HEADER),
+                ('TOPPADDING',    (0, 0), (-1, -1), 8),
+                ('BOTTOMPADDING', (0, 0), (-1, -1), 8),
+                ('LEFTPADDING',   (0, 0), (-1, -1), 10),
+            ]))
+            story.append(sit_tbl)
+
+            # Tabela de eventos (estilo SEFAZ)
+            cw_ev = [usable*0.38, usable*0.22, usable*0.26, usable*0.14]
+            evt_rows = [
+                # Cabeçalho
+                [Paragraph('Eventos da NF-e', s_evt_hdr),
+                 Paragraph('Protocolo',        s_evt_hdr),
+                 Paragraph('Data / Hora',       s_evt_hdr),
+                 Paragraph('Status',            s_evt_hdr)],
+                # Linha do evento de manifestação
+                [Paragraph(evento_nome,         s_evt_val),
+                 Paragraph(protocolo or '—',    s_evt_val),
+                 Paragraph(data_fmt,            s_evt_val),
+                 Paragraph(msg_sefaz,           s_evt_val)],
+            ]
+            evt_tbl = Table(evt_rows, colWidths=cw_ev)
+            evt_tbl.setStyle(TableStyle([
+                ('BACKGROUND',    (0, 0), (-1, 0),  C_EVT_HDR),
+                ('BACKGROUND',    (0, 1), (-1, -1), C_ROW_ALT),
+                ('BOX',           (0, 0), (-1, -1), 0.5, C_BORDER),
+                ('INNERGRID',     (0, 0), (-1, -1), 0.5, C_BORDER),
+                ('TOPPADDING',    (0, 0), (-1, -1), 5),
+                ('BOTTOMPADDING', (0, 0), (-1, -1), 5),
+                ('LEFTPADDING',   (0, 0), (-1, -1), 6),
+                ('RIGHTPADDING',  (0, 0), (-1, -1), 6),
+                ('VALIGN',        (0, 0), (-1, -1), 'MIDDLE'),
+            ]))
+            story.append(evt_tbl)
+            story.append(Spacer(1, 6 * mm))
+
+            # ── 9. Rodapé ─────────────────────────────────────────────────
+            now_fmt = datetime.now().strftime('%d/%m/%Y %H:%M:%S')
+            story.append(HRFlowable(width=usable, thickness=0.5, color=C_BORDER))
+            story.append(Spacer(1, 2 * mm))
+            story.append(Paragraph(
+                f'Documento gerado em {now_fmt}  ·  Busca XML — Sistema de Monitoramento Fiscal',
+                s_footer
+            ))
+
+            # ── Gera o PDF ────────────────────────────────────────────────
+            doc = SimpleDocTemplate(
+                str(out_path),
+                pagesize=A4,
+                rightMargin=RM, leftMargin=LM,
+                topMargin=1.5 * cm, bottomMargin=1.5 * cm,
+                title='Comprovante de Manifestação NF-e',
+                author='Busca XML',
+            )
+            doc.build(story)
+            print(f'[COMPROVANTE] ✅ PDF gerado: {out_path}')
+            return str(out_path)
+
+        except ImportError:
+            print('[COMPROVANTE] ⚠️ reportlab não disponível — PDF não gerado')
+            return None
+        except Exception as e:
+            import traceback
+            print(f'[COMPROVANTE] ❌ Erro ao gerar PDF: {e}')
+            traceback.print_exc()
+            return None
+
     def _build_pdf_cache_async(self):
         """Constrói cache de PDFs em background para abertura rápida"""
         if self._cache_building:
             return
-        
+
         self._cache_building = True
+
         
         class CacheBuilder(QThread):
             cache_ready = pyqtSignal(dict)  # {chave: pdf_path}
@@ -7338,6 +9886,10 @@ class MainWindow(QMainWindow):
             self._cache_worker = None
             print(f"[DEBUG] Cache de PDFs construído: {len(cache)} arquivos indexados")
         
+        # Evita iniciar threads durante shutdown
+        if self._is_shutting_down:
+            return
+        
         self._cache_worker = CacheBuilder(self.notes, BASE_DIR)
         self._cache_worker.cache_ready.connect(on_cache_ready)
         self._cache_worker.start()
@@ -7375,15 +9927,40 @@ class MainWindow(QMainWindow):
         
         print(f"[DEBUG PDF] Chave da célula: {chave}")
         
-        # Busca o item correto em self.notes usando a chave
-        item = None
-        for note in self.notes:
-            if note.get('chave') == chave:
-                item = note
-                break
+        # ⚡ LOOKUP O(1) via PRIMARY KEY do banco (substitui for loop O(n) em self.notes)
+        item = self.db.get_nota_by_chave(chave)
         
         if not item:
             print(f"[DEBUG PDF] ❌ Documento não encontrado no banco com chave: {chave}")
+            return
+        
+        # ⛔ VALIDAÇÃO: Eventos não geram PDF
+        xml_status = (item.get('xml_status') or '').upper()
+        if xml_status == 'EVENTO':
+            print(f"[DEBUG PDF] ⛔ Documento é um EVENTO - não gera PDF")
+            QMessageBox.information(
+                self, 
+                "PDF não disponível", 
+                "❌ Eventos não geram PDF.\n\n"
+                "Este documento é um evento de NF-e/CT-e:\n"
+                "• Ciência da Operação\n"
+                "• Confirmação de Operação\n"
+                "• Desconhecimento\n"
+                "• Cancelamento\n\n"
+                "Apenas o arquivo XML está disponível."
+            )
+            return
+        if xml_status == 'INDISPONIVEL':
+            print(f"[DEBUG PDF] 🚫 Nota marcada como INDISPONIVEL")
+            QMessageBox.information(
+                self,
+                "XML indisponível",
+                "🚫 XML não pode ser baixado.\n\n"
+                "O SEFAZ informou que este documento não está mais disponível para download:\n"
+                "• Prazo de 60 dias expirado (cStat 632), ou\n"
+                "• NF-e inexistente / inutilizada no sistema.\n\n"
+                "Verifique com o emitente se há uma cópia do XML original."
+            )
             return
         
         print(f"[DEBUG PDF] Informante: {item.get('informante', 'N/A')}")
@@ -7399,16 +9976,24 @@ class MainWindow(QMainWindow):
         is_nfse = 'NFS' in tipo
         
         # OTIMIZAÇÃO 0: Verifica pdf_path do banco (SUPER RÁPIDO - PRIORITÁRIO)
-        # ⚠️ EXCEÇÃO: Para NFS-e, ignora cache em pasta TEMP (usa pasta definitiva)
+        # Lógica NFS-e:
+        #   pdf_tipo = OFICIAL  → PDF oficial confirmado → abre direto (sem nova chamada de API)
+        #   pdf_tipo = GENERICO → tenta API; se falhar, usa/gera genérico
+        #   pdf_tipo = None     → API nunca tentada → tenta API
         pdf_path_db = item.get('pdf_path')
+        pdf_tipo_db = item.get('pdf_tipo')
         should_use_db_cache = False
         
         if pdf_path_db:
-            print(f"[DEBUG PDF] Etapa 0: PDF path do banco encontrado: {pdf_path_db}")
+            print(f"[DEBUG PDF] Etapa 0: PDF path do banco encontrado: {pdf_path_db} [tipo={pdf_tipo_db}]")
             pdf_file_db = Path(pdf_path_db)
             
-            # 🔍 NFS-e: Ignora cache em pasta temporária (prioriza pasta xmls)
-            if is_nfse and ('Temp' in pdf_path_db or 'temp' in pdf_path_db):
+            if is_nfse and pdf_tipo_db != 'OFICIAL':
+                # GENERICO ou None → sempre tenta API primeiro; se falhar, cai no genérico existente
+                print(f"[DEBUG PDF] ⚠️ NFS-e tipo={pdf_tipo_db} - tentando API oficial antes de usar cache")
+                should_use_db_cache = False
+            elif is_nfse and ('Temp' in pdf_path_db or 'temp' in pdf_path_db):
+                # Pasta temporária — sempre busca destinação definitiva
                 print(f"[DEBUG PDF] ⚠️ NFS-e com cache temporário - ignorando para buscar PDF definitivo")
                 should_use_db_cache = False
             elif pdf_file_db.exists():
@@ -7423,13 +10008,19 @@ class MainWindow(QMainWindow):
             try:
                 print(f"[DEBUG PDF] ⚡⚡ Database hit! Abrindo PDF direto do banco...")
                 pdf_str = str(pdf_file_db.absolute())
+                import os as _os_etapa0
                 if sys.platform == "win32":
-                    subprocess.Popen(["cmd", "/c", "start", "", pdf_str], shell=False, creationflags=subprocess.CREATE_NO_WINDOW)  # type: ignore[attr-defined]
+                    _os_etapa0.startfile(pdf_str)  # type: ignore[attr-defined]
                 else:
                     subprocess.Popen(["xdg-open", pdf_str])
                 total_time = time.time() - start_time
-                print(f"[DEBUG PDF] ✅ PDF aberto (banco) - Tempo total: {total_time:.3f}s")
-                self.set_status("✅ PDF aberto (cache DB)", 1000)
+                print(f"[DEBUG PDF] ✅ PDF aberto (banco/{pdf_tipo_db}) - Tempo total: {total_time:.3f}s")
+                if pdf_tipo_db == 'OFICIAL':
+                    self.set_status("✅ PDF oficial aberto!", 1000)
+                elif pdf_tipo_db == 'GENERICO':
+                    self.set_status("⚠️ PDF local (município sem suporte no ADN Nacional)", 3000)
+                else:
+                    self.set_status("✅ PDF aberto (cache DB)", 1000)
                 return
             except Exception as e:
                 print(f"[DEBUG PDF] ❌ Erro ao abrir PDF do banco: {e}")
@@ -7461,7 +10052,45 @@ class MainWindow(QMainWindow):
                     f"{numero}-*.pdf",
                     f"DANFSe_{numero}.pdf"
                 ])
-                print(f"[DEBUG PDF] Padrões de busca: {search_patterns}...")
+                
+                # 🎯 CAMINHO DIRETO (NFS-e): tenta pasta exata do ano-mês antes do rglob.
+                # Impede que uma NFS-e de mesmo número de outra data/prestador seja retornada.
+                data_emissao_raw = str(item.get('data_emissao') or '')[:10]  # ex: "2020-06-15"
+                year_month_item = data_emissao_raw[:7] if len(data_emissao_raw) >= 7 else None
+                if year_month_item and informante:
+                    candidate_yms = [year_month_item]
+                    try:
+                        yr, mo = year_month_item.split('-')
+                        candidate_yms.append(f"{mo}-{yr}")  # Formato legado MM-YYYY
+                    except Exception:
+                        pass
+                    for base_root in [DATA_DIR / "xmls", BASE_DIR / "xmls"]:
+                        inf_dir = base_root / informante
+                        if not inf_dir.exists():
+                            continue
+                        for ym in candidate_yms:
+                            for tipo_subdir in ["NFSE", "NFSe", "nfse"]:
+                                cdir = inf_dir / ym / tipo_subdir
+                                if not cdir.exists():
+                                    continue
+                                for sp in search_patterns:
+                                    if '*' in sp:
+                                        found = list(cdir.glob(sp))
+                                    else:
+                                        p = cdir / sp
+                                        found = [p] if p.exists() else []
+                                    if found:
+                                        pdf_file = found[0]
+                                        if pdf_file.exists() and pdf_file.suffix.lower() == '.pdf':
+                                            print(f"[DEBUG PDF] ✅ PDF encontrado (caminho direto por data): {pdf_file}")
+                                            pdf_path = str(pdf_file.absolute())
+                                            break
+                                if pdf_path:
+                                    break
+                            if pdf_path:
+                                break
+                        if pdf_path:
+                            break
         else:
             # Para NF-e e CT-e, busca por VÁRIOS padrões possíveis
             numero = item.get('numero') or item.get('nNF')
@@ -7486,14 +10115,41 @@ class MainWindow(QMainWindow):
         
         print(f"[DEBUG PDF] Padrões de busca: {search_patterns[:3]}...")  # Mostra primeiros 3
         
-        # Busca em todas as pastas de XMLs
-        roots = [
-            DATA_DIR / "xmls",
-            BASE_DIR / "xmls"
-        ]
+        # ⚡ FIX: Tenta caminhos DIRETOS antes de qualquer rglob (O(1) vs O(1M))
+        # Constrói o caminho esperado baseado na estrutura conhecida: xmls/infomante/YYYY-MM/Tipo/
+        if informante and len(chave) >= 10:
+            _aa, _mm = chave[2:4], chave[4:6]
+            _year_month = f"20{_aa}-{_mm}"
+            _tipo_doc = str(item.get('tipo', '')).upper()
+            _subdir = "CTe" if "CTE" in _tipo_doc else "NFe"
+            for _base in [DATA_DIR / "xmls", BASE_DIR / "xmls"]:
+                _dir = _base / informante / _year_month / _subdir
+                if _dir.exists():
+                    for _pat in search_patterns:
+                        if '*' not in _pat:
+                            _candidate = _dir / _pat
+                            if _candidate.exists():
+                                print(f"[DEBUG PDF] ⚡ PDF encontrado via caminho direto: {_candidate}")
+                                pdf_path = str(_candidate.absolute())
+                                break
+                    if not pdf_path and numero:
+                        # Tenta pattern numero-*.pdf direto na pasta correta
+                        _matches = list(_dir.glob(f"{numero}-*.pdf"))
+                        if _matches:
+                            pdf_path = str(_matches[0].absolute())
+                            print(f"[DEBUG PDF] ⚡ PDF encontrado via glob direto: {pdf_path}")
+                if pdf_path:
+                    break
+        
+        # Busca em todas as pastas de XMLs (deduplicado: em dev DATA_DIR == BASE_DIR)
+        _roots_raw = [DATA_DIR / "xmls", BASE_DIR / "xmls"]
+        seen = set()
+        roots = [r for r in _roots_raw if not (str(r.resolve()) in seen or seen.add(str(r.resolve())))]
         
         search_start = time.time()
         for r in roots:
+            if pdf_path:
+                break
             if not r.exists():
                 continue
             
@@ -7502,6 +10158,13 @@ class MainWindow(QMainWindow):
                 print(f"[DEBUG PDF] ⏱️ Timeout na busca de PDF (3s)")
                 break
             
+            # 🔒 SEGURANÇA: Restringe a busca ao subdiretório do informante quando disponível.
+            if informante and (r / informante).exists():
+                search_base = r / informante
+                print(f"[DEBUG PDF] 🔒 Busca restrita à pasta do informante: {search_base}")
+            else:
+                search_base = r
+            
             # Tenta cada padrão
             for pattern in search_patterns:
                 if time.time() - search_start > 3.0:
@@ -7509,7 +10172,7 @@ class MainWindow(QMainWindow):
                 
                 # Se tem wildcard (*), usa glob
                 if '*' in pattern:
-                    matches = list(r.rglob(pattern))
+                    matches = list(search_base.rglob(pattern))
                     if matches:
                         # Pega o mais recente se houver múltiplos
                         pdf_file = max(matches, key=lambda p: p.stat().st_mtime if p.exists() else 0)
@@ -7519,7 +10182,7 @@ class MainWindow(QMainWindow):
                             break
                 else:
                     # Busca exata
-                    matches = list(r.rglob(pattern))
+                    matches = list(search_base.rglob(pattern))
                     if matches and matches[0].exists():
                         print(f"[DEBUG PDF] ✅ PDF encontrado (padrão: {pattern}): {matches[0]}")
                         pdf_path = str(matches[0].absolute())
@@ -7528,58 +10191,52 @@ class MainWindow(QMainWindow):
             if pdf_path:
                 break
         
-        # Se encontrou PDF existente, abre direto
+        # Se encontrou PDF existente, verifica se é oficial ou genérico antes de abrir
         if pdf_path:
-            try:
-                # 🆕 CORREÇÃO: Para NFS-e, verifica XML e atualiza status no banco ANTES de abrir PDF
-                if is_nfse:
-                    print(f"[DEBUG PDF] 🔍 NFS-e: Verificando status do XML antes de abrir PDF...")
-                    xml_text = resolve_xml_text(item)
-                    if xml_text:
-                        print(f"[DEBUG PDF] ✅ XML da NFS-e encontrado - atualizando status no banco...")
-                        try:
-                            with sqlite3.connect(str(DB_PATH)) as conn_update:
-                                # Atualiza notas_detalhadas
-                                conn_update.execute(
-                                    "UPDATE notas_detalhadas SET xml_status = 'COMPLETO' WHERE chave = ?",
-                                    (chave,)
-                                )
-                                conn_update.commit()
-                                print(f"[DEBUG PDF] ✅ NFS-e marcada como COMPLETO no banco")
-                                
-                                # 🔥 FORÇA REFRESH DA TABELA NA INTERFACE
-                                if self.tab_widget.currentIndex() == 0:  # Aba Recebidas
-                                    QTimer.singleShot(100, self.refresh_table)
-                                else:  # Aba Emitidas
-                                    QTimer.singleShot(100, self.refresh_emitidos_table)
-                        except Exception as e_update:
-                            print(f"[DEBUG PDF] ⚠️ Erro ao atualizar status: {e_update}")
-                    else:
-                        print(f"[DEBUG PDF] ⚠️ XML da NFS-e não encontrado")
-                
-                print(f"[DEBUG PDF] ⚡ Abrindo PDF existente sem gerar novo...")
-                if sys.platform == "win32":
-                    subprocess.Popen(["cmd", "/c", "start", "", pdf_path], shell=False, creationflags=subprocess.CREATE_NO_WINDOW)  # type: ignore[attr-defined]
-                else:
-                    subprocess.Popen(["xdg-open", pdf_path])
-                
-                # Atualiza cache no banco
+            pdf_size = Path(pdf_path).stat().st_size if Path(pdf_path).exists() else 0
+            # PDFs oficiais (API do governo) têm >10KB; PDFs reportlab têm ~3-4KB
+            pdf_on_disk_tipo = 'OFICIAL' if pdf_size > 10000 else 'GENERICO'
+            print(f"[DEBUG PDF] 📏 Tamanho PDF: {pdf_size:,} bytes → classificado como {pdf_on_disk_tipo}")
+            
+            # NFS-e genérico no disco: ignora e tenta obter o oficial via geração (API)
+            if is_nfse and pdf_on_disk_tipo == 'GENERICO':
+                print(f"[DEBUG PDF] ⚠️ PDF no disco é GENERICO ({pdf_size:,}B) - tentando oficial via geração...")
                 try:
-                    self.db.atualizar_pdf_path(chave, pdf_path)
-                    print(f"[DEBUG PDF] ✅ Cache atualizado no banco")
+                    self.db.atualizar_pdf_path(chave, pdf_path, 'GENERICO')
                 except:
                     pass
-                
-                total_time = time.time() - start_time
-                print(f"[DEBUG PDF] ✅ PDF aberto (pasta) - Tempo total: {total_time:.3f}s")
-                self.set_status("✅ PDF aberto (arquivo existente)", 1500)
-                return
-            except Exception as e:
-                print(f"[DEBUG PDF] ❌ Erro ao abrir PDF: {e}")
-                QMessageBox.warning(self, "Erro ao abrir PDF", f"Erro: {e}")
-                return
-        else:
-            print(f"[DEBUG PDF] ⚠️ PDF não encontrado na pasta - será gerado novo")
+                pdf_path = None  # força geração (que tentará API primeiro)
+            
+            if pdf_path:
+                try:
+                    print(f"[DEBUG PDF] ⚡ Abrindo PDF existente ({pdf_on_disk_tipo}) sem gerar novo...")
+                    import os as _os
+                    if sys.platform == "win32":
+                        _os.startfile(pdf_path)  # type: ignore[attr-defined]
+                    else:
+                        subprocess.Popen(["xdg-open", pdf_path])
+                    
+                    # Atualiza cache no banco com tipo classificado
+                    try:
+                        self.db.atualizar_pdf_path(chave, pdf_path, pdf_on_disk_tipo)
+                        print(f"[DEBUG PDF] ✅ Cache atualizado no banco [{pdf_on_disk_tipo}]")
+                    except:
+                        pass
+                    
+                    total_time = time.time() - start_time
+                    print(f"[DEBUG PDF] ✅ PDF aberto (pasta/{pdf_on_disk_tipo}) - Tempo total: {total_time:.3f}s")
+                    if pdf_on_disk_tipo == 'OFICIAL':
+                        self.set_status("✅ PDF oficial aberto!", 1500)
+                    else:
+                        self.set_status("⚠️ PDF local aberto (oficial não disponível)", 2500)
+                    return
+                except Exception as e:
+                    print(f"[DEBUG PDF] ❌ Erro ao abrir PDF: {e}")
+                    QMessageBox.warning(self, "Erro ao abrir PDF", f"Erro: {e}")
+                    return
+        
+        if not pdf_path:
+            print(f"[DEBUG PDF] ⚠️ PDF não encontrado na pasta ou era GENERICO - gerando novo...")
         
         # Pula direto para verificação de XML e geração de PDF
         print(f"[DEBUG PDF] Etapa 5: Verificando XML antes de gerar PDF...")
@@ -7589,13 +10246,47 @@ class MainWindow(QMainWindow):
         xml_text = resolve_xml_text(item)
         if not xml_text:
             print(f"[DEBUG PDF] ❌ XML não encontrado localmente")
-            QMessageBox.warning(
-                self, 
-                "XML não encontrado", 
-                f"Não foi possível encontrar o XML para a chave {chave}.\n\n"
-                "O PDF só pode ser gerado se o XML estiver disponível."
-            )
-            return
+            # Se é RESUMO ou CT-e/NF-e sem XML, oferece download
+            xml_status_atual = (item.get('xml_status') or '').upper()
+            tipo_doc_atual = str(item.get('tipo', '')).upper()
+            is_nfe_cte = tipo_doc_atual in ('NFE', 'CTE', 'NF-E', 'CT-E')
+            if is_nfe_cte:
+                resp = QMessageBox.question(
+                    self,
+                    "XML não encontrado",
+                    f"O XML completo desta nota não está disponível localmente.\n\n"
+                    f"Status: {xml_status_atual or 'RESUMO'}\n\n"
+                    "Deseja baixar o XML completo da SEFAZ agora?",
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.Yes
+                )
+                if resp == QMessageBox.Yes:
+                    print(f"[DEBUG PDF] 🚀 Iniciando download do XML via _baixar_xml_e_pdf...")
+                    resultado = self._baixar_xml_e_pdf(item, silent_mode=True)
+                    if resultado and resultado.get('sucesso'):
+                        # XML baixado — re-busca e abre PDF
+                        xml_text = resolve_xml_text(item)
+                        if not xml_text:
+                            QMessageBox.information(self, "Download concluído",
+                                "XML baixado com sucesso!\nDê duplo clique novamente para abrir o PDF.")
+                            return
+                        # Cai no fluxo normal de geração de PDF abaixo
+                        print(f"[DEBUG PDF] ✅ XML obtido após download — gerando PDF...")
+                    else:
+                        erro = (resultado or {}).get('erro', 'Erro desconhecido')
+                        QMessageBox.warning(self, "Download falhou",
+                            f"Não foi possível baixar o XML da SEFAZ.\n\n{erro}")
+                        return
+                else:
+                    return
+            else:
+                QMessageBox.warning(
+                    self,
+                    "XML não encontrado",
+                    f"Não foi possível encontrar o XML para a chave {chave}.\n\n"
+                    "O PDF só pode ser gerado se o XML estiver disponível."
+                )
+                return
         
         print(f"[DEBUG PDF] ✅ XML encontrado, iniciando geração de PDF...")
         print(f"[DEBUG PDF] Etapa 5 concluída em {time.time() - xml_check_start:.3f}s")
@@ -7608,7 +10299,7 @@ class MainWindow(QMainWindow):
         
         # Cria worker thread para não travar a interface
         print(f"[DEBUG PDF] Criando worker thread para geração assíncrona...")
-        self._process_pdf_async(item)
+        self._process_pdf_async(item, xml_text_precargado=xml_text)
         print(f"[DEBUG PDF] Worker criado - aguardando conclusão em background")
         print(f"[DEBUG PDF] ========================================\n")
     
@@ -7645,13 +10336,8 @@ class MainWindow(QMainWindow):
         
         print(f"[DEBUG PDF EMITIDOS] Chave da célula: {chave}")
         
-        # Busca o item correto na lista de emitidos usando a chave
-        flt = self.filtered_emitidos()
-        item = None
-        for note in flt:
-            if note.get('chave') == chave:
-                item = note
-                break
+        # ⚡ LOOKUP O(1) via PRIMARY KEY do banco (substitui for loop O(n) em filtered_emitidos)
+        item = self.db.get_nota_by_chave(chave)
         
         if not item:
             print(f"[DEBUG PDF EMITIDOS] ❌ Documento não encontrado com chave: {chave}")
@@ -7701,12 +10387,40 @@ class MainWindow(QMainWindow):
                     "2. Ou execute uma busca manual de NFS-e"
                 )
             else:
-                QMessageBox.warning(
-                    self, 
-                    "XML não encontrado", 
-                    f"Não foi possível encontrar o XML para a chave {chave}.\n\n"
-                    "O PDF só pode ser gerado se o XML estiver disponível."
-                )
+                tipo_doc_emit = str(item.get('tipo', '')).upper()
+                is_nfe_cte_emit = tipo_doc_emit in ('NFE', 'CTE', 'NF-E', 'CT-E')
+                if is_nfe_cte_emit:
+                    resp = QMessageBox.question(
+                        self,
+                        "XML não encontrado",
+                        f"O XML completo desta nota não está disponível localmente.\n\n"
+                        "Deseja tentar baixar o XML da SEFAZ agora?",
+                        QMessageBox.Yes | QMessageBox.No,
+                        QMessageBox.Yes
+                    )
+                    if resp == QMessageBox.Yes:
+                        print(f"[DEBUG PDF EMITIDOS] 🚀 Iniciando download do XML via _baixar_xml_e_pdf...")
+                        resultado = self._baixar_xml_e_pdf(item, silent_mode=True)
+                        if resultado and resultado.get('sucesso'):
+                            xml_text = resolve_xml_text(item)
+                            if not xml_text:
+                                QMessageBox.information(self, "Download concluído",
+                                    "XML baixado com sucesso!\nDê duplo clique novamente para abrir o PDF.")
+                                return
+                        else:
+                            erro = (resultado or {}).get('erro', 'Erro desconhecido')
+                            QMessageBox.warning(self, "Download falhou",
+                                f"Não foi possível baixar o XML da SEFAZ.\n\n{erro}")
+                            return
+                    else:
+                        return
+                else:
+                    QMessageBox.warning(
+                        self, 
+                        "XML não encontrado", 
+                        f"Não foi possível encontrar o XML para a chave {chave}.\n\n"
+                        "O PDF só pode ser gerado se o XML estiver disponível."
+                    )
             return
         
         # 🆕 CORREÇÃO: Se é NFS-e e encontrou XML, atualiza status no banco
@@ -7734,11 +10448,11 @@ class MainWindow(QMainWindow):
         
         # Cria worker thread para não travar a interface
         print(f"[DEBUG PDF EMITIDOS] Criando worker thread para geração assíncrona...")
-        self._process_pdf_async(item)
+        self._process_pdf_async(item, xml_text_precargado=xml_text)  # Passa xml_text já resolvido para evitar dupla busca
         print(f"[DEBUG PDF EMITIDOS] Worker criado - aguardando conclusão em background")
         print(f"[DEBUG PDF EMITIDOS] ========================================\n")
     
-    def _process_pdf_async(self, item: Dict[str, Any]):
+    def _process_pdf_async(self, item: Dict[str, Any], xml_text_precargado: Optional[str] = None):
         """Processa PDF em thread separada para não travar a UI"""
         
         # ⛔ NUNCA GERAR PDF PARA EVENTOS!
@@ -7750,13 +10464,14 @@ class MainWindow(QMainWindow):
             return
         
         class PDFWorker(QThread):
-            finished = pyqtSignal(dict)  # {ok, pdf_path, error}
+            done = pyqtSignal(dict)  # renomeado: não shadowa QThread.finished nativo
             status_update = pyqtSignal(str)  # Para atualizar status na UI
             
-            def __init__(self, parent_window, item_data):
+            def __init__(self, parent_window, item_data, xml_text_precargado=None):
                 super().__init__()
                 self.parent_window = parent_window
                 self.item = item_data
+                self.xml_text_precargado = xml_text_precargado  # XML já resolvido pelo chamador
             
             def run(self):
                 try:
@@ -7764,9 +10479,13 @@ class MainWindow(QMainWindow):
                     informante = self.item.get('informante', '')
                     tipo = (self.item.get('tipo') or 'NFe').strip().upper().replace('-', '')
                     
-                    # Resolve XML
-                    self.status_update.emit("🔍 Buscando XML...")
-                    xml_text = resolve_xml_text(self.item)
+                    # Resolve XML — usa xml_text pré-carregado se disponível (evita dupla busca)
+                    if self.xml_text_precargado:
+                        self.status_update.emit("🔍 XML já disponível...")
+                        xml_text = self.xml_text_precargado
+                    else:
+                        self.status_update.emit("🔍 Buscando XML...")
+                        xml_text = resolve_xml_text(self.item)
                     
                     # Verifica se precisa buscar XML completo
                     def _is_nfe_full(x: str) -> bool:
@@ -7818,7 +10537,7 @@ class MainWindow(QMainWindow):
                             pass
                     
                     if not xml_text:
-                        self.finished.emit({"ok": False, "error": "XML completo não encontrado (local/SEFAZ)."})
+                        self.done.emit({"ok": False, "error": "XML completo não encontrado (local/SEFAZ)."  })
                         return
                     
                     # Save downloaded XML
@@ -7853,10 +10572,25 @@ class MainWindow(QMainWindow):
                             # Busca o XML APENAS na estrutura organizada por CNPJ (xmls/{CNPJ}/...)
                             xmls_root = DATA_DIR / "xmls"
                             found_xml = None
-                            
-                            # Busca 1: Na pasta do informante por nome da chave (PADRÃO v1.0.86+)
                             informante_folder = xmls_root / informante
-                            if informante_folder.exists():
+                            is_nfse_tipo = 'NFS' in tipo
+                            
+                            # Busca 0: Para NFS-e, busca pelo NÚMERO do documento
+                            # (NFS-e são salvas como NFSe_{num}.xml ou {num}-*.xml, NÃO por chave)
+                            if is_nfse_tipo and informante_folder.exists():
+                                numero = self.item.get('nNF') or self.item.get('numero')
+                                if numero:
+                                    for nfse_pat in [f"NFSe_{numero}.xml", f"{numero}-*.xml", f"*_{numero}.xml", f"*{numero}*.xml"]:
+                                        for xml_file in informante_folder.rglob(nfse_pat):
+                                            if not any(x in str(xml_file).lower() for x in ['debug', 'backup', 'request', 'response']):
+                                                found_xml = xml_file
+                                                print(f"[DEBUG XML] ✅ NFS-e XML encontrado por número ({numero}): {xml_file}")
+                                                break
+                                        if found_xml:
+                                            break
+                            
+                            # Busca 1: Na pasta do informante por nome da chave (PADRÃO v1.0.86+ para NF-e/CT-e)
+                            if not found_xml and informante_folder.exists():
                                 print(f"[DEBUG XML] Buscando {chave}.xml em: {informante_folder}")
                                 for xml_file in informante_folder.rglob(f"{chave}.xml"):
                                     # Ignora pastas de debug/backup
@@ -7893,10 +10627,20 @@ class MainWindow(QMainWindow):
                             pdf_path = tmp / f"{tipo}-{chave}.pdf"
                     
                     # Check if PDF exists (pode ter sido salvo junto com o XML)
+                    # NFS-e: se o PDF existente é pequeno (<10KB = genérico), NÃO faz early-return
+                    # — deixa o sandbox tentar API (pdf_simple ETAPA1 ignora <10KB, ETAPA2 tenta API,
+                    #   ETAPA3 sobrescreve se a API falhar). Se o PDF for oficial (>10KB), abre direto.
+                    is_nfse_worker = 'NFS' in tipo.upper()
                     if pdf_path.exists():
-                        self.status_update.emit("✅ PDF encontrado!")
-                        self.finished.emit({"ok": True, "pdf_path": str(pdf_path)})
-                        return
+                        pdf_size_worker = pdf_path.stat().st_size
+                        if is_nfse_worker and pdf_size_worker < 10000:
+                            print(f"[PDF] ℹ️ PDF existente é GENERICO ({pdf_size_worker}B) — tentando API oficial antes...")
+                            # Não faz early-return: cai para generate_pdf que tenta API primeiro
+                        else:
+                            self.status_update.emit("✅ PDF encontrado!")
+                            pdf_tipo_existente = 'OFICIAL' if pdf_size_worker > 10000 else 'GENERICO'
+                            self.done.emit({"ok": True, "pdf_path": str(pdf_path), "pdf_tipo": pdf_tipo_existente})
+                            return
                     
                     # Generate PDF
                     self.status_update.emit("📄 Gerando PDF do XML...")
@@ -7909,18 +10653,28 @@ class MainWindow(QMainWindow):
                     res = sandbox.run_task("generate_pdf", payload, timeout=240)
                     if res.get("ok"):
                         if pdf_path.exists():
-                            self.finished.emit({"ok": True, "pdf_path": str(pdf_path)})
+                            self.done.emit({"ok": True, "pdf_path": str(pdf_path), "pdf_tipo": res.get("pdf_tipo")})
                         else:
-                            self.finished.emit({"ok": False, "error": "PDF não foi gerado"})
+                            self.done.emit({"ok": False, "error": "PDF não foi gerado"})
                     else:
-                        self.finished.emit({"ok": False, "error": f"Falha ao gerar PDF: {res.get('error')}"})
+                        self.done.emit({"ok": False, "error": f"Falha ao gerar PDF: {res.get('error')}"})
                 
                 except Exception as e:
                     import traceback
-                    self.finished.emit({"ok": False, "error": f"Erro: {str(e)}\n{traceback.format_exc()}"})
+                    self.done.emit({"ok": False, "error": f"Erro: {str(e)}\n{traceback.format_exc()}"})
         
+        # Guarda contra duplo-clique: ignora se já há worker rodando para esta chave
+        chave_item = item.get('chave', '')
+        if not hasattr(self, '_pdf_workers'):
+            self._pdf_workers = []
+        for w in list(self._pdf_workers):
+            if getattr(w, '_chave', None) == chave_item and w.isRunning():
+                self.set_status("⏳ Gerando PDF... Por favor aguarde!", 3000)
+                return
+
         # Cria e inicia worker
-        worker = PDFWorker(self, item)
+        worker = PDFWorker(self, item, xml_text_precargado)
+        worker._chave = chave_item  # marca chave para deduplicação
         
         def on_status(msg: str):
             self.set_status(msg)
@@ -7929,34 +10683,47 @@ class MainWindow(QMainWindow):
             if result.get("ok"):
                 pdf_path = result.get("pdf_path")
                 chave = item.get('chave')
-                # AUTO-CURA: Atualiza PDF path no banco após gerar
+                pdf_tipo = result.get("pdf_tipo")  # 'OFICIAL', 'GENERICO', ou None
+                # AUTO-CURA: Atualiza PDF path + tipo no banco após gerar
                 if pdf_path and chave:
-                    self.db.atualizar_pdf_path(chave, pdf_path)
-                    print(f"[DEBUG PDF] 🔄 PDF gerado - path salvo no banco: {chave}")
+                    self.db.atualizar_pdf_path(chave, pdf_path, pdf_tipo)
+                    tipo_label = pdf_tipo or "?"
+                    print(f"[DEBUG PDF] 🔄 PDF gerado [{tipo_label}] - path salvo no banco: {chave}")
                 try:
+                    import os as _os
                     if sys.platform == "win32":
-                        # Abre PDF com visualizador padrão do Windows (evita abrir interface se PDF estiver associado incorretamente)
-                        subprocess.Popen(["cmd", "/c", "start", "", pdf_path], shell=False, creationflags=subprocess.CREATE_NO_WINDOW)  # type: ignore[attr-defined]
+                        # os.startfile é a forma correta no Windows — funciona com qualquer caminho
+                        _os.startfile(pdf_path)  # type: ignore[attr-defined]
                     else:
                         subprocess.Popen(["xdg-open", pdf_path])
-                    self.set_status("✅ PDF gerado e aberto com sucesso!", 2000)
+                    if pdf_tipo == 'OFICIAL':
+                        self.set_status("✅ PDF oficial aberto com sucesso!", 2000)
+                    elif pdf_tipo == 'GENERICO':
+                        self.set_status("⚠️ PDF gerado localmente (PDF oficial não disponível)", 3000)
+                    else:
+                        self.set_status("✅ PDF aberto com sucesso!", 2000)
                 except Exception as e:
                     self.set_status("")
-                    QMessageBox.warning(self, "Erro ao abrir PDF", f"Erro: {e}")
+                    QMessageBox.warning(self, "Erro ao abrir PDF", f"Não foi possível abrir o PDF:\n{pdf_path}\n\nErro: {e}")
             else:
                 self.set_status("")
                 error_msg = result.get("error", "Erro desconhecido")
-                QMessageBox.critical(self, "Erro", error_msg)
+                QMessageBox.critical(self, "Erro ao gerar PDF", error_msg)
         
         worker.status_update.connect(on_status)
-        worker.finished.connect(on_finished)
+        worker.done.connect(on_finished)
         worker.start()
         
         # Mantém referência para evitar garbage collection
-        if not hasattr(self, '_pdf_workers'):
-            self._pdf_workers = []
         self._pdf_workers.append(worker)
-        worker.finished.connect(lambda: self._pdf_workers.remove(worker) if worker in self._pdf_workers else None)
+        
+        def _pdf_worker_cleanup():
+            """Chamado pelo sinal NATIVO QThread.finished — thread já parou completamente."""
+            if worker in self._pdf_workers:
+                self._pdf_workers.remove(worker)
+            worker.deleteLater()
+        
+        worker.finished.connect(_pdf_worker_cleanup)  # nativo: dispara APÓS run() terminar
 
     def _auto_start_search(self):
         """Inicia busca automaticamente ao iniciar o sistema."""
@@ -8135,27 +10902,128 @@ class MainWindow(QMainWindow):
         except Exception as e:
             print(f"[AGENDADOR] Erro ao verificar tarefas periódicas: {e}")
     
+    def _iniciar_reprocessamento_resumos(self):
+        """Reprocessa notas que estão como RESUMO, buscando XML completo"""
+        # Busca notas RESUMO
+        with self.db._connect() as conn:
+            cursor = conn.execute("""
+                SELECT chave, informante, nome_emitente 
+                FROM notas_detalhadas 
+                WHERE xml_status = 'RESUMO'
+                ORDER BY data_emissao DESC
+            """)
+            notas_resumo = [{'chave': r[0], 'informante': r[1], 'nome_emitente': r[2]} for r in cursor]
+        
+        if not notas_resumo:
+            print("[AUTO-VERIFICAÇÃO] Nenhuma nota com status RESUMO encontrada.")
+            return
+        
+        # Cria e inicia o worker
+        from nfe_search import AutoVerificacaoWorker
+        worker = AutoVerificacaoWorker(self, notas_resumo)
+        
+        # Adiciona à lista de trabalhos ativos
+        trabalho = {
+            'tipo': 'auto_verificacao',
+            'nome': 'Auto-Verificação de XMLs',
+            'status': 'Em execução',
+            'progresso': 0,
+            'total': len(notas_resumo),
+            'mensagem': 'Iniciando...',
+            'worker': worker
+        }
+        self._trabalhos_ativos.append(trabalho)
+        
+        # Conecta sinais
+        def on_progress(msg, atual, total):
+            for t in self._trabalhos_ativos:
+                if t.get('tipo') == 'auto_verificacao':
+                    t['progresso'] = atual
+                    t['total'] = total
+                    t['mensagem'] = msg
+                    break
+        
+        def on_finished(encontrados, nao_encontrados):
+            # Remove da lista de trabalhos
+            self._trabalhos_ativos = [
+                t for t in self._trabalhos_ativos
+                if t.get('tipo') != 'auto_verificacao'
+            ]
+            
+            # Atualiza interface de forma OTIMIZADA (usa QTimer para garantir execução na thread principal)
+            from PyQt5.QtCore import QTimer
+            def atualizar_interface():
+                try:
+                    print("[AUTO-VERIFICAÇÃO] Atualizando interface...")
+                    
+                    # 1. Apenas corrige xml_status (rápido - já está otimizado)
+                    self._corrigir_xml_status_automatico()
+                    
+                    # 2. Apenas atualiza a tabela SEM recarregar dados
+                    # (os dados em self.notes já estão corretos, só precisa re-renderizar)
+                    self._refresh_table_only()
+                    
+                    print("[AUTO-VERIFICAÇÃO] Interface atualizada!")
+                except Exception as e:
+                    print(f"[AUTO-VERIFICAÇÃO] Erro ao atualizar interface: {e}")
+                    import traceback
+                    traceback.print_exc()
+            
+            # Executa atualização com delay pequeno (evita travamento)
+            QTimer.singleShot(200, atualizar_interface)
+            
+            # Log resultado
+            print(f"[AUTO-VERIFICAÇÃO] Concluída - ✅ XMLs encontrados: {encontrados} | ❌ Não encontrados: {nao_encontrados}")
+            self.set_status(f"✅ Auto-Verificação concluída: {encontrados} XMLs encontrados", 5000)
+        
+        def on_error(error_msg):
+            # Remove da lista de trabalhos
+            self._trabalhos_ativos = [
+                t for t in self._trabalhos_ativos
+                if t.get('tipo') != 'auto_verificacao'
+            ]
+            
+            if "Cancelado" not in error_msg:
+                print(f"[AUTO-VERIFICAÇÃO] Erro: {error_msg}")
+                self.set_status(f"❌ Erro na auto-verificação: {error_msg}", 5000)
+        
+        worker.progress.connect(on_progress)
+        worker.finished.connect(on_finished)
+        worker.error.connect(on_error)
+        
+        # Conecta sinal de log para imprimir no terminal
+        worker.log_message.connect(lambda msg: print(msg, flush=True))
+        
+        worker.start()
+        
+        print(f"[AUTO-VERIFICAÇÃO] Iniciada - Processando {len(notas_resumo)} notas RESUMO")
+        self.set_status(f"⏳ Processando {len(notas_resumo)} notas RESUMO...", 3000)
+    
     def _executar_tarefa_agendada(self, tarefa_index: int, tarefa_nome: str):
         """Executa a tarefa agendada conforme o índice"""
         try:
             print(f"[AGENDADOR] Iniciando execução: {tarefa_nome}")
             self.set_status(f"⏰ Executando tarefa agendada: {tarefa_nome}")
             
-            # Mapeamento de tarefas
+            # Mapeamento de tarefas (atualizado v1.1.27)
             if tarefa_index == 0:  # Buscar Notas na SEFAZ
                 self.do_search()
             elif tarefa_index == 1:  # Busca Completa (NSU)
                 self.do_busca_completa()
-            elif tarefa_index == 2:  # Atualizar Status de Notas
+            elif tarefa_index == 2:  # 🆕 Consultar Eventos/Status
+                self._atualizar_status_apos_busca()
+            elif tarefa_index == 3:  # Atualizar Status de Notas (era 2)
                 self._atualizar_status_background()
-            elif tarefa_index == 3:  # Baixar XMLs Faltantes
+            elif tarefa_index == 4:  # Baixar XMLs Faltantes (era 3)
                 self.baixar_xmls_faltantes_por_chave()
-            elif tarefa_index == 4:  # Gerar PDFs Pendentes
+            elif tarefa_index == 5:  # Gerar PDFs Pendentes (era 4)
                 self._gerar_pdfs_faltantes()
-            elif tarefa_index == 5:  # Manifestação Automática
+            elif tarefa_index == 6:  # Manifestação Automática (era 5)
                 self._manifestar_nota(None)
-            elif tarefa_index == 6:  # Sincronizar Documentos
+            elif tarefa_index == 7:  # Sincronizar Documentos (era 6)
                 self.sincronizar_xmls_interface()
+            elif tarefa_index == 8:  # 🆕 Processar Resumos (baixar XMLs de RESUMO → COMPLETO)
+                self._iniciar_reprocessamento_resumos()
             
             print(f"[AGENDADOR] Tarefa '{tarefa_nome}' executada com sucesso")
             
@@ -8175,6 +11043,7 @@ class MainWindow(QMainWindow):
             'nfes_found': 0,
             'ctes_found': 0,
             'nfses_found': 0,
+            'chaves_found': 0,
             'start_time': datetime.now(),
             'last_cert': '',
             'total_docs': 0
@@ -8210,20 +11079,31 @@ class MainWindow(QMainWindow):
                         cnpj = match.group(1)
                         self._search_stats['last_cert'] = cnpj[-4:]  # Últimos 4 dígitos
                         self._update_search_summary()
+                        # 🔧 FIX: Força atualização da UI (apenas quando certificado muda)
+                        QApplication.processEvents()
                 
                 # Detecta NFe encontrada
                 if "registrar_xml" in line.lower() or "infnfe" in line.lower():
                     self._search_stats['nfes_found'] += 1
+                    self._search_stats['chaves_found'] += 1
                     self._update_search_summary()
                 
                 # Detecta CTe encontrado
                 if "processar_cte" in line.lower() or "🚛" in line:
                     self._search_stats['ctes_found'] += 1
+                    self._search_stats['chaves_found'] += 1
                     self._update_search_summary()
                 
                 # Detecta NFS-e processada
-                if "nfs-e processada com sucesso" in line.lower() or "📋" in line:
-                    self._search_stats['nfses_found'] += 1
+                # Usa linha de resumo "📊 NFS-e: N documentos processados nesta iteração"
+                # que contém o número real de documentos do lote — evita contar por consulta/requisição.
+                if "nfs-e:" in line.lower() and "documentos processados" in line.lower():
+                    import re as _re
+                    m = _re.search(r'nfs-e:\s*(\d+)\s*documentos processados', line, _re.IGNORECASE)
+                    if m:
+                        self._search_stats['nfses_found'] += int(m.group(1))
+                    else:
+                        self._search_stats['nfses_found'] += 1
                     self._update_search_summary()
                 
                 # Detecta documentos processados
@@ -8245,11 +11125,15 @@ class MainWindow(QMainWindow):
                 # Mostra resumo final
                 elapsed = (datetime.now() - self._search_stats['start_time']).total_seconds()
                 self.search_summary_label.setText(
-                    f"✅ NFes: {self._search_stats['nfes_found']} | "
+                    f"✅ Chaves: {self._search_stats['chaves_found']} | "
+                    f"NFes: {self._search_stats['nfes_found']} | "
                     f"CTes: {self._search_stats['ctes_found']} | "
                     f"NFSes: {self._search_stats['nfses_found']} | "
                     f"Tempo: {elapsed:.0f}s"
                 )
+                
+                # 🔧 FIX: Força atualização da UI ao finalizar
+                QApplication.processEvents()
                 
                 # Usa o intervalo configurado pelo usuário (em horas)
                 intervalo_horas = self.spin_intervalo.value()
@@ -8338,6 +11222,10 @@ class MainWindow(QMainWindow):
                 print(f"Erro ao processar on_error: {e}")
         
         # Conecta sinais
+        # Evita iniciar threads durante shutdown
+        if self._is_shutting_down:
+            return
+        
         self._search_worker = SearchWorker()
         self._search_worker.progress_line.connect(on_progress)
         self._search_worker.finished_search.connect(on_finished)
@@ -8434,8 +11322,8 @@ class MainWindow(QMainWindow):
                 "Busca por Chave",
                 f"Buscar {total_chaves} chave(s) de acesso na SEFAZ?\n\n"
                 f"✅ As notas encontradas serão salvas automaticamente.\n"
-                f"📂 Notas de SAÍDA → aba 'Emitidos pela empresa'\n"
-                f"📂 Notas de ENTRADA → aba principal",
+                f"📂 Notas de SAÍDA → aba 'Saídas'\n"
+                f"📂 Notas de ENTRADA → aba 'Entradas'",
                 QMessageBox.Yes | QMessageBox.No,
                 QMessageBox.Yes
             )
@@ -8480,6 +11368,17 @@ class MainWindow(QMainWindow):
         
         print(f"\n[BUSCA POR CHAVE] Iniciando busca de {len(chaves)} chaves")
         print(f"[BUSCA POR CHAVE] Certificados disponíveis: {len(certificados)}")
+        
+        # CNPJs cujo limite de 20 consultas/hora na DistribuiçãoDFe foi atingido (cStat=656).
+        # Persistem para toda a sessão — se um CNPJ foi bloqueado, não adianta tentar nas próximas notas.
+        # Inicializa a partir do cache de instância (compartilhado com _baixar_xml_e_pdf)
+        _agora = datetime.now()
+        _dist_rate_limited_cnpjs_session = {
+            cnpj for cnpj, ts in list(self._dist_rl_cache.items())
+            if (_agora - ts).total_seconds() < 3600
+        }
+        if _dist_rate_limited_cnpjs_session:
+            print(f"[BUSCA POR CHAVE] \u26a0\ufe0f {len(_dist_rate_limited_cnpjs_session)} cert(s) com rate limit ativo: {_dist_rate_limited_cnpjs_session}")
         
         for idx, chave in enumerate(chaves):
             if progress.wasCanceled():
@@ -8527,9 +11426,68 @@ class MainWindow(QMainWindow):
             
             print(f"[DEBUG] Ordem de tentativa dos certificados: {[i+1 for i in ordem_certs]}")
             
+            _dist_rate_limited_cnpjs = []  # CNPJs bloqueados por rate limit nesta nota (para mensagem de erro)
+
+            # Atalho: se todos os certs estão na sessão de rate limit E nenhum é o emitente desta nota,
+            # não há nada a tentar — pula direto sem entrar no loop de certificados
+            if not is_cte:
+                _cnpj_emit_nota = chave[6:20]
+                _certs_cnpjs = [''.join(c for c in cert[0] if c.isdigit())[-14:] for cert in certificados]
+                _todos_rl = all(cnpj_c in _dist_rate_limited_cnpjs_session for cnpj_c in _certs_cnpjs)
+                if _todos_rl and _cnpj_emit_nota not in _dist_rate_limited_cnpjs_session:
+                    nao_encontradas += 1
+                    _rl_msg = (f"{chave}: Rate limit SEFAZ (656) em todos os {len(certificados)} certificados. "
+                               f"Aguarde ~1 hora e tente novamente.")
+                    erros.append(_rl_msg)
+                    print(f"[DEBUG] Todos os {len(certificados)} certs com rate limit ativo — pulando nota sem HTTP")
+
+                    # Salva chave no banco como RESUMO pendente para o ciclo automático retentar
+                    # quando a quota de 20 consultas/hora renovar (~1h)
+                    try:
+                        with db._connect() as _conn_rl:
+                            _row_rl = _conn_rl.execute(
+                                "SELECT xml_status FROM notas_detalhadas WHERE chave=?", (chave,)
+                            ).fetchone()
+                        if not _row_rl:
+                            # Nota ainda não existe no banco — cria entrada mínima como RESUMO pendente
+                            _inf_rl = certificados[0][3] if certificados else ''
+                            db.salvar_nota_detalhada({
+                                'chave': chave,
+                                'nsu': '',
+                                'informante': _inf_rl,
+                                'xml_status': 'RESUMO',
+                                'tipo': 'NFe',
+                                'numero': '',
+                                'nome_emitente': '',
+                                'ie_tomador': '',
+                                'cnpj_emitente': chave[6:20],
+                                'data_emissao': None,
+                                'valor': None,
+                                'status': '',
+                                'atualizado_em': datetime.now().isoformat(),
+                            })
+                            print(f"[INFO] Chave {chave[:10]}… salva como RESUMO pendente (retry automático em ~1h)")
+                        else:
+                            print(f"[INFO] Chave {chave[:10]}… já existe no banco ({_row_rl[0]}) — não sobrescrevendo")
+                    except Exception as _e_resumo:
+                        print(f"[AVISO] Não foi possível salvar RESUMO pendente para {chave[:10]}…: {_e_resumo}")
+
+                    continue
+
             for cert_idx in ordem_certs:
                 try:
                     cnpj, path, senha, inf, cuf = certificados[cert_idx]
+                    cnpj = ''.join(c for c in cnpj if c.isdigit())  # normaliza: remove formatação, garante só dígitos
+
+                    # Otimização: se o CNPJ está com rate limit E não é o emitente da chave,
+                    # não há nenhum serviço SEFAZ que possa funcionar — pula sem instanciar NFeService
+                    if not is_cte:
+                        _cnpj_emit_pre = chave[6:20]
+                        if cnpj in _dist_rate_limited_cnpjs_session and cnpj != _cnpj_emit_pre:
+                            print(f"[DEBUG] Cert {cert_idx+1} ({cnpj}): rate limit ativo e não é emitente — pulando sem instanciar serviço")
+                            _dist_rate_limited_cnpjs.append(cnpj)
+                            continue
+                    
                     print(f"[DEBUG] Tentando certificado {cert_idx+1}/{len(certificados)}: CNPJ={cnpj}, Informante={inf}, UF={cuf}")
                     
                     svc = NFeService(path, senha, cnpj, cuf)
@@ -8539,14 +11497,59 @@ class MainWindow(QMainWindow):
                         print(f"[DEBUG] Chamando fetch_prot_cte para chave: {chave}")
                         resp_xml = svc.fetch_prot_cte(chave)
                     else:
-                        print(f"[DEBUG] Chamando fetch_prot_nfe para chave: {chave}")
-                        resp_xml = svc.fetch_prot_nfe(chave)
+                        # NF-e: Tenta via DistribuiçãoDFe primeiro (funciona para emitente E destinatário)
+                        # NFeConsultaProtocolo4 (fetch_prot_nfe) retorna cStat 217 para não-emitentes
+                        # Emitente está na própria chave: chave[6:20]
+                        _cnpj_emit_chave = chave[6:20]
+                        if cnpj in _dist_rate_limited_cnpjs_session:
+                            # Quota já esgotada nesta sessão — não adianta tentar
+                            print(f"[DEBUG] CNPJ {cnpj} com rate limit ativo (656), pulando distribuição")
+                            _dist_rate_limited_cnpjs.append(cnpj)
+                            resp_xml = None
+                            continue
+                        print(f"[DEBUG] Tentando NF-e via DistribuiçãoDFe (consChNFe) para: {chave}")
+                        try:
+                            _resp_dist = svc.fetch_by_chave_dist(chave)
+                        except Exception as _e_dist:
+                            print(f"[DEBUG] fetch_by_chave_dist falhou: {_e_dist}")
+                            _resp_dist = None
+                        if _resp_dist and '<cStat>138</cStat>' in _resp_dist:
+                            # Documento localizado via Distribuição (cStat 138)
+                            resp_xml = _resp_dist
+                            print(f"[SUCCESS] NF-e localizada via DistribuiçãoDFe (cStat=138)!")
+                        else:
+                            _cstat_dist = ''
+                            if _resp_dist:
+                                import re as _re
+                                _m = _re.search(r'<cStat>(\d+)</cStat>', _resp_dist)
+                                _cstat_dist = _m.group(1) if _m else '?'
+                            if _cstat_dist == '656':
+                                # Rate limit SEFAZ (20 consultas/hora por CNPJ) — não adianta tentar protocolo
+                                print(f"[AVISO] ⚠️ Distribuição bloqueada por rate limit (656) para CNPJ {cnpj} — pulando protocolo e marcando para sessão")
+                                _dist_rate_limited_cnpjs_session.add(cnpj)  # persiste para toda a sessão
+                                self._dist_rl_cache[cnpj] = datetime.now()  # compartilha com _baixar_xml_e_pdf
+                                _dist_rate_limited_cnpjs.append(cnpj)
+                                resp_xml = None
+                            elif cnpj == _cnpj_emit_chave:
+                                # Este certificado É o emitente da NF-e — protocolo pode funcionar
+                                # (ex: nota ainda não propagada para distribuição)
+                                print(f"[DEBUG] Distribuição: cStat={_cstat_dist or 'N/A'}, cert=emitente → tentando NFeConsultaProtocolo4")
+                                resp_xml = svc.fetch_prot_nfe(chave)
+                            else:
+                                # Cert não é o emitente E distribuição não encontrou → protocolo retornaria 217
+                                print(f"[DEBUG] Distribuição: cStat={_cstat_dist or 'N/A'}, cert≠emitente ({cnpj}≠{_cnpj_emit_chave}) → pulando protocolo")
                     print(f"[DEBUG] Resposta recebida: {resp_xml[:200] if resp_xml else 'None'}...")
                     
                     if resp_xml:
+                        # cStat 138 = NF-e localizada via Distribuição → break imediatamente
+                        if not is_cte and '<cStat>138</cStat>' in resp_xml:
+                            cert_encontrado = (cnpj, path, senha, inf, cuf)
+                            ultimo_cert_sucesso = cert_idx
+                            print(f"[SUCCESS] Certificado {cert_idx+1} encontrou a NF-e via Distribuição!")
+                            break
                         # Verifica se é erro que indica "tente outro certificado"
-                        # 217 = Nota não consta na base, 226 = UF divergente, 404 = namespace
-                        erros_tentar_outro = ['217', '226', '404']
+                        # 217 = Nota não consta na base, 226 = UF divergente, 404 = namespace, 137 = não disponível via dist
+                        erros_tentar_outro = ['217', '226', '404', '137']
                         tem_erro_cert = any(f'<cStat>{cod}</cStat>' in resp_xml for cod in erros_tentar_outro)
                         
                         if not tem_erro_cert:
@@ -8558,6 +11561,8 @@ class MainWindow(QMainWindow):
                             # Identifica qual erro
                             if '<cStat>217</cStat>' in resp_xml:
                                 print(f"[INFO] Nota não consta na base deste certificado (217), tentando próximo...")
+                            elif '<cStat>137</cStat>' in resp_xml:
+                                print(f"[INFO] Documento não disponível via distribuição (137), tentando próximo...")
                             elif '<cStat>226</cStat>' in resp_xml:
                                 print(f"[INFO] UF divergente (226), tentando próximo...")
                             elif '<cStat>404</cStat>' in resp_xml:
@@ -8575,13 +11580,123 @@ class MainWindow(QMainWindow):
             try:
                 if not resp_xml or not cert_encontrado:
                     nao_encontradas += 1
-                    erros.append(f"{chave}: Não encontrada em nenhum certificado")
-                    print(f"[ERRO] Chave não encontrada em nenhum certificado")
+                    if _dist_rate_limited_cnpjs:
+                        # Normaliza CNPJs (remove duplicatas, garante 14 dígitos)
+                        _cnpjs_rl_uniq = list(dict.fromkeys(
+                            ''.join(c for c in c2 if c.isdigit()) for c2 in _dist_rate_limited_cnpjs
+                        ))
+                        _rl_msg = (f"{chave}: Rate limit SEFAZ/Distribuição (656) para "
+                                   f"{len(_cnpjs_rl_uniq)} certificado(s) — "
+                                   f"{', '.join(_cnpjs_rl_uniq)}. "
+                                   f"Aguarde ~1 hora e tente novamente.")
+                        erros.append(_rl_msg)
+                        print(f"[ERRO] ⚠️ {_rl_msg}")
+
+                        # Salva como RESUMO pendente para retry automático
+                        try:
+                            with db._connect() as _conn_rl2:
+                                _row_rl2 = _conn_rl2.execute(
+                                    "SELECT xml_status FROM notas_detalhadas WHERE chave=?", (chave,)
+                                ).fetchone()
+                            if not _row_rl2:
+                                _inf_rl = certificados[0][3] if certificados else ''
+                                db.salvar_nota_detalhada({
+                                    'chave': chave,
+                                    'nsu': '',
+                                    'informante': _inf_rl,
+                                    'xml_status': 'RESUMO',
+                                    'tipo': 'NFe',
+                                    'numero': '',
+                                    'nome_emitente': '',
+                                    'ie_tomador': '',
+                                    'cnpj_emitente': chave[6:20],
+                                    'data_emissao': None,
+                                    'valor': None,
+                                    'status': '',
+                                    'atualizado_em': datetime.now().isoformat(),
+                                })
+                                print(f"[INFO] Chave {chave[:10]}… salva como RESUMO pendente (retry automático em ~1h)")
+                            else:
+                                print(f"[INFO] Chave {chave[:10]}… já existe no banco ({_row_rl2[0]}) — não sobrescrevendo")
+                        except Exception as _e_resumo2:
+                            print(f"[AVISO] Não foi possível salvar RESUMO pendente: {_e_resumo2}")
+                    else:
+                        erros.append(f"{chave}: Não encontrada em nenhum certificado")
+                        print(f"[ERRO] Chave não encontrada em nenhum certificado")
                     continue
                 
                 if resp_xml:
                     print(f"[DEBUG] Processando resposta XML...")
-                    # Parse da resposta
+                    
+                    # 🆕 Resposta da DistribuiçãoDFe (retDistDFeInt com docZip)?
+                    # Isso acontece quando a NF-e foi encontrada via consChNFe (emitente ou destinatário)
+                    if not is_cte and ('<retDistDFeInt' in resp_xml or (
+                            '<cStat>138</cStat>' in resp_xml and '<docZip' in resp_xml)):
+                        print(f"[DEBUG] Resposta da DistribuiçãoDFe — extraindo XML do docZip...")
+                        import base64, gzip
+                        xml_completo = None
+                        try:
+                            _root_d = etree.fromstring(resp_xml.encode('utf-8') if isinstance(resp_xml, str) else resp_xml)
+                            _ns_d = {'nfe': 'http://www.portalfiscal.inf.br/nfe'}
+                            for dz in (_root_d.findall('.//nfe:docZip', namespaces=_ns_d) + _root_d.findall('.//docZip')):
+                                if dz.text:
+                                    try:
+                                        _xml_b = gzip.decompress(base64.b64decode(dz.text)).decode('utf-8')
+                                        if '<nfeProc' in _xml_b or '<NFe' in _xml_b or '<procNFe' in _xml_b:
+                                            xml_completo = _xml_b
+                                            print(f"[DEBUG] XML extraído do docZip: {len(xml_completo)} bytes")
+                                            break
+                                    except Exception as _e_unzip:
+                                        print(f"[DEBUG] Erro ao descompactar docZip: {_e_unzip}")
+                        except Exception as _e_parse_dist:
+                            print(f"[DEBUG] Erro ao parsear resposta de distribuição: {_e_parse_dist}")
+                        
+                        if not xml_completo:
+                            nao_encontradas += 1
+                            erros.append(f"{chave}: Distribuição retornou 138 mas sem XML válido no docZip")
+                            continue
+                        
+                        cnpj_cert, _, _, inf_correto, _ = cert_encontrado
+                        nome_cert = db.get_cert_nome_by_informante(inf_correto)
+                        
+                        resultado_local = salvar_xml_por_certificado(xml_completo, cnpj_cert, pasta_base="xmls")
+                        caminho_xml = resultado_local[0] if isinstance(resultado_local, tuple) else resultado_local
+                        salvar_xml_por_certificado(xml_completo, cnpj_cert, pasta_base=None, nome_certificado=nome_cert)
+                        
+                        if caminho_xml:
+                            db.registrar_xml(chave, inf_correto, caminho_xml)
+                        else:
+                            db.registrar_xml(chave, inf_correto)
+                        
+                        encontradas += 1
+                        print(f"[SUCCESS] NF-e via Distribuição registrada! ({len(xml_completo)} bytes)")
+                        
+                        try:
+                            print(f"[DEBUG] Extraindo dados completos da NF-e...")
+                            from nfe_search import XMLProcessor
+                            nota_dados = extrair_nota_detalhada(
+                                xml_completo,
+                                XMLProcessor(),
+                                db,
+                                chave,
+                                informante=inf_correto,
+                                nsu_documento=""
+                            )
+                            db.salvar_nota_detalhada(nota_dados)
+                            
+                            certs_cnpjs = [c[0] for c in certificados]
+                            cnpj_emit = nota_dados.get('cnpj_emitente', '')
+                            cnpj_emit_limpo = ''.join(c for c in cnpj_emit if c.isdigit())
+                            if cnpj_emit_limpo in certs_cnpjs:
+                                print(f"[INFO] ✅ NF-e de SAÍDA (emitente = certificado)")
+                            else:
+                                print(f"[INFO] ✅ NF-e de ENTRADA (emitente ≠ certificado)")
+                        except Exception as _e_extract_dist:
+                            print(f"[AVISO] Erro ao extrair dados: {_e_extract_dist}")
+                        
+                        continue  # Processamento via distribuição concluído, próxima nota
+                    
+                    # Parse da resposta (protocolo NF-e ou CT-e)
                     try:
                         tree = etree.fromstring(resp_xml.encode('utf-8') if isinstance(resp_xml, str) else resp_xml)
                         print(f"[DEBUG] XML parseado com sucesso")
@@ -8606,9 +11721,106 @@ class MainWindow(QMainWindow):
                                 
                                 # Se autorizado (código 100 = Autorizado)
                                 if cStat in ['100', '101', '110', '150', '301', '302']:
-                                    # Salva XML completo do CT-e
-                                    xml_completo = etree.tostring(tree, encoding='utf-8').decode('utf-8')
                                     cnpj_cert, _, _, inf_correto, _ = cert_encontrado
+                                    
+                                    import base64, gzip
+                                    xml_completo = None
+                                    
+                                    # ── TIER 1: O retConsSitCTe de algumas SEFAZ já embute o XML completo ──
+                                    print(f"[DEBUG] Tier 1: verificando CT-e embutido no protocolo ({len(resp_xml)} bytes)...")
+                                    try:
+                                        NS_CTE = {'cte': 'http://www.portalfiscal.inf.br/cte'}
+                                        cte_elem = tree.find('.//cte:CTe', namespaces=NS_CTE)
+                                        prot_elem = tree.find('.//cte:protCTe', namespaces=NS_CTE)
+                                        if cte_elem is not None:
+                                            cte_str = etree.tostring(cte_elem, encoding='unicode')
+                                            prot_str = etree.tostring(prot_elem, encoding='unicode') if prot_elem is not None else ''
+                                            xml_completo = (
+                                                '<cteProc versao="4.00" xmlns="http://www.portalfiscal.inf.br/cte">'
+                                                + cte_str + prot_str + '</cteProc>'
+                                            )
+                                            print(f"[DEBUG] Tier 1: CT-e extraído do protocolo ({len(xml_completo)} bytes)")
+                                    except Exception as e_t1:
+                                        print(f"[DEBUG] Tier 1 falhou: {e_t1}")
+                                    
+                                    # ── TIER 2: CTeDistribuicaoDFe (serviço correto para CT-e por chave) ──
+                                    if not xml_completo:
+                                        print(f"[DEBUG] Tier 2: buscando CT-e via CTeDistribuicaoDFe...")
+                                        try:
+                                            from modules.cte_service import CTeService
+                                            _, path_c, senha_c, _, cuf_c = cert_encontrado
+                                            cte_svc = CTeService(path_c, senha_c, cnpj_cert, cuf_c, ambiente='producao')
+                                            # Tenta via NSU de distribuição usando consChNFe (que serve CT-e também)
+                                            resp_dist_cte = svc.fetch_by_chave_dist(chave)
+                                            if resp_dist_cte:
+                                                if '<cteProc' in resp_dist_cte or '<CTe' in resp_dist_cte:
+                                                    xml_completo = resp_dist_cte
+                                                else:
+                                                    _root_d = etree.fromstring(resp_dist_cte.encode('utf-8') if isinstance(resp_dist_cte, str) else resp_dist_cte)
+                                                    _ns_d = {'nfe': 'http://www.portalfiscal.inf.br/nfe'}
+                                                    for dz in (_root_d.findall('.//nfe:docZip', namespaces=_ns_d) + _root_d.findall('.//docZip')):
+                                                        if dz.text:
+                                                            _xml_b = gzip.decompress(base64.b64decode(dz.text)).decode('utf-8')
+                                                            if '<cteProc' in _xml_b or '<CTe' in _xml_b:
+                                                                xml_completo = _xml_b
+                                                                break
+                                            if xml_completo:
+                                                print(f"[DEBUG] Tier 2: CT-e obtido via distribuição ({len(xml_completo)} bytes)")
+                                        except Exception as e_t2:
+                                            print(f"[DEBUG] Tier 2 falhou: {e_t2}")
+                                    
+                                    # ── TIER 3 (fallback crítico): salva como RESUMO a partir dos dados do protocolo ──
+                                    # Garante que o CT-e autorizado SEMPRE aparece na interface.
+                                    if not xml_completo:
+                                        print(f"[AVISO] XML completo CT-e indisponível — salvando como RESUMO a partir do protocolo")
+                                        try:
+                                            # Extrai campos da chave (padrão SEFAZ: cUF|AAMM|CNPJ|mod|serie|nDoc|...)
+                                            numero_cte = str(int(chave[25:34]))
+                                            aamm = chave[2:6]
+                                            data_est = f"20{aamm[:2]}-{aamm[2:4]}-01"
+                                            cnpj_emit_chave = chave[6:20]
+                                            # Tenta obter nome do emitente via protocolo se disponível
+                                            nome_emit = ''
+                                            try:
+                                                _xe = tree.find('.//cte:xNome', namespaces={'cte': 'http://www.portalfiscal.inf.br/cte'})
+                                                if _xe is not None:
+                                                    nome_emit = _xe.text or ''
+                                            except Exception:
+                                                pass
+                                            nota_resumo = {
+                                                'chave': chave,
+                                                'tipo': 'CTe',
+                                                'numero': numero_cte,
+                                                'data_emissao': data_est,
+                                                'cnpj_emitente': cnpj_emit_chave,
+                                                'nome_emitente': nome_emit,
+                                                'informante': inf_correto,
+                                                'status': xMotivo,
+                                                'xml_status': 'RESUMO',
+                                                'valor': '',
+                                                'nome_destinatario': '',
+                                                'cnpj_destinatario': '',
+                                                'uf': chave[:2],
+                                                'nsu': '',
+                                                'ie_tomador': '',
+                                                'atualizado_em': __import__('datetime').datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                                                'cfop': '',
+                                                'vencimento': '',
+                                                'ncm': '',
+                                                'natureza': '',
+                                                'base_icms': '',
+                                                'valor_icms': '',
+                                                'v_ibs': '',
+                                                'v_cbs': '',
+                                            }
+                                            db.salvar_nota_detalhada(nota_resumo)
+                                            encontradas += 1
+                                            print(f"[SUCCESS] CT-e salvo como RESUMO (Tier 3): chave={chave}")
+                                        except Exception as e_t3:
+                                            print(f"[ERRO] Tier 3 falhou: {e_t3}")
+                                            nao_encontradas += 1
+                                            erros.append(f"{chave}: autorizado ({cStat}) mas XML indisponível e RESUMO falhou: {e_t3}")
+                                        continue  # Pula o bloco de armazenamento completo abaixo
                                     
                                     # 🆕 ARMAZENAMENTO AUTOMÁTICO: Salva em backup local (xmls/) + TODOS os perfis ativos
                                     nome_cert = db.get_cert_nome_by_informante(inf_correto)
@@ -8665,9 +11877,36 @@ class MainWindow(QMainWindow):
                                 
                                 # Se autorizada
                                 if cStat in ['100', '101', '110', '150', '301', '302']:
-                                    # Salva XML da NFe
-                                    xml_completo = etree.tostring(tree, encoding='utf-8').decode('utf-8')
                                     cnpj_cert, _, _, inf_correto, _ = cert_encontrado
+                                    
+                                    # ⚠️ fetch_prot_nfe retorna apenas protocolo (retConsSitNFe),
+                                    # não o XML completo da NF-e. É preciso buscá-lo via DistribuiçãoDFe.
+                                    xml_completo = None
+                                    print(f"[DEBUG] Buscando XML completo da NF-e via DistribuiçãoDFe...")
+                                    try:
+                                        import base64, gzip
+                                        resp_dist = svc.fetch_by_chave_dist(chave)
+                                        if resp_dist:
+                                            if '<nfeProc' in resp_dist or '<procNFe' in resp_dist:
+                                                xml_completo = resp_dist
+                                            else:
+                                                # Tenta descompactar docZip
+                                                _root_d = etree.fromstring(resp_dist.encode('utf-8'))
+                                                _ns_d = {'nfe': 'http://www.portalfiscal.inf.br/nfe'}
+                                                for dz in (_root_d.findall('.//nfe:docZip', namespaces=_ns_d) + _root_d.findall('.//docZip')):
+                                                    if dz.text:
+                                                        _xml_b = gzip.decompress(base64.b64decode(dz.text)).decode('utf-8')
+                                                        if '<nfeProc' in _xml_b or '<procNFe' in _xml_b:
+                                                            xml_completo = _xml_b
+                                                            break
+                                    except Exception as e_dist:
+                                        print(f"[AVISO] Erro ao buscar NF-e completa via distribuição: {e_dist}")
+                                    
+                                    if not xml_completo:
+                                        print(f"[AVISO] XML completo NF-e não disponível ainda na DistribuiçãoDFe")
+                                        nao_encontradas += 1
+                                        erros.append(f"{chave}: autorizado ({cStat}) mas XML completo não disponível")
+                                        continue
                                     
                                     # 🆕 ARMAZENAMENTO AUTOMÁTICO: Salva em backup local (xmls/) + TODOS os perfis ativos
                                     nome_cert = db.get_cert_nome_by_informante(inf_correto)
@@ -8691,9 +11930,12 @@ class MainWindow(QMainWindow):
                                     # 🆕 EXTRAÇÃO COMPLETA DE DADOS (tanto de entrada quanto saída)
                                     try:
                                         print(f"[DEBUG] Extraindo dados completos da NF-e...")
+                                        from nfe_search import XMLProcessor
                                         nota_dados = extrair_nota_detalhada(
-                                            xml_completo, 
-                                            db, 
+                                            xml_completo,
+                                            XMLProcessor(),
+                                            db,
+                                            chave,
                                             informante=inf_correto,
                                             nsu_documento=""  # Notas consultadas por chave não têm NSU
                                         )
@@ -8773,8 +12015,8 @@ class MainWindow(QMainWindow):
         mensagem += f"📊 Total processado: {encontradas + nao_encontradas} de {len(chaves)} chaves\n\n"
         mensagem += f"━━━━━━━━━━━━━━━━━━━━━━\n"
         mensagem += f"📂 Onde encontrar as notas:\n"
-        mensagem += f"  • Notas de SAÍDA → aba 'Emitidos pela empresa'\n"
-        mensagem += f"  • Notas de ENTRADA → aba principal\n"
+        mensagem += f"  • Notas de SAÍDA → aba 'Saídas'\n"
+        mensagem += f"  • Notas de ENTRADA → aba 'Entradas'\n"
         mensagem += f"  • XMLs salvos → pasta xmls/ e perfis ativos"
         
         if erros and len(erros) <= 10:
@@ -9985,10 +13227,15 @@ class MainWindow(QMainWindow):
                     valor_icms = None
                     status_nfe = None
                     
-                    # Tenta NFe
+                    # Tenta NFe / NFC-e (mesmo namespace, distingue pelo modelo)
                     if tree.find('.//nfe:infNFe', namespaces=NS) is not None:
-                        tipo = 'NFe'
-                        chave_elem = tree.find('.//nfe:infNFe', namespaces=NS)
+                        inf_nfe = tree.find('.//nfe:infNFe', namespaces=NS)
+                        _mod = tree.findtext('.//nfe:infNFe/nfe:ide/nfe:mod', namespaces=NS) or ''
+                        if _mod.strip() == '65':
+                            tipo = 'NFCe'
+                        else:
+                            tipo = 'NFe'
+                        chave_elem = inf_nfe
                         chave = chave_elem.get('Id', '').replace('NFe', '') if chave_elem is not None else None
                         
                         # Emitente
@@ -10041,7 +13288,173 @@ class MainWindow(QMainWindow):
                         
                         # Valor
                         valor = tree.findtext('.//cte:vPrest/cte:vTPrest', namespaces=NS) or '0'
-                    
+
+                    # Tenta NFS-e formato ABRASF (DominioWeb / sistemas municipais)
+                    elif tree.find('.//ab:InfNfse', namespaces={'ab': 'http:/www.abrasf.org.br/nfse.xsd'}) is not None \
+                            or tree.find('.//InfNfse') is not None:
+                        ns_ab = {'ab': 'http:/www.abrasf.org.br/nfse.xsd'}
+                        tipo = 'NFS-e'
+
+                        def _abrasf_text(parent, tag):
+                            el = parent.find(f'ab:{tag}', ns_ab)
+                            if el is None:
+                                el = parent.find(tag)
+                            return el.text.strip() if el is not None and el.text else ''
+
+                        def _abrasf_el(parent, tag):
+                            el = parent.find(f'ab:{tag}', ns_ab)
+                            if el is None:
+                                el = parent.find(tag)
+                            return el
+
+                        # Collect ALL InfNfse nodes — ListaNotaFiscal may contain many
+                        all_inf_nfse = tree.findall('.//ab:InfNfse', ns_ab) or tree.findall('.//InfNfse')
+
+                        if len(all_inf_nfse) > 1:
+                            # ── MULTI-NOTE FILE: split and process each note individually ─────
+                            from copy import deepcopy as _deepcopy
+                            for _inf in all_inf_nfse:
+                                try:
+                                    _chave  = _inf.get('Id', '')
+                                    _prest  = _abrasf_el(_inf, 'PrestadorServico')
+                                    _id_p   = _abrasf_el(_prest, 'IdentificacaoPrestador') if _prest is not None else None
+                                    _cnpj_e = _abrasf_text(_id_p, 'Cnpj') if _id_p is not None else ''
+                                    _nome_e = _abrasf_text(_prest, 'RazaoSocial') if _prest is not None else ''
+                                    _end_p  = _abrasf_el(_prest, 'Endereco') if _prest is not None else None
+                                    _uf_n   = _abrasf_text(_end_p, 'Uf') if _end_p is not None else ''
+                                    _toma   = _abrasf_el(_inf, 'TomadorServico')
+                                    _id_t   = _abrasf_el(_toma, 'IdentificacaoTomador') if _toma is not None else None
+                                    _cpfc   = _abrasf_el(_id_t, 'CpfCnpj') if _id_t is not None else None
+                                    _cnpj_d = _abrasf_text(_cpfc, 'Cnpj') if _cpfc is not None else ''
+                                    _nome_d = _abrasf_text(_toma, 'RazaoSocial') if _toma is not None else ''
+                                    _num    = _abrasf_text(_inf, 'Numero')
+                                    _data   = _abrasf_text(_inf, 'DataEmissao')
+                                    _serv   = _abrasf_el(_inf, 'Servico')
+                                    _vals   = _abrasf_el(_serv, 'Valores') if _serv is not None else None
+                                    _valor  = _abrasf_text(_vals, 'ValorServicos') if _vals is not None else '0'
+
+                                    _cnpj_e_limpo = ''.join(c for c in _cnpj_e if c.isdigit())
+                                    _cnpj_d_limpo = ''.join(c for c in _cnpj_d if c.isdigit())
+                                    if not _chave and _cnpj_e_limpo and _num:
+                                        _chave = f"{_cnpj_e_limpo}_{_num.zfill(15)}"
+                                    if not _chave:
+                                        continue
+
+                                    # ── De-dup: skip if this numero+emitente already stored ────
+                                    # NFS-e usa chaves construídas (sem padrão único), então
+                                    # a mesma nota pode ter chegado com Id diferente antes.
+                                    try:
+                                        with self.db._connect() as _dc:
+                                            _dup_nd = _dc.execute(
+                                                "SELECT 1 FROM notas_detalhadas "
+                                                "WHERE numero=? AND cnpj_emitente=? LIMIT 1",
+                                                (_num, _cnpj_e_limpo)
+                                            ).fetchone()
+                                            _dup_ns = _dc.execute(
+                                                "SELECT 1 FROM nfse_docs "
+                                                "WHERE n_nfse=? AND prest_cnpj=? LIMIT 1",
+                                                (_num, _cnpj_e_limpo)
+                                            ).fetchone()
+                                        if _dup_nd or _dup_ns:
+                                            print(f"[IMPORTAR] NFS-e {_num} já existe — ignorando duplicata")
+                                            continue
+                                    except Exception as _de:
+                                        print(f"[IMPORTAR] Aviso ao verificar duplicata NFS-e {_num}: {_de}")
+
+                                    _emitido    = _cnpj_e_limpo in cnpjs_empresa
+                                    _informante = _cnpj_e_limpo if _emitido else list(cnpjs_empresa)[0]
+                                    if _emitido:
+                                        emitidos += 1
+                                    else:
+                                        recebidos += 1
+
+                                    _ym = datetime.now().strftime('%Y-%m')
+                                    if _data and len(_data) >= 7:
+                                        _ym = _data[:7]
+
+                                    # Save each note as its own XML file
+                                    _folder = DATA_DIR / 'xmls' / _informante / 'NFSE' / _ym
+                                    _folder.mkdir(parents=True, exist_ok=True)
+                                    _dest = _folder / (f"NFSe_{_num}.xml" if _num else f"{_chave}.xml")
+
+                                    # Serialize the parent <Nfse> node (or <InfNfse> if no parent wrapper)
+                                    _nfse_node = _inf.getparent()
+                                    if _nfse_node is None or _nfse_node is tree:
+                                        _nfse_node = _inf
+                                    _dest.write_bytes(
+                                        etree.tostring(_deepcopy(_nfse_node),
+                                                       xml_declaration=True,
+                                                       encoding='UTF-8',
+                                                       pretty_print=True)
+                                    )
+
+                                    self.db.register_xml_download(_chave, str(_dest), _informante)
+                                    self.db.save_note({
+                                        'chave': _chave,
+                                        'numero': _num,
+                                        'data_emissao': _data[:10] if len(_data) >= 10 else _data,
+                                        'tipo': 'NFS-e',
+                                        'valor': _valor,
+                                        'cnpj_emitente': _cnpj_e_limpo,
+                                        'nome_emitente': _nome_e,
+                                        'nome_destinatario': _nome_d,
+                                        'cnpj_destinatario': _cnpj_d_limpo,
+                                        'ie_tomador': '',
+                                        'cfop': '',
+                                        'ncm': '',
+                                        'natureza': 'Prestação de Serviços',
+                                        'uf': _uf_n,
+                                        'base_icms': '0',
+                                        'valor_icms': '0',
+                                        'status': 'Autorizado',
+                                        'informante': _informante,
+                                        'xml_status': 'COMPLETO',
+                                    })
+                                    try:
+                                        from modules.xml_indexer import parse_nfse_abrasf
+                                        for _ix in parse_nfse_abrasf(str(_dest), informante=_informante):
+                                            if _ix.get('chave'):
+                                                self.db.upsert_nfse_doc(_ix)
+                                    except Exception as _ie:
+                                        print(f"[INDEX] Aviso ao indexar {_dest}: {_ie}")
+
+                                    importados += 1
+                                    print(f"[IMPORTAR] NFS-e {_num} - {'EMITIDO' if _emitido else 'RECEBIDO'} - {_dest}")
+                                except Exception as _e:
+                                    erros.append(f"{xml_file.name} (NFS-e #{_abrasf_text(_inf, 'Numero') if _inf is not None else '?'}): {_e}")
+                                    print(f"[ERRO IMPORTAR NFSE] {xml_file.name}: {_e}")
+                            continue  # ← all notes in this file handled above, skip outer bottom code
+
+                        # ── Single note: fall through to shared bottom code ──────────────
+                        inf_nfse = all_inf_nfse[0] if all_inf_nfse else None
+                        chave = inf_nfse.get('Id', '') if inf_nfse is not None else ''
+
+                        prest_el   = _abrasf_el(inf_nfse, 'PrestadorServico') or type('_', (), {'find': lambda s, *a, **k: None, 'findtext': lambda s, *a, **k: ''})()
+                        id_prest   = _abrasf_el(prest_el, 'IdentificacaoPrestador') if prest_el is not None else None
+                        cnpj_emitente   = _abrasf_text(id_prest, 'Cnpj') if id_prest is not None else ''
+                        nome_emitente   = _abrasf_text(prest_el, 'RazaoSocial') if prest_el is not None else ''
+                        end_prest  = _abrasf_el(prest_el, 'Endereco') if prest_el is not None else None
+                        uf = _abrasf_text(end_prest, 'Uf') if end_prest is not None else ''
+
+                        toma_el    = _abrasf_el(inf_nfse, 'TomadorServico') if inf_nfse is not None else None
+                        id_toma    = _abrasf_el(toma_el, 'IdentificacaoTomador') if toma_el is not None else None
+                        cpfcnpj_el = _abrasf_el(id_toma, 'CpfCnpj') if id_toma is not None else None
+                        cnpj_destinatario = _abrasf_text(cpfcnpj_el, 'Cnpj') if cpfcnpj_el is not None else ''
+                        ie_destinatario   = ''
+                        nome_destinatario = _abrasf_text(toma_el, 'RazaoSocial') if toma_el is not None else ''
+
+                        numero        = _abrasf_text(inf_nfse, 'Numero') if inf_nfse is not None else ''
+                        data_emissao  = _abrasf_text(inf_nfse, 'DataEmissao') if inf_nfse is not None else ''
+                        natureza      = 'Prestação de Serviços'
+
+                        serv_el  = _abrasf_el(inf_nfse, 'Servico') if inf_nfse is not None else None
+                        vals_el  = _abrasf_el(serv_el, 'Valores') if serv_el is not None else None
+                        valor    = _abrasf_text(vals_el, 'ValorServicos') if vals_el is not None else '0'
+
+                        # Reconstrói chave única como CNPJ_prestador + numero se Id não disponível
+                        if cnpj_emitente and numero and not chave:
+                            chave = f"{cnpj_emitente}_{numero.zfill(15)}"
+
                     if not tipo or not chave:
                         erros.append(f"{xml_file.name}: Tipo não identificado")
                         continue
@@ -10049,7 +13462,27 @@ class MainWindow(QMainWindow):
                     # Remove caracteres não numéricos do CNPJ emitente e destinatário
                     cnpj_emitente_limpo = ''.join(c for c in cnpj_emitente if c.isdigit())
                     cnpj_destinatario_limpo = ''.join(c for c in cnpj_destinatario if c.isdigit())
-                    
+
+                    # De-dup para NFS-e: chaves ABRASF não são padronizadas, então a
+                    # mesma nota pode já existir com chave diferente. Verifica numero+emitente.
+                    if tipo == 'NFS-e' and numero and cnpj_emitente_limpo:
+                        try:
+                            with self.db._connect() as _dc2:
+                                _dup2 = _dc2.execute(
+                                    "SELECT 1 FROM notas_detalhadas "
+                                    "WHERE numero=? AND cnpj_emitente=? LIMIT 1",
+                                    (numero, cnpj_emitente_limpo)
+                                ).fetchone() or _dc2.execute(
+                                    "SELECT 1 FROM nfse_docs "
+                                    "WHERE n_nfse=? AND prest_cnpj=? LIMIT 1",
+                                    (numero, cnpj_emitente_limpo)
+                                ).fetchone()
+                            if _dup2:
+                                print(f"[IMPORTAR] NFS-e {numero} já existe — ignorando duplicata")
+                                continue
+                        except Exception as _de2:
+                            print(f"[IMPORTAR] Aviso ao verificar duplicata NFS-e {numero}: {_de2}")
+
                     # Determina se foi emitido pela empresa ou recebido
                     emitido_pela_empresa = cnpj_emitente_limpo in cnpjs_empresa
                     
@@ -10111,7 +13544,36 @@ class MainWindow(QMainWindow):
                         'xml_status': 'COMPLETO'
                     }
                     self.db.save_note(nota_data)
-                    
+
+                    # Indexa na tabela de campos completos (nfe_docs / cte_docs / nfse_docs / nfce_docs)
+                    try:
+                        from modules.xml_indexer import parse_nfe, parse_cte, parse_nfse, parse_nfse_abrasf, parse_nfce
+                        if tipo == 'NFe':
+                            idx = parse_nfe(str(dest_file), informante=informante)
+                            if idx.get('chave'):
+                                self.db.upsert_nfe_doc(idx)
+                        elif tipo == 'NFCe':
+                            idx = parse_nfce(str(dest_file), informante=informante)
+                            if idx.get('chave'):
+                                self.db.upsert_nfce_doc(idx)
+                        elif tipo == 'CTe':
+                            idx = parse_cte(str(dest_file), informante=informante)
+                            if idx.get('chave'):
+                                self.db.upsert_cte_doc(idx)
+                        elif tipo in ('NFS-e', 'NFSe', 'NFSE'):
+                            # Detect ABRASF vs SPED/ADN
+                            header_bytes = Path(dest_file).read_bytes()[:512].decode('utf-8', errors='ignore')
+                            if 'abrasf.org.br' in header_bytes or 'ListaNotaFiscal' in header_bytes:
+                                for idx in parse_nfse_abrasf(str(dest_file), informante=informante):
+                                    if idx.get('chave'):
+                                        self.db.upsert_nfse_doc(idx)
+                            else:
+                                idx = parse_nfse(str(dest_file), informante=informante)
+                                if idx.get('chave'):
+                                    self.db.upsert_nfse_doc(idx)
+                    except Exception as idx_err:
+                        print(f"[INDEX] Aviso ao indexar {dest_file}: {idx_err}")
+
                     importados += 1
                     print(f"[IMPORTAR] {tipo} {numero} - {'EMITIDO' if emitido_pela_empresa else 'RECEBIDO'} - {dest_file}")
                     
@@ -10129,8 +13591,8 @@ class MainWindow(QMainWindow):
             # Mostra resultado
             mensagem = f"Importação concluída!\n\n"
             mensagem += f"✅ Arquivos importados: {importados}\n"
-            mensagem += f"📤 Emitidos pela empresa: {emitidos}\n"
-            mensagem += f"📥 Recebidos de terceiros: {recebidos}\n"
+            mensagem += f"📤 Saídas: {emitidos}\n"
+            mensagem += f"📥 Entradas: {recebidos}\n"
             
             if erros:
                 mensagem += f"\n❌ Erros: {len(erros)}"
@@ -10149,8 +13611,12 @@ class MainWindow(QMainWindow):
     def abrir_exportacao(self):
         """Abre o diálogo de exportação de arquivos."""
         try:
+            # Determina qual tabela está ativa com base na aba selecionada
+            is_emitidos = self.tabs.currentIndex() == 1
+            tabela_ativa = self.table_emitidos if is_emitidos else self.table
+
             # Verifica se há documentos selecionados na tabela
-            selected_rows = self.table.selectionModel().selectedRows()
+            selected_rows = tabela_ativa.selectionModel().selectedRows()
             
             if not selected_rows:
                 QMessageBox.warning(
@@ -10163,17 +13629,21 @@ class MainWindow(QMainWindow):
             # Abre diálogo de exportação
             dialog = ExportDialog(self)
             if dialog.exec_() == QDialog.Accepted:
-                self._executar_exportacao(dialog.get_opcoes())
+                self._executar_exportacao(dialog.get_opcoes(), tabela_ativa)
                 
         except Exception as e:
             QMessageBox.critical(self, "Erro", f"Erro ao abrir exportação: {e}")
             import traceback
             traceback.print_exc()
     
-    def _executar_exportacao(self, opcoes):
+    def _executar_exportacao(self, opcoes, tabela=None):
         """Executa a exportação com as opções selecionadas."""
         from datetime import datetime
         import shutil
+        
+        # Usa a tabela passada como parâmetro; cai na tabela recebidas por compatibilidade
+        if tabela is None:
+            tabela = self.table
         
         try:
             print("\n" + "="*60)
@@ -10195,7 +13665,7 @@ class MainWindow(QMainWindow):
             print(f"📁 Pasta destino: {pasta_destino}")
             
             # Obtém documentos selecionados
-            selected_rows = self.table.selectionModel().selectedRows()
+            selected_rows = tabela.selectionModel().selectedRows()
             total = len(selected_rows)
             print(f"📋 Total de documentos selecionados: {total}")
             
@@ -10220,7 +13690,7 @@ class MainWindow(QMainWindow):
                 #          Emissor CNPJ(6), Emissor Nome(7), Natureza(8), UF(9), 
                 #          Base ICMS(10), Valor ICMS(11), IBS(12), CBS(13), 
                 #          Status(14), CFOP(15), NCM(16), Tomador IE(17), Chave(18)
-                chave = self.table.item(row, 18).text() if self.table.item(row, 18) else None
+                chave = tabela.item(row, 18).text() if tabela.item(row, 18) else None
                 
                 if not chave:
                     print(f"⚠️ Linha {row}: Chave não encontrada na tabela")
@@ -10260,7 +13730,8 @@ class MainWindow(QMainWindow):
                     
                     sucesso_xml = False
                     sucesso_pdf = False
-                    
+                    xml_origem = None  # shared between XML and PDF fallback
+
                     # Exporta XML
                     if opcoes['exportar_xml']:
                         print(f"  🔍 Procurando arquivo XML...")
@@ -10292,8 +13763,9 @@ class MainWindow(QMainWindow):
                             # Se PDF não existe, tenta gerar automaticamente
                             print(f"  ⚠️  PDF não encontrado, tentando gerar...")
                             
-                            # Primeiro encontra o XML
-                            xml_origem = self._encontrar_arquivo_xml(chave)
+                            # Reutiliza xml_origem se já encontrado acima, caso contrário busca agora
+                            if xml_origem is None or not xml_origem.exists():
+                                xml_origem = self._encontrar_arquivo_xml(chave)
                             
                             if xml_origem and xml_origem.exists():
                                 try:
@@ -10312,7 +13784,8 @@ class MainWindow(QMainWindow):
                                     from modules.pdf_simple import generate_danfe_pdf
                                     
                                     tipo = doc.get('tipo', 'NFE')
-                                    if generate_danfe_pdf(xml_content, str(pdf_temp), tipo):
+                                    if generate_danfe_pdf(xml_content, str(pdf_temp), tipo,
+                                                          xml_source_path=str(xml_origem)):
                                         # PDF gerado com sucesso, copia para destino
                                         pdf_destino = pasta_destino / f"{nome_base}.pdf"
                                         print(f"  ✅ PDF gerado com sucesso!")
@@ -10402,30 +13875,120 @@ class MainWindow(QMainWindow):
         """Encontra o arquivo XML de uma chave de acesso."""
         print(f"    🔍 Procurando XML para chave: {chave}")
         
-        # PRIORIDADE 1: Consulta o banco de dados onde o caminho está registrado
+        # PRIORIDADE 1: Consulta o banco de dados — verifica TODOS os caminhos conhecidos
         print(f"    💾 Consultando banco de dados...")
         try:
             with self.db._connect() as conn:
-                cursor = conn.execute(
-                    "SELECT caminho_arquivo FROM xmls_baixados WHERE chave = ?",
+                # 1a) xmls_caminhos: todos os destinos registrados (LOCAL, STORAGE, PERFIL)
+                rows_c = conn.execute(
+                    "SELECT caminho, tipo, perfil_nome FROM xmls_caminhos WHERE chave = ? ORDER BY tipo",
                     (chave,)
-                )
-                row = cursor.fetchone()
-                if row and row[0]:
-                    xml_path = Path(row[0])
-                    print(f"    💾 Caminho encontrado no banco: {xml_path}")
+                ).fetchall()
+                for row_c in rows_c:
+                    xml_path = Path(row_c[0])
+                    label = f"{row_c[1]}{(' / ' + row_c[2]) if row_c[2] else ''}"
                     if xml_path.exists():
-                        print(f"    ✅ XML encontrado no banco: {xml_path}")
+                        print(f"    ✅ XML encontrado no banco [{label}]: {xml_path}")
                         return xml_path
                     else:
-                        print(f"    ⚠️ Caminho do banco não existe mais: {xml_path}")
-                else:
-                    print(f"    ⚠️ Chave não encontrada no banco de xmls_baixados")
+                        print(f"    ⚠️ Caminho registrado não existe mais [{label}]: {xml_path}")
+                # 1b) xmls_baixados: caminho primário (compatibilidade)
+                row_b = conn.execute(
+                    "SELECT caminho_arquivo FROM xmls_baixados WHERE chave = ?",
+                    (chave,)
+                ).fetchone()
+                if row_b and row_b[0]:
+                    xml_path = Path(row_b[0])
+                    if xml_path.exists():
+                        print(f"    ✅ XML encontrado (xmls_baixados): {xml_path}")
+                        return xml_path
+                    else:
+                        print(f"    ⚠️ Caminho de xmls_baixados não existe mais: {xml_path}")
+                elif not rows_c:
+                    print(f"    ⚠️ Chave não encontrada em nenhuma tabela do banco")
         except Exception as e:
             print(f"    ❌ Erro ao consultar banco: {e}")
             import traceback
             traceback.print_exc()
-        
+
+        # PRIORIDADE 1.5: Busca inteligente usando dados de notas_detalhadas
+        # Constrói caminhos diretos sem varrer 12 000+ arquivos
+        try:
+            with self.db._connect() as conn:
+                nd_row = conn.execute(
+                    "SELECT informante, numero, data_emissao, tipo "
+                    "FROM notas_detalhadas WHERE chave = ? LIMIT 1",
+                    (chave,)
+                ).fetchone()
+            if nd_row:
+                inf_nd, numero_nd, data_nd, tipo_nd = nd_row
+                # Nome amigável do certificado (ex: '99-JL COMERCIO')
+                nome_cert_nd = self.db.get_cert_nome_by_informante(inf_nd) if inf_nd else None
+                # Pasta base de armazenamento configurada
+                storage_base = self.db.get_config('storage_pasta_base', '') or ''
+                # Deriva todos os formatos de data possíveis
+                datas_cands = []
+                if data_nd and len(data_nd) >= 7:
+                    ano_d = data_nd[0:4]
+                    mes_d = data_nd[5:7]
+                    datas_cands = [
+                        mes_d + ano_d,           # MMAAAA: 022026
+                        ano_d + '-' + mes_d,     # AAAA-MM: 2026-02
+                        mes_d + '-' + ano_d,     # MM-AAAA: 02-2026
+                        ano_d + mes_d,           # AAAAAMM: 202602
+                    ]
+                tipo_key = (tipo_nd or "NFe").upper().replace("-", "")  # NFE/NFSE/CTE
+                tipo_base_nd = 'NFe' if tipo_key in ('NFE', 'NFSE') else 'CTe'
+                if tipo_key == 'NFSE':
+                    tipo_base_nd = 'NFSe'
+                # Nomes de pasta: CNPJ primeiro, depois nome amigável
+                pastas_cert = [p for p in [inf_nd, nome_cert_nd] if p]
+                candidatos = []
+                for data_fmt in datas_cands:
+                    for pasta_cert in pastas_cert:
+                        if tipo_key == "NFSE":
+                            # NFS-e: xmls/{cert}/{MM}/{NFSE}/
+                            candidatos.append(DATA_DIR / 'xmls' / pasta_cert / data_fmt / 'NFSE')
+                            candidatos.append(DATA_DIR / 'xmls' / pasta_cert / data_fmt / 'NFSe')
+                            if storage_base and storage_base != 'xmls':
+                                candidatos.append(Path(storage_base) / pasta_cert / data_fmt / 'NFSe')
+                                candidatos.append(Path(storage_base) / pasta_cert / data_fmt / 'NFSE')
+                        else:
+                            # NF-e/CT-e — todas as estruturas possíveis
+                            candidatos.append(DATA_DIR / 'xmls' / tipo_base_nd / pasta_cert / data_fmt)
+                            candidatos.append(DATA_DIR / 'xmls' / pasta_cert / data_fmt / tipo_base_nd)
+                            candidatos.append(DATA_DIR / 'xmls' / pasta_cert / data_fmt)
+                            if storage_base and storage_base != 'xmls':
+                                candidatos.append(Path(storage_base) / pasta_cert / data_fmt / tipo_base_nd)
+                                candidatos.append(Path(storage_base) / pasta_cert / data_fmt)
+                                candidatos.append(Path(storage_base) / tipo_base_nd / pasta_cert / data_fmt)
+                # Remove duplicatas preservando ordem
+                seen_c = set()
+                candidatos = [c for c in candidatos if not (str(c) in seen_c or seen_c.add(str(c)))]
+                for pasta in candidatos:
+                    if not pasta.exists():
+                        continue
+                    print(f"    📂 Busca direta: {pasta}")
+                    if tipo_key == "NFSE" and numero_nd:
+                        nfse_xml = pasta / f"NFSe_{numero_nd}.xml"
+                        if nfse_xml.exists():
+                            print(f"    ✅ NFS-e encontrada diretamente: {nfse_xml}")
+                            return nfse_xml
+                    if numero_nd:
+                        for f_xml in pasta.glob(f"{numero_nd}-*.xml"):
+                            print(f"    ✅ Encontrado por número {numero_nd}: {f_xml}")
+                            return f_xml
+                    for f_xml in pasta.rglob("*.xml"):
+                        try:
+                            with open(f_xml, 'r', encoding='utf-8', errors='ignore') as fh:
+                                if chave in fh.read(4000):
+                                    print(f"    ✅ Encontrado por conteúdo (pasta direta): {f_xml}")
+                                    return f_xml
+                        except Exception:
+                            continue
+        except Exception as e_smart:
+            print(f"    ⚠️ Erro na busca inteligente: {e_smart}")
+
         # PRIORIDADE 2: Busca em diretórios estruturados por informante
         # Formato: DATA_DIR/xmls/{informante}/{ano-mes}/{tipo}/{numero}-{nome}.xml
         print(f"    📂 DATA_DIR: {DATA_DIR}")
@@ -10444,25 +14007,27 @@ class MainWindow(QMainWindow):
             print(f"    🔍 Chave não encontrada no nome, buscando no conteúdo dos XMLs...")
             xml_files = list(xmls_dir.rglob("*.xml"))
             
-            # Filtra arquivos de debug/protocolo
+            # Filtra arquivos de debug/protocolo/resumo e pastas de debug
+            _pastas_excluir = {'debug de notas', 'resumos', 'eventos', 'debug', 'outros'}
             xml_files = [
                 f for f in xml_files 
-                if not any(x in f.name.lower() for x in ['debug', 'protocolo', 'request', 'response'])
+                if not any(x in f.name.lower() for x in ['debug', 'protocolo', 'request', 'response', 'resumo', '_extraido_'])
+                and not any(part.lower() in _pastas_excluir for part in f.parts)
             ]
             
             print(f"    📊 Total de XMLs para verificar: {len(xml_files)}")
-            
-            # Busca a chave no conteúdo (limitado aos primeiros 1000 arquivos para não travar)
-            for xml_file in xml_files[:1000]:
+
+            # Busca a chave no conteúdo (varredura completa, sem limite)
+            for xml_file in xml_files:
                 try:
-                    with open(xml_file, 'r', encoding='utf-8') as f:
+                    with open(xml_file, 'r', encoding='utf-8', errors='ignore') as f:
                         content = f.read(2000)  # Lê apenas início do arquivo
                         if chave in content:
                             print(f"    ✅ Arquivo encontrado por conteúdo: {xml_file}")
                             return xml_file
                 except Exception:
                     continue
-            
+
             print(f"    ⚠️ Chave {chave} não encontrada em nenhum XML")
         else:
             print(f"    ⚠️ Diretório não existe: {xmls_dir}")
@@ -10494,26 +14059,122 @@ class MainWindow(QMainWindow):
         """Encontra o arquivo PDF de uma chave de acesso."""
         print(f"    🔍 Procurando PDF para chave: {chave}")
         
-        # PRIORIDADE 1: PDF ao lado do XML registrado no banco
+        # PRIORIDADE 1: PDF ao lado do XML — verifica TODOS os caminhos conhecidos
         try:
             with self.db._connect() as conn:
-                cursor = conn.execute(
+                # 1a) xmls_caminhos: todos os destinos registrados
+                rows_c = conn.execute(
+                    "SELECT caminho, tipo, perfil_nome FROM xmls_caminhos WHERE chave = ? ORDER BY tipo",
+                    (chave,)
+                ).fetchall()
+                for row_c in rows_c:
+                    xml_path = Path(row_c[0])
+                    pdf_path = xml_path.with_suffix('.pdf')
+                    label = f"{row_c[1]}{(' / ' + row_c[2]) if row_c[2] else ''}"
+                    if pdf_path.exists():
+                        print(f"    ✅ PDF encontrado [{label}]: {pdf_path}")
+                        return pdf_path
+                # 1b) xmls_baixados: caminho primário (compatibilidade)
+                row_b = conn.execute(
                     "SELECT caminho_arquivo FROM xmls_baixados WHERE chave = ?",
                     (chave,)
-                )
-                row = cursor.fetchone()
-                if row and row[0]:
-                    xml_path = Path(row[0])
+                ).fetchone()
+                if row_b and row_b[0]:
+                    xml_path = Path(row_b[0])
                     pdf_path = xml_path.with_suffix('.pdf')
                     if pdf_path.exists():
-                        print(f"    ✅ PDF encontrado ao lado do XML: {pdf_path}")
+                        print(f"    ✅ PDF encontrado (xmls_baixados): {pdf_path}")
                         return pdf_path
                     else:
                         print(f"    ⚠️ PDF não existe ao lado do XML: {pdf_path}")
         except Exception as e:
             print(f"    ⚠️ Erro ao consultar banco: {e}")
-        
-        # PRIORIDADE 2: Busca em estrutura por informante  
+
+        # PRIORIDADE 1.5: Busca inteligente usando dados de notas_detalhadas
+        try:
+            with self.db._connect() as conn:
+                nd_row = conn.execute(
+                    "SELECT informante, numero, data_emissao, tipo "
+                    "FROM notas_detalhadas WHERE chave = ? LIMIT 1",
+                    (chave,)
+                ).fetchone()
+            if nd_row:
+                inf_nd, numero_nd, data_nd, tipo_nd = nd_row
+                nome_cert_nd = self.db.get_cert_nome_by_informante(inf_nd) if inf_nd else None
+                storage_base = self.db.get_config('storage_pasta_base', '') or ''
+                datas_cands = []
+                if data_nd and len(data_nd) >= 7:
+                    ano_d = data_nd[0:4]
+                    mes_d = data_nd[5:7]
+                    datas_cands = [
+                        mes_d + ano_d,
+                        ano_d + '-' + mes_d,
+                        mes_d + '-' + ano_d,
+                        ano_d + mes_d,
+                    ]
+                tipo_key = (tipo_nd or "NFe").upper().replace("-", "")
+                tipo_base_nd = 'NFe' if tipo_key in ('NFE', 'NFSE') else 'CTe'
+                if tipo_key == 'NFSE':
+                    tipo_base_nd = 'NFSe'
+                pastas_cert = [p for p in [inf_nd, nome_cert_nd] if p]
+                candidatos = []
+                for data_fmt in datas_cands:
+                    for pasta_cert in pastas_cert:
+                        if tipo_key == "NFSE":
+                            candidatos.append(DATA_DIR / 'xmls' / pasta_cert / data_fmt / 'NFSE')
+                            candidatos.append(DATA_DIR / 'xmls' / pasta_cert / data_fmt / 'NFSe')
+                            # Layout alternativo: xmls/NFSe/{cnpj}/{period}/
+                            candidatos.append(DATA_DIR / 'xmls' / 'NFSe' / pasta_cert / data_fmt)
+                            candidatos.append(DATA_DIR / 'xmls' / 'NFSE' / pasta_cert / data_fmt)
+                            if storage_base and storage_base != 'xmls':
+                                candidatos.append(Path(storage_base) / pasta_cert / data_fmt / 'NFSe')
+                                candidatos.append(Path(storage_base) / pasta_cert / data_fmt / 'NFSE')
+                                candidatos.append(Path(storage_base) / 'NFSe' / pasta_cert / data_fmt)
+                                candidatos.append(Path(storage_base) / 'NFSE' / pasta_cert / data_fmt)
+                        else:
+                            candidatos.append(DATA_DIR / 'xmls' / tipo_base_nd / pasta_cert / data_fmt)
+                            candidatos.append(DATA_DIR / 'xmls' / pasta_cert / data_fmt / tipo_base_nd)
+                            candidatos.append(DATA_DIR / 'xmls' / pasta_cert / data_fmt)
+                            if storage_base and storage_base != 'xmls':
+                                candidatos.append(Path(storage_base) / pasta_cert / data_fmt / tipo_base_nd)
+                                candidatos.append(Path(storage_base) / pasta_cert / data_fmt)
+                                candidatos.append(Path(storage_base) / tipo_base_nd / pasta_cert / data_fmt)
+                seen_c = set()
+                candidatos = [c for c in candidatos if not (str(c) in seen_c or seen_c.add(str(c)))]
+                for pasta in candidatos:
+                    if not pasta.exists():
+                        continue
+                    print(f"    📂 Busca direta PDF: {pasta}")
+                    if tipo_key == "NFSE" and numero_nd:
+                        for ext_s in (f"NFSe_{numero_nd}.pdf", f"NFSe_{numero_nd}.xml"):
+                            p = pasta / ext_s
+                            if p.exists() and p.suffix == '.pdf':
+                                print(f"    ✅ PDF NFS-e encontrado diretamente: {p}")
+                                return p
+                        # PDFs nomeados como "{numero}-{emitente}.pdf" (sem XML par na mesma pasta)
+                        for pdf_g in pasta.glob(f"{numero_nd}-*.pdf"):
+                            print(f"    ✅ PDF NFS-e encontrado por número: {pdf_g}")
+                            return pdf_g
+                    if numero_nd:
+                        for f_xml in pasta.glob(f"{numero_nd}-*.xml"):
+                            f_pdf = f_xml.with_suffix('.pdf')
+                            if f_pdf.exists():
+                                print(f"    ✅ PDF encontrado por número {numero_nd}: {f_pdf}")
+                                return f_pdf
+                    for f_xml in pasta.rglob("*.xml"):
+                        try:
+                            with open(f_xml, 'r', encoding='utf-8', errors='ignore') as fh:
+                                if chave in fh.read(4000):
+                                    f_pdf = f_xml.with_suffix('.pdf')
+                                    if f_pdf.exists():
+                                        print(f"    ✅ PDF encontrado (pasta direta): {f_pdf}")
+                                        return f_pdf
+                        except Exception:
+                            continue
+        except Exception as e_smart:
+            print(f"    ⚠️ Erro na busca inteligente PDF: {e_smart}")
+
+        # PRIORIDADE 2: Busca em estrutura por informante
         xmls_dir = DATA_DIR / 'xmls'
         if xmls_dir.exists():
             print(f"    📂 Buscando em estrutura: {xmls_dir}")
@@ -10528,16 +14189,18 @@ class MainWindow(QMainWindow):
             print(f"    🔍 Chave não encontrada no nome, buscando PDF correspondente ao XML...")
             xml_files = list(xmls_dir.rglob("*.xml"))
             
-            # Filtra arquivos de debug/protocolo
+            # Filtra arquivos de debug/protocolo/resumo e pastas de debug
+            _pastas_excluir_pdf = {'debug de notas', 'resumos', 'eventos', 'debug', 'outros'}
             xml_files = [
                 f for f in xml_files 
-                if not any(x in f.name.lower() for x in ['debug', 'protocolo', 'request', 'response'])
+                if not any(x in f.name.lower() for x in ['debug', 'protocolo', 'request', 'response', 'resumo', '_extraido_'])
+                and not any(part.lower() in _pastas_excluir_pdf for part in f.parts)
             ]
             
-            # Busca a chave no conteúdo do XML e verifica se existe PDF
-            for xml_file in xml_files[:1000]:
+            # Busca a chave no conteúdo do XML e verifica se existe PDF (varredura completa)
+            for xml_file in xml_files:
                 try:
-                    with open(xml_file, 'r', encoding='utf-8') as f:
+                    with open(xml_file, 'r', encoding='utf-8', errors='ignore') as f:
                         content = f.read(2000)  # Lê apenas início do arquivo
                         if chave in content:
                             # Verifica se existe PDF com mesmo nome
@@ -11164,6 +14827,333 @@ class MainWindow(QMainWindow):
             import traceback
             traceback.print_exc()
 
+    def abrir_relatorios_menu(self):
+        """Abre menu de seleção de relatórios."""
+        from PyQt5.QtWidgets import QDialog, QVBoxLayout, QPushButton, QLabel
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Relatórios")
+        dialog.setFixedSize(340, 160)
+        layout = QVBoxLayout(dialog)
+        layout.setSpacing(10)
+        layout.addWidget(QLabel("<b>Selecione o relatório desejado:</b>"))
+
+        btn_ibs = QPushButton("💰  Relatório IBS/CBS")
+        btn_ibs.setMinimumHeight(42)
+        btn_ibs.setToolTip("Relatório analítico com IBS e CBS por nota fiscal")
+        btn_ibs.clicked.connect(lambda: (dialog.accept(), self.abrir_relatorio()))
+        layout.addWidget(btn_ibs)
+
+        btn_notas = QPushButton("📄  Relatório de Notas")
+        btn_notas.setMinimumHeight(42)
+        btn_notas.setToolTip("Relatório de todas as notas da empresa: número, valor e impostos")
+        btn_notas.clicked.connect(lambda: (dialog.accept(), self.abrir_relatorio_notas()))
+        layout.addWidget(btn_notas)
+
+        dialog.exec_()
+
+    def abrir_relatorio_notas(self):
+        """Abre relatório completo de notas da empresa selecionada."""
+        from PyQt5.QtWidgets import (
+            QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
+            QTableWidget, QTableWidgetItem, QHeaderView, QComboBox,
+            QDateEdit, QProgressDialog, QFileDialog, QMessageBox
+        )
+        from PyQt5.QtCore import Qt, QDate
+        from PyQt5.QtGui import QColor
+        from datetime import datetime
+
+        try:
+            dialog = QDialog(self)
+            dialog.setWindowTitle("Relatório de Notas")
+            dialog.resize(1500, 850)
+            layout = QVBoxLayout(dialog)
+
+            # ── Filtros ──────────────────────────────────────────────────────
+            filtro_layout = QHBoxLayout()
+
+            filtro_layout.addWidget(QLabel("De:"))
+            date_inicio = QDateEdit()
+            date_inicio.setCalendarPopup(True)
+            date_inicio.setDate(QDate.currentDate().addMonths(-1))
+            date_inicio.setDisplayFormat("dd/MM/yyyy")
+            filtro_layout.addWidget(date_inicio)
+
+            filtro_layout.addWidget(QLabel("Até:"))
+            date_fim = QDateEdit()
+            date_fim.setCalendarPopup(True)
+            date_fim.setDate(QDate.currentDate())
+            date_fim.setDisplayFormat("dd/MM/yyyy")
+            filtro_layout.addWidget(date_fim)
+
+            filtro_layout.addWidget(QLabel("Empresa:"))
+            combo_empresa = QComboBox()
+            combo_empresa.setMinimumWidth(260)
+            filtro_layout.addWidget(combo_empresa)
+
+            filtro_layout.addWidget(QLabel("Tipo:"))
+            combo_tipo = QComboBox()
+            combo_tipo.addItem("Todos", None)
+            combo_tipo.addItem("NF-e", "NFE")
+            combo_tipo.addItem("CT-e", "CTE")
+            combo_tipo.addItem("NFS-e", "NFSE")
+            filtro_layout.addWidget(combo_tipo)
+
+            btn_atualizar = QPushButton("🔄 Atualizar")
+            btn_atualizar.setMinimumWidth(100)
+            filtro_layout.addWidget(btn_atualizar)
+
+            btn_exportar = QPushButton("📊 Exportar Excel")
+            btn_exportar.setMinimumWidth(130)
+            btn_exportar.setEnabled(False)
+            filtro_layout.addWidget(btn_exportar)
+
+            filtro_layout.addStretch()
+            layout.addLayout(filtro_layout)
+
+            # ── Tabela ───────────────────────────────────────────────────────
+            colunas = ["Nº", "Tipo", "Data Emissão", "Emitente", "CNPJ Emitente",
+                       "Destinatário", "CNPJ Dest.", "Valor Total", "IBS", "CBS",
+                       "Status", "Chave"]
+            table = QTableWidget(0, len(colunas))
+            table.setHorizontalHeaderLabels(colunas)
+            table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+            table.horizontalHeader().setStretchLastSection(True)
+            table.setSelectionBehavior(QTableWidget.SelectRows)
+            table.setEditTriggers(QTableWidget.NoEditTriggers)
+            table.setAlternatingRowColors(True)
+            table.setSortingEnabled(True)
+            # Larguras iniciais
+            for col, w in [(0, 80), (1, 60), (2, 95), (3, 200), (4, 130),
+                           (5, 200), (6, 130), (7, 105), (8, 90), (9, 90),
+                           (10, 100)]:
+                table.setColumnWidth(col, w)
+            layout.addWidget(table)
+
+            # ── Rodapé ───────────────────────────────────────────────────────
+            rodape = QHBoxLayout()
+            lbl_status = QLabel("")
+            rodape.addWidget(lbl_status, 1)
+            lbl_totais_rel = QLabel("")
+            lbl_totais_rel.setStyleSheet("font-weight: bold; padding-left: 12px;")
+            rodape.addWidget(lbl_totais_rel)
+            layout.addLayout(rodape)
+
+            # ── Helpers ──────────────────────────────────────────────────────
+            def fmt_moeda(v):
+                try:
+                    return f"R$ {float(v):,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+                except Exception:
+                    return "R$ 0,00"
+
+            def atualizar_totais_rel():
+                selecionadas = table.selectedItems()
+                linhas = {item.row() for item in selecionadas}
+                if not linhas:
+                    linhas = set(range(table.rowCount()))
+                total_valor = ibs_total = cbs_total = 0.0
+                for r in linhas:
+                    def _cel(c):
+                        it = table.item(r, c)
+                        return it.text() if it else ""
+                    try:
+                        total_valor += float(_cel(7).replace("R$", "").replace(".", "").replace(",", ".").strip() or 0)
+                    except Exception:
+                        pass
+                    try:
+                        ibs_total += float(_cel(8).replace("R$", "").replace(".", "").replace(",", ".").strip() or 0)
+                    except Exception:
+                        pass
+                    try:
+                        cbs_total += float(_cel(9).replace("R$", "").replace(".", "").replace(",", ".").strip() or 0)
+                    except Exception:
+                        pass
+                lbl_totais_rel.setText(
+                    f"Docs: {len(linhas)} | Valor: {fmt_moeda(total_valor)} | "
+                    f"IBS: {fmt_moeda(ibs_total)} | CBS: {fmt_moeda(cbs_total)}"
+                )
+
+            def popular_empresas_notas():
+                combo_empresa.clear()
+                combo_empresa.addItem("Todas as empresas", None)
+                try:
+                    with self.db._connect() as conn:
+                        cursor = conn.execute("PRAGMA table_info(certificados)")
+                        cols = {c[1] for c in cursor.fetchall()}
+                        nome_col = "razao_social" if "razao_social" in cols else (
+                            "nome_certificado" if "nome_certificado" in cols else "informante")
+                        ativo_clause = "WHERE ativo = 1" if "ativo" in cols else ""
+                        cursor = conn.execute(
+                            f"SELECT cnpj_cpf, {nome_col} FROM certificados {ativo_clause} ORDER BY {nome_col}"
+                        )
+                        for cnpj, nome in cursor.fetchall():
+                            if cnpj:
+                                combo_empresa.addItem(f"{cnpj} – {nome or 'Sem Nome'}", cnpj)
+                except Exception:
+                    pass
+                # Pre-seleciona certificado ativo se houver
+                cert_atual = getattr(self, '_selected_cert_cnpj', None)
+                if cert_atual:
+                    for i in range(combo_empresa.count()):
+                        if combo_empresa.itemData(i) == cert_atual:
+                            combo_empresa.setCurrentIndex(i)
+                            break
+
+            def atualizar_relatorio_notas():
+                table.setRowCount(0)
+                btn_exportar.setEnabled(False)
+                lbl_totais_rel.setText("")
+                lbl_status.setText("Buscando...")
+                dialog.repaint()
+
+                data_ini = date_inicio.date().toString("yyyy-MM-dd")
+                data_fim = date_fim.date().toString("yyyy-MM-dd")
+                cnpj_filtro = combo_empresa.currentData()
+                tipo_filtro = combo_tipo.currentData()
+
+                try:
+                    query = """
+                        SELECT numero, tipo, data_emissao, nome_emitente, cnpj_emitente,
+                               nome_destinatario, cnpj_destinatario, valor, v_ibs, v_cbs,
+                               status, chave
+                        FROM notas_detalhadas
+                        WHERE data_emissao BETWEEN ? AND ?
+                    """
+                    params = [data_ini, data_fim]
+
+                    if cnpj_filtro:
+                        query += " AND (cnpj_destinatario = ? OR cnpj_emitente = ? OR informante = ?)"
+                        params.extend([cnpj_filtro, cnpj_filtro, cnpj_filtro])
+
+                    if tipo_filtro:
+                        if tipo_filtro == "NFSE":
+                            query += " AND tipo LIKE '%NFS%'"
+                        else:
+                            query += " AND UPPER(REPLACE(REPLACE(tipo,'-',''),' ','')) = ?"
+                            params.append(tipo_filtro)
+
+                    query += " ORDER BY data_emissao DESC, numero DESC"
+
+                    with self.db._connect() as conn:
+                        rows = conn.execute(query, params).fetchall()
+
+                    if not rows:
+                        lbl_status.setText("Nenhum documento encontrado no período selecionado.")
+                        return
+
+                    progress = QProgressDialog("Preenchendo tabela...", "Cancelar", 0, len(rows), dialog)
+                    progress.setWindowTitle("Relatório de Notas")
+                    progress.setWindowModality(Qt.WindowModal)
+                    progress.show()
+
+                    table.setSortingEnabled(False)
+                    table.setRowCount(len(rows))
+
+                    for idx, row in enumerate(rows):
+                        if progress.wasCanceled():
+                            break
+                        (numero, tipo, data_emissao, nome_emit, cnpj_emit,
+                         nome_dest, cnpj_dest, valor, v_ibs, v_cbs, status, chave) = row
+
+                        try:
+                            data_fmt = datetime.strptime(data_emissao, "%Y-%m-%d").strftime("%d/%m/%Y")
+                        except Exception:
+                            data_fmt = data_emissao or ""
+
+                        try:
+                            valor_f = float(valor) if valor else 0.0
+                        except Exception:
+                            valor_f = 0.0
+                        try:
+                            ibs_f = float(v_ibs) if v_ibs is not None else 0.0
+                        except Exception:
+                            ibs_f = 0.0
+                        try:
+                            cbs_f = float(v_cbs) if v_cbs is not None else 0.0
+                        except Exception:
+                            cbs_f = 0.0
+
+                        vals = [numero or "", tipo or "", data_fmt,
+                                nome_emit or "", cnpj_emit or "",
+                                nome_dest or "", cnpj_dest or "",
+                                fmt_moeda(valor_f), fmt_moeda(ibs_f), fmt_moeda(cbs_f),
+                                status or "", chave or ""]
+                        for col, val in enumerate(vals):
+                            table.setItem(idx, col, QTableWidgetItem(val))
+
+                        if idx % 100 == 0 or idx == len(rows) - 1:
+                            progress.setValue(idx)
+
+                    progress.setValue(len(rows))
+                    table.setSortingEnabled(True)
+                    lbl_status.setText(f"✅ {len(rows)} documento(s) encontrado(s)")
+                    btn_exportar.setEnabled(True)
+                    atualizar_totais_rel()
+
+                except Exception as e:
+                    QMessageBox.critical(dialog, "Erro", f"Erro ao gerar relatório: {e}")
+                    import traceback; traceback.print_exc()
+
+            def exportar_excel_notas():
+                if table.rowCount() == 0:
+                    QMessageBox.warning(dialog, "Aviso", "Não há dados para exportar.")
+                    return
+                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                arquivo, _ = QFileDialog.getSaveFileName(
+                    dialog, "Salvar Relatório Excel",
+                    f"Relatorio_Notas_{ts}.xlsx", "Excel Files (*.xlsx)"
+                )
+                if not arquivo:
+                    return
+                try:
+                    from openpyxl import Workbook
+                    from openpyxl.styles import Font, Alignment, PatternFill
+                except ImportError:
+                    QMessageBox.critical(dialog, "Erro",
+                        "Biblioteca openpyxl não instalada.\n\nExecute: pip install openpyxl")
+                    return
+                try:
+                    wb = Workbook()
+                    ws = wb.active
+                    ws.title = "Relatório de Notas"
+                    headers = [table.horizontalHeaderItem(i).text() for i in range(table.columnCount())]
+                    ws.append(headers)
+                    hfill = PatternFill(start_color="366092", end_color="366092", fill_type="solid")
+                    for cell in ws[1]:
+                        cell.fill = hfill
+                        cell.font = Font(color="FFFFFF", bold=True)
+                        cell.alignment = Alignment(horizontal="center")
+                    for r in range(table.rowCount()):
+                        row_data = [
+                            (table.item(r, c).text() if table.item(r, c) else "")
+                            for c in range(table.columnCount())
+                        ]
+                        ws.append(row_data)
+                    # Alinha colunas monetárias à direita (Valor, IBS, CBS = cols 8,9,10)
+                    for r in range(2, ws.max_row + 1):
+                        for c in [8, 9, 10]:
+                            ws.cell(row=r, column=c).alignment = Alignment(horizontal="right")
+                    for col in ws.columns:
+                        max_len = max((len(str(cell.value or "")) for cell in col), default=10)
+                        ws.column_dimensions[col[0].column_letter].width = min(max_len + 2, 50)
+                    wb.save(arquivo)
+                    QMessageBox.information(dialog, "Sucesso", f"Relatório exportado!\n\n{arquivo}")
+                except Exception as e:
+                    QMessageBox.critical(dialog, "Erro", f"Erro ao exportar: {e}")
+                    import traceback; traceback.print_exc()
+
+            # ── Sinais ───────────────────────────────────────────────────────
+            btn_atualizar.clicked.connect(atualizar_relatorio_notas)
+            btn_exportar.clicked.connect(exportar_excel_notas)
+            table.itemSelectionChanged.connect(atualizar_totais_rel)
+
+            popular_empresas_notas()
+            dialog.exec_()
+
+        except Exception as e:
+            QMessageBox.critical(self, "Erro", f"Erro ao abrir relatório de notas: {e}")
+            import traceback
+            traceback.print_exc()
+
     def do_busca_completa(self):
         """Busca completa: reseta NSU para 0 e busca todos os XMLs da SEFAZ."""
         from datetime import datetime, timedelta
@@ -11234,6 +15224,7 @@ class MainWindow(QMainWindow):
                 'nfes_found': 0,
                 'ctes_found': 0,
                 'nfses_found': 0,
+                'chaves_found': 0,
                 'start_time': datetime.now(),
                 'last_cert': '',
                 'total_docs': 0,
@@ -11245,7 +15236,7 @@ class MainWindow(QMainWindow):
             self.search_progress.setVisible(True)
             self.search_progress.setRange(0, total_informantes)
             self.search_progress.setValue(0)
-            self.search_summary_label.setText(f"🔄 Busca Completa: 0/{total_informantes} certificados | NFes: 0 | CTes: 0 | NFSes: 0")
+            self.search_summary_label.setText(f"🔄 Busca Completa: 0/{total_informantes} certificados | Chaves: 0 | NFes: 0 | CTes: 0 | NFSes: 0")
             
             # Inicia busca na SEFAZ
             self.set_status("🔄 Busca Completa iniciada - aguarde...", 0)
@@ -11274,34 +15265,26 @@ class MainWindow(QMainWindow):
                             elapsed = (datetime.now() - self._search_stats['start_time']).total_seconds()
                             self.search_summary_label.setText(
                                 f"🔄 Busca Completa: {current}/{total_informantes} certificados | "
+                                f"Chaves: {self._search_stats['chaves_found']} | "
                                 f"NFes: {self._search_stats['nfes_found']} | "
                                 f"CTes: {self._search_stats['ctes_found']} | "
                                 f"NFSes: {self._search_stats['nfses_found']} | "
                                 f"Cert: ...{self._search_stats['last_cert']} | "
                                 f"{elapsed:.0f}s"
                             )
+                            
+                            # 🔧 FIX: Força atualização da UI
+                            QApplication.processEvents()
                     
                     # Detecta NFe encontrada
                     if "registrar_xml" in line.lower() or "infnfe" in line.lower():
                         self._search_stats['nfes_found'] += 1
+                        self._search_stats['chaves_found'] += 1
                         elapsed = (datetime.now() - self._search_stats['start_time']).total_seconds()
                         current = min(self._search_stats['current_cert'], total_informantes)
                         self.search_summary_label.setText(
                             f"🔄 Busca Completa: {current}/{total_informantes} certificados | "
-                            f"NFes: {self._search_stats['nfes_found']} | "
-                            f"CTes: {self._search_stats['ctes_found']} | "
-                            f"NFSes: {self._search_stats['nfses_found']} | "
-                            f"Cert: ...{self._search_stats['last_cert']} | "
-                            f"{elapsed:.0f}s"
-                        )
-                    
-                    # Detecta CTe encontrado
-                    if "processar_cte" in line.lower() or "🚛" in line:
-                        self._search_stats['ctes_found'] += 1
-                        elapsed = (datetime.now() - self._search_stats['start_time']).total_seconds()
-                        current = min(self._search_stats['current_cert'], total_informantes)
-                        self.search_summary_label.setText(
-                            f"🔄 Busca Completa: {current}/{total_informantes} certificados | "
+                            f"Chaves: {self._search_stats['chaves_found']} | "
                             f"NFes: {self._search_stats['nfes_found']} | "
                             f"CTes: {self._search_stats['ctes_found']} | "
                             f"NFSes: {self._search_stats['nfses_found']} | "
@@ -11309,6 +15292,48 @@ class MainWindow(QMainWindow):
                             f"{elapsed:.0f}s"
                         )
                         
+                        # 🔧 FIX: Força atualização da UI
+                        QApplication.processEvents()
+                    
+                    # Detecta CTe encontrado
+                    if "processar_cte" in line.lower() or "🚛" in line:
+                        self._search_stats['ctes_found'] += 1
+                        self._search_stats['chaves_found'] += 1
+                        elapsed = (datetime.now() - self._search_stats['start_time']).total_seconds()
+                        current = min(self._search_stats['current_cert'], total_informantes)
+                        self.search_summary_label.setText(
+                            f"🔄 Busca Completa: {current}/{total_informantes} certificados | "
+                            f"Chaves: {self._search_stats['chaves_found']} | "
+                            f"NFes: {self._search_stats['nfes_found']} | "
+                            f"CTes: {self._search_stats['ctes_found']} | "
+                            f"NFSes: {self._search_stats['nfses_found']} | "
+                            f"Cert: ...{self._search_stats['last_cert']} | "
+                            f"{elapsed:.0f}s"
+                        )
+                        
+                        # 🔧 FIX: Força atualização da UI
+                        QApplication.processEvents()
+                    
+                    # Detecta NFS-e processada — usa linha de resumo com número real de documentos
+                    if "nfs-e:" in line.lower() and "documentos processados" in line.lower():
+                        m = re.search(r'nfs-e:\s*(\d+)\s*documentos processados', line, re.IGNORECASE)
+                        if m:
+                            self._search_stats['nfses_found'] += int(m.group(1))
+                        else:
+                            self._search_stats['nfses_found'] += 1
+                        elapsed = (datetime.now() - self._search_stats['start_time']).total_seconds()
+                        current = min(self._search_stats['current_cert'], total_informantes)
+                        self.search_summary_label.setText(
+                            f"🔄 Busca Completa: {current}/{total_informantes} certificados | "
+                            f"Chaves: {self._search_stats['chaves_found']} | "
+                            f"NFes: {self._search_stats['nfes_found']} | "
+                            f"CTes: {self._search_stats['ctes_found']} | "
+                            f"NFSes: {self._search_stats['nfses_found']} | "
+                            f"Cert: ...{self._search_stats['last_cert']} | "
+                            f"{elapsed:.0f}s"
+                        )
+                        QApplication.processEvents()
+                
                 except Exception:
                     pass  # Silencioso para evitar recursão
                 
@@ -11328,11 +15353,15 @@ class MainWindow(QMainWindow):
                     tempo_str = f"{minutos}min {segundos}s" if minutos > 0 else f"{segundos}s"
                     
                     self.search_summary_label.setText(
-                        f"✅ Busca Completa finalizada! NFes: {self._search_stats['nfes_found']} | "
+                        f"✅ Busca Completa finalizada! Chaves: {self._search_stats['chaves_found']} | "
+                        f"NFes: {self._search_stats['nfes_found']} | "
                         f"CTes: {self._search_stats['ctes_found']} | "
                         f"NFSes: {self._search_stats['nfses_found']} | "
                         f"Tempo: {tempo_str}"
                     )
+                    
+                    # 🔧 FIX: Força atualização da UI
+                    QApplication.processEvents()
                     
                     # Extrai tempo de espera (em minutos)
                     import re
@@ -11352,69 +15381,125 @@ class MainWindow(QMainWindow):
             class SearchWorker(QThread):
                 finished_search = pyqtSignal(dict)
                 progress_line = pyqtSignal(str)
+                error_occurred = pyqtSignal(str)
                 
                 def run(self):
-                    res = run_search(progress_cb=lambda line: self.progress_line.emit(line))
-                    self.finished_search.emit(res)
+                    try:
+                        res = run_search(progress_cb=lambda line: self.progress_line.emit(line))
+                        self.finished_search.emit(res)
+                    except Exception as e:
+                        import traceback
+                        error_msg = f"Erro fatal na thread de busca completa: {str(e)}\n{traceback.format_exc()}"
+                        print(error_msg)
+                        self.error_occurred.emit(error_msg)
+                        self.finished_search.emit({"ok": False, "error": error_msg})
             
             def on_finished(res: Dict[str, Any]):
-                # Força finalização da busca
-                self._search_in_progress = False
-                
-                # Oculta progress bar
-                self.search_progress.setVisible(False)
-                
-                if not res.get("ok"):
-                    error = res.get('error') or res.get('message')
-                    print(f"Erro na busca completa: {error}")
-                    self.set_status(f"❌ Erro: {error[:50]}...", 5000)
-                    self.search_summary_label.setText(f"❌ Erro na busca completa")
-                else:
-                    # Busca finalizada com sucesso
-                    elapsed = (datetime.now() - self._search_stats['start_time']).total_seconds()
-                    minutos = int(elapsed / 60)
-                    segundos = int(elapsed % 60)
-                    tempo_str = f"{minutos}min {segundos}s" if minutos > 0 else f"{segundos}s"
+                try:
+                    # Força finalização da busca
+                    self._search_in_progress = False
+                    self._search_worker = None
                     
-                    self.search_summary_label.setText(
-                        f"✅ Busca Completa finalizada! NFes: {self._search_stats['nfes_found']} | "
-                        f"CTes: {self._search_stats['ctes_found']} | "
-                        f"NFSes: {self._search_stats['nfses_found']} | "
-                        f"Tempo: {tempo_str}"
-                    )
-                    self.set_status("✅ Busca completa finalizada", 3000)
+                    # Oculta progress bar
+                    self.search_progress.setVisible(False)
                     
-                    # Atualiza a interface com os novos dados
-                    self.refresh_all()
+                    if not res.get("ok"):
+                        error = res.get('error') or res.get('message')
+                        print(f"Erro na busca completa: {error}")
+                        self.set_status(f"❌ Erro: {error[:50]}...", 5000)
+                        self.search_summary_label.setText(f"❌ Erro na busca completa")
+                    else:
+                        # Busca finalizada com sucesso
+                        elapsed = (datetime.now() - self._search_stats['start_time']).total_seconds()
+                        minutos = int(elapsed / 60)
+                        segundos = int(elapsed % 60)
+                        tempo_str = f"{minutos}min {segundos}s" if minutos > 0 else f"{segundos}s"
+                        
+                        self.search_summary_label.setText(
+                            f"✅ Busca Completa finalizada! Chaves: {self._search_stats['chaves_found']} | "
+                            f"NFes: {self._search_stats['nfes_found']} | "
+                            f"CTes: {self._search_stats['ctes_found']} | "
+                            f"NFSes: {self._search_stats['nfses_found']} | "
+                            f"Tempo: {tempo_str}"
+                        )
+                        self.set_status("✅ Busca completa finalizada", 3000)
+                        
+                        # Atualiza a interface com os novos dados
+                        try:
+                            self.refresh_all()
+                        except Exception as e:
+                            print(f"[ERRO] Falha ao atualizar interface: {e}")
+                        
+                        # Gera PDFs dos novos XMLs em background (como busca normal faz)
+                        QTimer.singleShot(1000, self._gerar_pdfs_faltantes)
+                        
+                        # 🆕 CONSULTA DE EVENTOS após Busca Completa
+                        try:
+                            print("[PÓS-BUSCA COMPLETA] Iniciando consulta de eventos dos documentos baixados...")
+                            QTimer.singleShot(3000, lambda: self._atualizar_status_apos_busca())
+                        except Exception as e:
+                            print(f"[ERRO] Falha ao iniciar consulta de eventos: {e}")
+                        
+                        # 🆕 AUTO-VERIFICAÇÃO INTELIGENTE após Busca Completa
+                        try:
+                            print("[PÓS-BUSCA COMPLETA] Agendando auto-verificação inteligente de XMLs RESUMO...")
+                            # Proteção contra AttributeError - captura método antes do timer
+                            if hasattr(self, '_iniciar_auto_verificacao_inteligente'):
+                                metodo_verificacao = self._iniciar_auto_verificacao_inteligente
+                                QTimer.singleShot(8000, metodo_verificacao)
+                            else:
+                                print("[PÓS-BUSCA COMPLETA] ⚠️ Método _iniciar_auto_verificacao_inteligente não disponível")
+                        except Exception as e:
+                            print(f"[ERRO] Falha ao iniciar auto-verificação: {e}")
+                        
+                        # 🆕 BUSCA DE NFS-e após Busca Completa concluir com sucesso
+                        try:
+                            print("\n" + "="*70)
+                            print("[PÓS-BUSCA COMPLETA] ✅ NF-e e CT-e concluídos!")
+                            print("[PÓS-BUSCA COMPLETA] 📋 NFS-e COMPLETA será processada em 10 segundos...")
+                            print("[PÓS-BUSCA COMPLETA] ℹ️  Busca desde NSU=0 (todos documentos)")
+                            print("="*70 + "\n")
+                            QTimer.singleShot(10000, lambda: self._buscar_nfse_automatico(busca_completa=True))
+                        except Exception as e:
+                            print(f"[ERRO] Falha ao iniciar busca NFS-e: {e}")
+                        
+                        # 🆕 CORREÇÃO DE STATUS após busca completa
+                        try:
+                            print("[PÓS-BUSCA COMPLETA] Agendando correção automática de status XML...")
+                            QTimer.singleShot(12000, lambda: self._executar_correcao_status())
+                        except Exception as e:
+                            print(f"[ERRO] Falha ao iniciar correção de status: {e}")
                     
-                    # 🆕 CONSULTA DE EVENTOS após Busca Completa
-                    print("[PÓS-BUSCA COMPLETA] Iniciando consulta de eventos dos documentos baixados...")
-                    QTimer.singleShot(3000, lambda: self._atualizar_status_apos_busca())
+                    # 🔧 FIX: Força atualização da UI após processar tudo
+                    QApplication.processEvents()
                     
-                    # 🆕 AUTO-VERIFICAÇÃO INTELIGENTE após Busca Completa
-                    print("[PÓS-BUSCA COMPLETA] Agendando auto-verificação inteligente de XMLs RESUMO...")
-                    # Proteção contra AttributeError - captura método antes do timer
-                    try:
-                        metodo_verificacao = self._iniciar_auto_verificacao_inteligente
-                        QTimer.singleShot(8000, metodo_verificacao)
-                    except AttributeError:
-                        print("[PÓS-BUSCA COMPLETA] ⚠️ Método _iniciar_auto_verificacao_inteligente não disponível")
-                    
-                    # 🆕 BUSCA DE NFS-e após Busca Completa concluir com sucesso
-                    print("\n" + "="*70)
-                    print("[PÓS-BUSCA COMPLETA] ✅ NF-e e CT-e concluídos!")
-                    print("[PÓS-BUSCA COMPLETA] 📋 NFS-e COMPLETA será processada em 10 segundos...")
-                    print("[PÓS-BUSCA COMPLETA] ℹ️  Busca desde NSU=0 (todos documentos)")
-                    print("="*70 + "\n")
-                    QTimer.singleShot(10000, lambda: self._buscar_nfse_automatico(busca_completa=True))
+                except Exception as e:
+                    print(f"[ERRO CRÍTICO] Exceção em on_finished: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    self._search_in_progress = False
+                    self.search_progress.setVisible(False)
+                    self.set_status(f"❌ Erro ao finalizar busca: {e}", 5000)
             
             # Conecta sinais e inicia worker
+            # Evita iniciar threads durante shutdown
+            if self._is_shutting_down:
+                return
+            
             self._search_worker = SearchWorker()
             self._search_worker.progress_line.connect(on_progress)
             self._search_worker.finished_search.connect(on_finished)
+            self._search_worker.error_occurred.connect(
+                lambda msg: (
+                    setattr(self, '_search_in_progress', False),
+                    setattr(self, '_search_worker', None),
+                    self.search_progress.setVisible(False),
+                    self.set_status(f"❌ Erro fatal na busca completa: {msg[:60]}", 5000)
+                )
+            )
             self._search_worker.start()
         except Exception as e:
-            QMessageBox.critical(self, "PDFs em lote", f"Erro: {e}")
+            QMessageBox.critical(self, "Busca Completa", f"Erro: {e}")
 
     def open_logs_folder(self):
         try:
@@ -11611,7 +15696,7 @@ class MainWindow(QMainWindow):
                 self, 
                 "Limpar Dados",
                 "Esta ação irá:\n\n"
-                "• Limpar a interface (tabela)\n"
+                "• Limpar TODAS as interfaces (Recebidas e Emitidas)\n"
                 "• Deletar TODOS os XMLs baixados da SEFAZ\n"
                 "• Limpar registros do banco de dados\n\n"
                 "Esta operação NÃO pode ser desfeita!\n\n"
@@ -11626,10 +15711,17 @@ class MainWindow(QMainWindow):
             self.set_status("Limpando dados…")
             QApplication.processEvents()
             
-            # 1. Limpar tabela da interface
+            # 1. Limpar tabelas da interface (Recebidas E Emitidas)
             self.notes = []
             self.table.clearContents()
             self.table.setRowCount(0)
+            
+            # Limpar também a tabela de emitidos
+            if hasattr(self, 'filtered_emitidos_notes'):
+                self.filtered_emitidos_notes = []
+            if hasattr(self, 'table_emitidos'):
+                self.table_emitidos.clearContents()
+                self.table_emitidos.setRowCount(0)
             
             # 2. Limpar banco de dados
             try:
@@ -11674,7 +15766,7 @@ class MainWindow(QMainWindow):
                 self, 
                 "Limpar Dados",
                 f"Operação concluída!\n\n"
-                f"• Interface limpa\n"
+                f"• Interfaces limpas (Recebidas e Emitidas)\n"
                 f"• Banco de dados resetado\n"
                 f"• {deleted_count} XMLs/pastas removidos"
             )
@@ -12528,7 +16620,7 @@ class GerenciadorTrabalhosDialog(QDialog):
         from PyQt5.QtCore import QThread, pyqtSignal
         
         class UpdateStatusWorker(QThread):
-            finished = pyqtSignal(dict)
+            done = pyqtSignal(dict)   # renomeado: não shadowa QThread.finished nativo
             error = pyqtSignal(str)
             
             def __init__(self, db, certs, chaves, callback):
@@ -12547,7 +16639,7 @@ class GerenciadorTrabalhosDialog(QDialog):
                         self.chaves,
                         self.callback
                     )
-                    self.finished.emit(stats)
+                    self.done.emit(stats)
                 except Exception as e:
                     self.error.emit(str(e))
         
@@ -12564,8 +16656,7 @@ class GerenciadorTrabalhosDialog(QDialog):
             
             QMessageBox.information(self, "Concluído", msg)
             
-            # Limpa referência ao worker
-            self._update_worker = None
+            # NOTA: _update_worker será limpo em _cleanup_update_worker
             
             # FORÇA recarregar dados do banco
             if self.parent_window:
@@ -12579,11 +16670,15 @@ class GerenciadorTrabalhosDialog(QDialog):
         def on_error(error_msg):
             progress.close()
             
-            # Limpa referência ao worker
-            self._update_worker = None
-            
             if "Cancelado" not in error_msg:
                 QMessageBox.warning(self, "Erro", f"Erro ao atualizar status:\n{error_msg}")
+        
+        def _cleanup_update_worker():
+            """Chamado pelo sinal NATIVO QThread.finished — thread já parou completamente."""
+            old = self._update_worker
+            self._update_worker = None
+            if old is not None:
+                old.deleteLater()
         
         worker = UpdateStatusWorker(
             self.parent_window.db,
@@ -12591,8 +16686,9 @@ class GerenciadorTrabalhosDialog(QDialog):
             chaves,
             progress_callback
         )
-        worker.finished.connect(on_finished)
+        worker.done.connect(on_finished)
         worker.error.connect(on_error)
+        worker.finished.connect(_cleanup_update_worker)  # nativo: dispara APÓS run() terminar
         worker.start()
         
         # Mantém referência ao worker
@@ -12653,21 +16749,22 @@ class GerenciadorTrabalhosDialog(QDialog):
                 f"• XMLs completos encontrados: {encontrados}\n\n"
                 f"A interface será atualizada."
             )
-            # Remove worker da lista
-            if worker in self.workers:
-                self.workers.remove(worker)
             # Atualiza interface
             if self.parent_window:
                 self.parent_window.refresh_all()
         
         def on_error_reprocessar(msg):
             QMessageBox.critical(self, "Erro", f"Erro no reprocessamento:\n{msg}")
-            # Remove worker da lista
+        
+        def _cleanup_repro2_worker():
+            """Chamado pelo sinal NATIVO QThread.finished — thread já parou completamente."""
             if worker in self.workers:
                 self.workers.remove(worker)
+            worker.deleteLater()
         
-        worker.finished.connect(on_finished_reprocessar)
+        worker.done.connect(on_finished_reprocessar)
         worker.error.connect(on_error_reprocessar)
+        worker.finished.connect(_cleanup_repro2_worker)  # nativo: dispara APÓS run() terminar
         
         # Inicia thread
         worker.start()
@@ -12711,7 +16808,7 @@ class GerenciadorTrabalhosDialog(QDialog):
         
         class AutoVerificacaoWorker(QThread):
             progress = pyqtSignal(str, int, int)  # mensagem, atual, total
-            finished = pyqtSignal(int, int)  # encontrados, nao_encontrados
+            done = pyqtSignal(int, int)  # renomeado: não shadowa QThread.finished nativo
             error = pyqtSignal(str)
             log_message = pyqtSignal(str)  # Para enviar logs ao terminal
             
@@ -12794,7 +16891,7 @@ class GerenciadorTrabalhosDialog(QDialog):
                     total = len(self.notas_resumo)
                     if total == 0:
                         self.log("[AUTO-VERIFICAÇÃO] ℹ️ Nenhuma nota RESUMO encontrada")
-                        self.finished.emit(0, 0)
+                        self.done.emit(0, 0)
                         return
                     
                     # Carrega certificados
@@ -12966,9 +17063,9 @@ class GerenciadorTrabalhosDialog(QDialog):
                         self.log(f"[AUTO-VERIFICAÇÃO]    • Taxa de sucesso: {taxa_sucesso:.1f}%")
                     self.log(f"[AUTO-VERIFICAÇÃO] ========================================")
                     
-                    print("[DEBUG WORKER] Emitindo signal finished...")
-                    self.finished.emit(encontrados, nao_encontrados)
-                    print("[DEBUG WORKER] Signal finished emitido!")
+                    print("[DEBUG WORKER] Emitindo signal done...")
+                    self.done.emit(encontrados, nao_encontrados)
+                    print("[DEBUG WORKER] Signal done emitido!")
                     
                 except Exception as e:
                     import traceback
@@ -13051,9 +17148,6 @@ class GerenciadorTrabalhosDialog(QDialog):
                 f"• XMLs não disponíveis: {nao_encontrados}\n\n"
                 f"A interface será atualizada."
             )
-            # Remove worker da lista
-            if worker in self.workers:
-                self.workers.remove(worker)
             # Atualiza interface
             if self.parent_window:
                 self.parent_window.refresh_all()
@@ -13061,9 +17155,12 @@ class GerenciadorTrabalhosDialog(QDialog):
         def on_error_worker(msg):
             print(f"[DEBUG AUTO-VERIFICAÇÃO] ERRO no worker: {msg}")
             QMessageBox.critical(self, "Erro", f"Erro na auto-verificação:\n{msg}")
-            # Remove worker da lista
+        
+        def _cleanup_autoverif_worker():
+            """Chamado pelo sinal NATIVO QThread.finished — thread já parou completamente."""
             if worker in self.workers:
                 self.workers.remove(worker)
+            worker.deleteLater()
         
         def on_progress_worker(msg, current, total):
             print(f"[DEBUG AUTO-VERIFICAÇÃO] Progresso: {msg} ({current}/{total})")
@@ -13071,8 +17168,9 @@ class GerenciadorTrabalhosDialog(QDialog):
         def on_log_worker(msg):
             print(f"[AUTO-VERIFICAÇÃO LOG] {msg}")
         
-        worker.finished.connect(on_finished_worker)
+        worker.done.connect(on_finished_worker)
         worker.error.connect(on_error_worker)
+        worker.finished.connect(_cleanup_autoverif_worker)  # nativo: dispara APÓS run() terminar
         worker.progress.connect(on_progress_worker)
         worker.log_message.connect(on_log_worker)
         
@@ -13185,7 +17283,7 @@ class GerenciadorTrabalhosDialog(QDialog):
         class AutoVerificacaoInteligenteWorker(QThread):
             """Worker para auto-verificação com controle de quota"""
             progress = pyqtSignal(str, int, int)
-            finished = pyqtSignal(int, int, int)  # encontrados, nao_encontrados, quota_esgotada
+            done = pyqtSignal(int, int, int)  # renomeado: não shadowa QThread.finished nativo
             error = pyqtSignal(str)
             log_message = pyqtSignal(str)
             
@@ -13288,7 +17386,7 @@ class GerenciadorTrabalhosDialog(QDialog):
                             self.log(f"[{idx}/{total}] ⚠️ Erro: {str(e)[:50]}")
                             nao_encontrados += 1
                     
-                    self.finished.emit(encontrados, nao_encontrados, quota_esgotada)
+                    self.done.emit(encontrados, nao_encontrados, quota_esgotada)
                 
                 except Exception as e:
                     import traceback
@@ -13318,9 +17416,16 @@ class GerenciadorTrabalhosDialog(QDialog):
         def on_log(msg):
             print(msg)
         
-        worker.finished.connect(on_finished)
+        def _cleanup_inteligente_worker():
+            """Chamado pelo sinal NATIVO QThread.finished — thread já parou completamente."""
+            if worker in self.workers:
+                self.workers.remove(worker)
+            worker.deleteLater()
+        
+        worker.done.connect(on_finished)
         worker.error.connect(on_error)
         worker.log_message.connect(on_log)
+        worker.finished.connect(_cleanup_inteligente_worker)  # nativo: dispara APÓS run() terminar
         worker.start()
         
         # Guarda referência
@@ -13484,11 +17589,13 @@ class GerenciadorTrabalhosDialog(QDialog):
         combo_tarefa.addItems([
             "Buscar Notas na SEFAZ",
             "Busca Completa (NSU)",
+            "Consultar Eventos/Status",
             "Atualizar Status de Notas",
             "Baixar XMLs Faltantes",
             "Gerar PDFs Pendentes",
             "Manifestação Automática",
-            "Sincronizar Documentos"
+            "Sincronizar Documentos",
+            "Processar Resumos (RESUMO → COMPLETO)"  # 🆕 v1.1.27
         ])
         combo_tarefa.setStyleSheet("""
             QComboBox {
@@ -13513,11 +17620,13 @@ class GerenciadorTrabalhosDialog(QDialog):
         descricoes = {
             0: "Busca novos documentos fiscais na SEFAZ usando distribuição DFe.",
             1: "Busca completa usando NSU (últimos 90 dias).",
-            2: "Consulta status de notas autorizadas (cancelamentos, etc).",
-            3: "Baixa XMLs completos para notas que estão como RESUMO.",
-            4: "Gera arquivos PDF para XMLs que ainda não possuem PDF.",
-            5: "Manifesta automaticamente notas pendentes (Ciência da Operação).",
-            6: "Sincroniza todos os documentos e atualiza banco de dados."
+            2: "Consulta eventos e status (cancelamentos, etc) de documentos recentes.",
+            3: "Consulta status de notas autorizadas (cancelamentos, etc).",
+            4: "Baixa XMLs completos para notas que estão como RESUMO.",
+            5: "Gera arquivos PDF para XMLs que ainda não possuem PDF.",
+            6: "Manifesta automaticamente notas pendentes (Ciência da Operação).",
+            7: "Sincroniza todos os documentos e atualiza banco de dados.",
+            8: "Processa as 781 notas RESUMO, consultando cada chave para baixar XML completo (RESUMO → COMPLETO)."
         }
         
         def atualizar_descricao(index):
@@ -13530,17 +17639,100 @@ class GerenciadorTrabalhosDialog(QDialog):
         grupo_oque.setLayout(layout_oque)
         layout.addWidget(grupo_oque)
         
+        # 🆕 Grupo 3: Encadeamento de tarefas
+        grupo_encadeamento = QGroupBox("🔗 Execução Encadeada")
+        layout_encadeamento = QVBoxLayout()
+        
+        check_apos_busca = QCheckBox("▶️ Executar após 'Buscar Notas na SEFAZ'")
+        check_apos_busca.setToolTip(
+            "Quando marcado, esta tarefa será executada automaticamente\n"
+            "logo após a conclusão da busca de notas na SEFAZ."
+        )
+        check_apos_busca.setStyleSheet("padding: 5px;")
+        
+        # Desabilita se a tarefa selecionada for a própria "Buscar Notas"
+        def atualizar_encadeamento(index):
+            # Não pode executar a busca após ela mesma
+            if index == 0:  # "Buscar Notas na SEFAZ"
+                check_apos_busca.setEnabled(False)
+                check_apos_busca.setChecked(False)
+                check_apos_busca.setToolTip("Esta opção não se aplica à tarefa 'Buscar Notas'")
+            else:
+                check_apos_busca.setEnabled(True)
+                check_apos_busca.setToolTip(
+                    "Quando marcado, esta tarefa será executada automaticamente\n"
+                    "logo após a conclusão da busca de notas na SEFAZ."
+                )
+        
+        combo_tarefa.currentIndexChanged.connect(atualizar_encadeamento)
+        
+        layout_encadeamento.addWidget(check_apos_busca)
+        
+        label_info_encadeamento = QLabel(
+            "💡 Esta opção permite que a tarefa seja executada automaticamente\n"
+            "após cada busca de notas, garantindo atualização contínua."
+        )
+        label_info_encadeamento.setWordWrap(True)
+        label_info_encadeamento.setStyleSheet("""
+            background-color: #fff3cd;
+            padding: 8px;
+            border-radius: 4px;
+            color: #856404;
+            font-size: 10px;
+            border: 1px solid #ffeaa7;
+        """)
+        layout_encadeamento.addWidget(label_info_encadeamento)
+        
+        grupo_encadeamento.setLayout(layout_encadeamento)
+        layout.addWidget(grupo_encadeamento)
+        
         # Carregar configurações salvas
         settings = QSettings('NFE_System', 'BOT_NFE')
+        
+        # 🔄 MIGRAÇÃO AUTOMÁTICA: v1.1.25 → v1.1.26
+        # Adicionamos "Consultar Eventos/Status" no índice 2, então índices >= 2 precisam +1
+        config_version = settings.value('agendador/config_version', 1, type=int)
+        tarefa_index = settings.value('agendador/tarefa_index', 0, type=int)
+        
+        if config_version == 1 and tarefa_index >= 2:
+            # Migra índices antigos: 2→3, 3→4, 4→5, 5→6, 6→7
+            tarefa_index += 1
+            settings.setValue('agendador/tarefa_index', tarefa_index)
+            settings.setValue('agendador/config_version', 2)  # Marca como migrado
+            print(f"[AGENDADOR] ✅ Migração automática aplicada: índice {tarefa_index-1} → {tarefa_index}")
+        
         check_ao_iniciar.setChecked(settings.value('agendador/ao_iniciar', False, type=bool))
         check_horario.setChecked(settings.value('agendador/horario_ativo', False, type=bool))
         time_edit.setTime(QTime.fromString(settings.value('agendador/horario', '08:00'), 'HH:mm'))
         check_intervalo.setChecked(settings.value('agendador/intervalo_ativo', False, type=bool))
         spin_intervalo.setValue(settings.value('agendador/intervalo_horas', 2, type=int))
-        combo_tarefa.setCurrentIndex(settings.value('agendador/tarefa_index', 0, type=int))
+        combo_tarefa.setCurrentIndex(tarefa_index)
+        check_apos_busca.setChecked(settings.value('agendador/executar_apos_busca', False, type=bool))
+        
+        # Atualiza estado inicial do checkbox de encadeamento
+        atualizar_encadeamento(combo_tarefa.currentIndex())
         
         # Botões
         layout_botoes = QHBoxLayout()
+        
+        # 🆕 Botão Executar Agora (v1.1.27)
+        btn_executar_agora = QPushButton("▶️ Executar Agora")
+        btn_executar_agora.setStyleSheet("""
+            QPushButton {
+                background-color: #007bff;
+                color: white;
+                padding: 10px 20px;
+                border-radius: 4px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #0056b3;
+            }
+        """)
+        btn_executar_agora.setToolTip(
+            "Executa a tarefa selecionada IMEDIATAMENTE,\n"
+            "sem precisar salvar a configuração do agendamento."
+        )
         
         btn_salvar = QPushButton("💾 Salvar Configuração")
         btn_salvar.setStyleSheet("""
@@ -13569,6 +17761,40 @@ class GerenciadorTrabalhosDialog(QDialog):
             }
         """)
         
+        def executar_agora():
+            """Executa a tarefa selecionada imediatamente"""
+            tarefa_index = combo_tarefa.currentIndex()
+            tarefa_nome = combo_tarefa.currentText()
+            
+            # Confirma execução
+            reply = QMessageBox.question(
+                dialog,
+                "Executar Tarefa Agora",
+                f"🚀 Deseja executar a seguinte tarefa IMEDIATAMENTE?\n\n"
+                f"📋 Tarefa: {tarefa_nome}\n\n"
+                f"ℹ️ {descricoes.get(tarefa_index, '')}\n\n"
+                f"A tarefa será executada em segundo plano.\n"
+                f"Você pode continuar usando o sistema normalmente.",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.Yes
+            )
+            
+            if reply != QMessageBox.Yes:
+                return
+            
+            # Fecha o diálogo
+            dialog.accept()
+            
+            # Executa a tarefa
+            print(f"[AGENDADOR] ▶️ Executando tarefa manualmente: {tarefa_nome}")
+            self.parent_window.set_status(f"▶️ Executando: {tarefa_nome}...")
+            
+            # Executa usando o método do agendador
+            self.parent_window._executar_tarefa_agendada(tarefa_index, tarefa_nome)
+            
+            # Feedback
+            self.parent_window.set_status(f"✅ Tarefa '{tarefa_nome}' iniciada com sucesso!", 5000)
+        
         def salvar_configuracao():
             # Valida se ao menos uma opção foi marcada
             if not (check_ao_iniciar.isChecked() or check_horario.isChecked() or check_intervalo.isChecked()):
@@ -13587,6 +17813,8 @@ class GerenciadorTrabalhosDialog(QDialog):
             settings.setValue('agendador/intervalo_horas', spin_intervalo.value())
             settings.setValue('agendador/tarefa_index', combo_tarefa.currentIndex())
             settings.setValue('agendador/tarefa_nome', combo_tarefa.currentText())
+            settings.setValue('agendador/executar_apos_busca', check_apos_busca.isChecked())
+            settings.setValue('agendador/config_version', 3)  # v1.1.27
             
             QMessageBox.information(
                 dialog,
@@ -13595,7 +17823,8 @@ class GerenciadorTrabalhosDialog(QDialog):
                 f"Tarefa: {combo_tarefa.currentText()}\n"
                 f"Ao iniciar: {'Sim' if check_ao_iniciar.isChecked() else 'Não'}\n"
                 f"Horário: {time_edit.time().toString('HH:mm') if check_horario.isChecked() else 'Não'}\n"
-                f"Intervalo: {f'{spin_intervalo.value()}h' if check_intervalo.isChecked() else 'Não'}"
+                f"Intervalo: {f'{spin_intervalo.value()}h' if check_intervalo.isChecked() else 'Não'}\n"
+                f"Após Busca: {'Sim ▶️' if check_apos_busca.isChecked() else 'Não'}"
             )
             
             # 🔧 CORREÇÃO: Atualiza lista de tarefas após salvar
@@ -13603,9 +17832,12 @@ class GerenciadorTrabalhosDialog(QDialog):
             
             dialog.accept()
         
+        btn_executar_agora.clicked.connect(executar_agora)
         btn_salvar.clicked.connect(salvar_configuracao)
         btn_cancelar.clicked.connect(dialog.reject)
         
+        layout_botoes.addWidget(btn_executar_agora)
+        layout_botoes.addStretch()  # Espaço entre executar e salvar
         layout_botoes.addWidget(btn_salvar)
         layout_botoes.addWidget(btn_cancelar)
         layout.addLayout(layout_botoes)
@@ -13620,7 +17852,7 @@ class GerenciadorTrabalhosDialog(QDialog):
         class ReprocessarResumosWorker(QThread):
             """Worker para reprocessar notas com status RESUMO"""
             progress = pyqtSignal(str, int, int)  # mensagem, atual, total
-            finished = pyqtSignal(int, int)  # encontrados, total
+            done = pyqtSignal(int, int)  # renomeado: não shadowa QThread.finished nativo
             error = pyqtSignal(str)
             log_message = pyqtSignal(str)
             
@@ -13817,7 +18049,7 @@ class GerenciadorTrabalhosDialog(QDialog):
                     self.log(f"[REPROCESSAR] ✅ Concluído: {encontrados}/{total} XMLs baixados")
                     self.log(f"[REPROCESSAR] ========================================")
                     
-                    self.finished.emit(encontrados, total)
+                    self.done.emit(encontrados, total)
                     
                 except Exception as e:
                     self.log(f"[REPROCESSAR] ❌ ERRO: {str(e)}")
@@ -13874,124 +18106,20 @@ class GerenciadorTrabalhosDialog(QDialog):
         def on_log_repro(msg):
             print(msg)
         
+        def _cleanup_repro_worker():
+            """Chamado pelo sinal NATIVO QThread.finished — thread já parou completamente."""
+            # O worker_repro já foi removido de _trabalhos_ativos pelo on_finished_repro;
+            # aqui apenas agendamos a destruição segura.
+            worker_repro.deleteLater()
+        
         worker_repro.progress.connect(on_progress_repro)
-        worker_repro.finished.connect(on_finished_repro)
+        worker_repro.done.connect(on_finished_repro)
         worker_repro.error.connect(on_error_repro)
         worker_repro.log_message.connect(on_log_repro)
+        worker_repro.finished.connect(_cleanup_repro_worker)  # nativo: dispara APÓS run() terminar
         
         # Inicia worker
         worker_repro.start()
-    
-    def _iniciar_reprocessamento_resumos(self):
-        """Reprocessa notas que estão como RESUMO, buscando XML completo"""
-        # Busca notas RESUMO
-        with self.db._connect() as conn:
-            cursor = conn.execute("""
-                SELECT chave, informante, nome_emitente 
-                FROM notas_detalhadas 
-                WHERE xml_status = 'RESUMO'
-                ORDER BY data_emissao DESC
-            """)
-            notas_resumo = [{'chave': r[0], 'informante': r[1], 'nome_emitente': r[2]} for r in cursor]
-        
-        if not notas_resumo:
-            QMessageBox.information(
-                self,
-                "Nenhuma nota pendente",
-                "Não há notas com status RESUMO para reprocessar."
-            )
-            return
-        
-        # Cria e inicia o worker
-        worker = AutoVerificacaoWorker(self.parent_window, notas_resumo)
-        
-        # Adiciona à lista de trabalhos ativos
-        trabalho = {
-            'tipo': 'auto_verificacao',
-            'nome': 'Auto-Verificação de XMLs',
-            'status': 'Em execução',
-            'progresso': 0,
-            'total': len(notas_resumo),
-            'mensagem': 'Iniciando...',
-            'worker': worker
-        }
-        self.parent_window._trabalhos_ativos.append(trabalho)
-        
-        # Conecta sinais
-        def on_progress(msg, atual, total):
-            for t in self.parent_window._trabalhos_ativos:
-                if t.get('tipo') == 'auto_verificacao':
-                    t['progresso'] = atual
-                    t['total'] = total
-                    t['mensagem'] = msg
-                    break
-        
-        def on_finished(encontrados, nao_encontrados):
-            # Remove da lista de trabalhos
-            self.parent_window._trabalhos_ativos = [
-                t for t in self.parent_window._trabalhos_ativos
-                if t.get('tipo') != 'auto_verificacao'
-            ]
-            
-            # Atualiza interface de forma OTIMIZADA (usa QTimer para garantir execução na thread principal)
-            from PyQt5.QtCore import QTimer
-            def atualizar_interface():
-                try:
-                    print("[AUTO-VERIFICAÇÃO] Atualizando interface...")
-                    
-                    # 1. Apenas corrige xml_status (rápido - já está otimizado)
-                    self.parent_window._corrigir_xml_status_automatico()
-                    
-                    # 2. Apenas atualiza a tabela SEM recarregar dados
-                    # (os dados em self.notes já estão corretos, só precisa re-renderizar)
-                    self.parent_window._refresh_table_only()
-                    
-                    print("[AUTO-VERIFICAÇÃO] Interface atualizada!")
-                except Exception as e:
-                    print(f"[AUTO-VERIFICAÇÃO] Erro ao atualizar interface: {e}")
-                    import traceback
-                    traceback.print_exc()
-            
-            # Executa atualização com delay pequeno (evita travamento)
-            QTimer.singleShot(200, atualizar_interface)
-            
-            # Mostra resultado IMEDIATAMENTE (não espera atualização)
-            print(f"[AUTO-VERIFICAÇÃO] Exibindo resultado final...")
-            QMessageBox.information(
-                self,
-                "Auto-Verificação Concluída",
-                f"Verificação concluída!\n\n"
-                f"✅ XMLs encontrados: {encontrados}\n"
-                f"❌ XMLs não encontrados: {nao_encontrados}\n\n"
-                f"A interface será atualizada em instantes."
-            )
-        
-        def on_error(error_msg):
-            # Remove da lista de trabalhos
-            self.parent_window._trabalhos_ativos = [
-                t for t in self.parent_window._trabalhos_ativos
-                if t.get('tipo') != 'auto_verificacao'
-            ]
-            
-            if "Cancelado" not in error_msg:
-                QMessageBox.warning(self, "Erro", f"Erro na auto-verificação:\n{error_msg}")
-        
-        worker.progress.connect(on_progress)
-        worker.finished.connect(on_finished)
-        worker.error.connect(on_error)
-        
-        # Conecta sinal de log para imprimir no terminal
-        worker.log_message.connect(lambda msg: print(msg, flush=True))
-        
-        worker.start()
-        
-        QMessageBox.information(
-            self,
-            "Auto-Verificação Iniciada",
-            f"A auto-verificação foi iniciada em segundo plano.\n\n"
-            f"Total de notas: {len(notas_resumo)}\n\n"
-            f"Você pode acompanhar o progresso nesta janela."
-        )
     
     def _atualizar_lista(self):
         """Atualiza a lista de trabalhos"""
@@ -14015,6 +18143,58 @@ class GerenciadorTrabalhosDialog(QDialog):
                 'mensagem': 'Buscando XMLs completos...',
                 'total': 100,
                 'worker': worker
+            })
+        
+        # 🆕 3. Tarefa agendada (lê do QSettings)
+        from PyQt5.QtCore import QSettings
+        settings = QSettings('NFE_System', 'BOT_NFE')
+        
+        # Verifica se existe alguma configuração válida (usa tarefa_nome como chave principal)
+        tarefa_nome = settings.value('agendador/tarefa_nome', None, type=str)
+        tarefa_agendada_index = settings.value('agendador/tarefa_index', None, type=int)
+        
+        # Só adiciona se AMBOS existirem (garante que há configuração válida)
+        if tarefa_nome and tarefa_agendada_index is not None:
+            ao_iniciar = settings.value('agendador/ao_iniciar', False, type=bool)
+            horario_ativo = settings.value('agendador/horario_ativo', False, type=bool)
+            horario = settings.value('agendador/horario', '08:00', type=str)
+            intervalo_ativo = settings.value('agendador/intervalo_ativo', False, type=bool)
+            intervalo_horas = settings.value('agendador/intervalo_horas', 2, type=int)
+            apos_busca = settings.value('agendador/executar_apos_busca', False, type=bool)
+            
+            # Monta descrição de quando executa
+            quando = []
+            if ao_iniciar:
+                quando.append("Ao iniciar")
+            if horario_ativo:
+                quando.append(f"Às {horario}")
+            if intervalo_ativo:
+                quando.append(f"A cada {intervalo_horas}h")
+            if apos_busca:
+                quando.append("Após busca ▶️")
+            
+            quando_texto = ", ".join(quando) if quando else "Não configurado"
+            
+            trabalhos.append({
+                'tipo': 'tarefa_agendada',
+                'nome': f"⏰ {tarefa_nome}",
+                'status': 'Agendada',
+                'progresso': 0,
+                'mensagem': quando_texto,
+                'total': 100,
+                'worker': None  # Tarefa agendada não tem worker
+            })
+        
+        # 📌 Placeholder: Se não houver nenhuma tarefa, mostra mensagem informativa
+        if len(trabalhos) == 0:
+            trabalhos.append({
+                'tipo': 'placeholder',
+                'nome': 'ℹ️ Nenhuma tarefa ativa ou agendada',
+                'status': 'Aguardando',
+                'progresso': 0,
+                'mensagem': 'Clique em "⏰ Agendar Tarefa" para criar uma nova tarefa automática',
+                'total': 100,
+                'worker': None
             })
         
         self.table.setRowCount(len(trabalhos))
@@ -14199,14 +18379,76 @@ class GerenciadorTrabalhosDialog(QDialog):
             acoes_layout.setSpacing(10)
             
             worker = trabalho.get('worker')
+            tipo_trabalho = trabalho.get('tipo', '')
             
-            if status == 'Em execução':
-                btn_pausar = QPushButton("⏸ Pausar")
-                btn_pausar.setFixedHeight(36)
-                btn_pausar.setCursor(Qt.PointingHandCursor)
-                btn_pausar.setStyleSheet("""
+            # 📌 Se for placeholder, não mostra botões de ação
+            if tipo_trabalho == 'placeholder':
+                info_label = QLabel("Nenhuma ação disponível")
+                info_label.setStyleSheet("""
+                    QLabel {
+                        color: #999999;
+                        font-size: 11px;
+                        font-style: italic;
+                        padding: 8px;
+                    }
+                """)
+                acoes_layout.addWidget(info_label)
+                acoes_layout.addStretch()
+            else:
+                # Botões de ação normais (Pausar, Retomar, Cancelar)
+                if status == 'Em execução':
+                    btn_pausar = QPushButton("⏸ Pausar")
+                    btn_pausar.setFixedHeight(36)
+                    btn_pausar.setCursor(Qt.PointingHandCursor)
+                    btn_pausar.setStyleSheet("""
+                        QPushButton {
+                            background-color: #ff8c00;
+                            color: white;
+                            border: none;
+                            padding: 6px 16px;
+                            border-radius: 5px;
+                            font-weight: bold;
+                            font-size: 12px;
+                        }
+                        QPushButton:hover {
+                            background-color: #ff7700;
+                        }
+                        QPushButton:pressed {
+                            background-color: #e67700;
+                        }
+                    """)
+                    btn_pausar.clicked.connect(lambda checked, w=worker, t=trabalho: self._pausar(w, t))
+                    acoes_layout.addWidget(btn_pausar)
+                elif status == 'Pausado':
+                    btn_retomar = QPushButton("▶ Retomar")
+                    btn_retomar.setFixedHeight(36)
+                    btn_retomar.setCursor(Qt.PointingHandCursor)
+                    btn_retomar.setStyleSheet("""
+                        QPushButton {
+                            background-color: #16c60c;
+                            color: white;
+                            border: none;
+                            padding: 6px 16px;
+                            border-radius: 5px;
+                            font-weight: bold;
+                            font-size: 12px;
+                        }
+                        QPushButton:hover {
+                            background-color: #13a10e;
+                        }
+                        QPushButton:pressed {
+                            background-color: #0e7c0a;
+                        }
+                    """)
+                    btn_retomar.clicked.connect(lambda checked, w=worker, t=trabalho: self._retomar(w, t))
+                    acoes_layout.addWidget(btn_retomar)
+                
+                btn_cancelar = QPushButton("✖ Cancelar")
+                btn_cancelar.setFixedHeight(36)
+                btn_cancelar.setCursor(Qt.PointingHandCursor)
+                btn_cancelar.setStyleSheet("""
                     QPushButton {
-                        background-color: #ff8c00;
+                        background-color: #d13438;
                         color: white;
                         border: none;
                         padding: 6px 16px;
@@ -14215,60 +18457,14 @@ class GerenciadorTrabalhosDialog(QDialog):
                         font-size: 12px;
                     }
                     QPushButton:hover {
-                        background-color: #ff7700;
+                        background-color: #b52d30;
                     }
                     QPushButton:pressed {
-                        background-color: #e67700;
+                        background-color: #992628;
                     }
                 """)
-                btn_pausar.clicked.connect(lambda checked, w=worker, t=trabalho: self._pausar(w, t))
-                acoes_layout.addWidget(btn_pausar)
-            elif status == 'Pausado':
-                btn_retomar = QPushButton("▶ Retomar")
-                btn_retomar.setFixedHeight(36)
-                btn_retomar.setCursor(Qt.PointingHandCursor)
-                btn_retomar.setStyleSheet("""
-                    QPushButton {
-                        background-color: #16c60c;
-                        color: white;
-                        border: none;
-                        padding: 6px 16px;
-                        border-radius: 5px;
-                        font-weight: bold;
-                        font-size: 12px;
-                    }
-                    QPushButton:hover {
-                        background-color: #13a10e;
-                    }
-                    QPushButton:pressed {
-                        background-color: #0e7c0a;
-                    }
-                """)
-                btn_retomar.clicked.connect(lambda checked, w=worker, t=trabalho: self._retomar(w, t))
-                acoes_layout.addWidget(btn_retomar)
-            
-            btn_cancelar = QPushButton("✖ Cancelar")
-            btn_cancelar.setFixedHeight(36)
-            btn_cancelar.setCursor(Qt.PointingHandCursor)
-            btn_cancelar.setStyleSheet("""
-                QPushButton {
-                    background-color: #d13438;
-                    color: white;
-                    border: none;
-                    padding: 6px 16px;
-                    border-radius: 5px;
-                    font-weight: bold;
-                    font-size: 12px;
-                }
-                QPushButton:hover {
-                    background-color: #b52d30;
-                }
-                QPushButton:pressed {
-                    background-color: #992628;
-                }
-            """)
-            btn_cancelar.clicked.connect(lambda checked, w=worker, t=trabalho: self._cancelar(w, t))
-            acoes_layout.addWidget(btn_cancelar)
+                btn_cancelar.clicked.connect(lambda checked, w=worker, t=trabalho: self._cancelar(w, t))
+                acoes_layout.addWidget(btn_cancelar)
             
             acoes_layout.addStretch()
             acoes_widget.setLayout(acoes_layout)
@@ -14276,45 +18472,62 @@ class GerenciadorTrabalhosDialog(QDialog):
         
         # Atualizar rodapé com informações detalhadas
         if trabalhos:
-            em_execucao = sum(1 for t in trabalhos if t.get('status') == 'Em execução')
-            pausados = sum(1 for t in trabalhos if t.get('status') == 'Pausado')
-            concluidos = sum(1 for t in trabalhos if t.get('status') == 'Concluído')
+            # Filtra placeholders para não contar nas estatísticas
+            trabalhos_reais = [t for t in trabalhos if t.get('tipo') != 'placeholder']
             
-            if em_execucao > 0:
-                self.status_label.setText(f"✅ {em_execucao} trabalho(s) em execução")
-                self.status_label.setStyleSheet("""
-                    QLabel {
-                        background-color: transparent;
-                        color: #16c60c;
-                        font-size: 12px;
-                        font-weight: bold;
-                    }
-                """)
-            elif pausados > 0:
-                self.status_label.setText(f"⏸ {pausados} trabalho(s) pausado(s)")
-                self.status_label.setStyleSheet("""
-                    QLabel {
-                        background-color: transparent;
-                        color: #ff8c00;
-                        font-size: 12px;
-                        font-weight: bold;
-                    }
-                """)
+            if trabalhos_reais:
+                em_execucao = sum(1 for t in trabalhos_reais if t.get('status') == 'Em execução')
+                pausados = sum(1 for t in trabalhos_reais if t.get('status') == 'Pausado')
+                concluidos = sum(1 for t in trabalhos_reais if t.get('status') == 'Concluído')
+                
+                if em_execucao > 0:
+                    self.status_label.setText(f"✅ {em_execucao} trabalho(s) em execução")
+                    self.status_label.setStyleSheet("""
+                        QLabel {
+                            background-color: transparent;
+                            color: #16c60c;
+                            font-size: 12px;
+                            font-weight: bold;
+                        }
+                    """)
+                elif pausados > 0:
+                    self.status_label.setText(f"⏸ {pausados} trabalho(s) pausado(s)")
+                    self.status_label.setStyleSheet("""
+                        QLabel {
+                            background-color: transparent;
+                            color: #ff8c00;
+                            font-size: 12px;
+                            font-weight: bold;
+                        }
+                    """)
+                else:
+                    self.status_label.setText(f"✅ Todos os trabalhos concluídos")
+                    self.status_label.setStyleSheet("""
+                        QLabel {
+                            background-color: transparent;
+                            color: #16c60c;
+                            font-size: 12px;
+                            font-weight: bold;
+                        }
+                    """)
+                
+                # Info adicional
+                from datetime import datetime
+                agora = datetime.now().strftime("%H:%M:%S")
+                self.info_label.setText(f"Total: {len(trabalhos_reais)} | Ativos: {em_execucao} | Pausados: {pausados} | Concluídos: {concluidos} | Atualizado: {agora}")
+            
             else:
-                self.status_label.setText(f"✅ Todos os trabalhos concluídos")
+                # Só há placeholder (nenhum trabalho real)
+                self.status_label.setText("ℹ️ Nenhuma tarefa ativa ou agendada")
                 self.status_label.setStyleSheet("""
                     QLabel {
                         background-color: transparent;
-                        color: #16c60c;
+                        color: #666;
                         font-size: 12px;
                         font-weight: bold;
                     }
                 """)
-            
-            # Info adicional
-            from datetime import datetime
-            agora = datetime.now().strftime("%H:%M:%S")
-            self.info_label.setText(f"Total: {len(trabalhos)} | Ativos: {em_execucao} | Pausados: {pausados} | Concluídos: {concluidos} | Atualizado: {agora}")
+                self.info_label.setText("Clique em '⏰ Agendar Tarefa' para criar uma nova tarefa automática")
         else:
             self.status_label.setText("ℹ Nenhum trabalho em execução")
             self.status_label.setStyleSheet("""
@@ -14354,6 +18567,57 @@ class GerenciadorTrabalhosDialog(QDialog):
     def _cancelar(self, worker, trabalho):
         """Cancela um trabalho"""
         print(f"[DEBUG GERENCIADOR] _cancelar chamado - worker: {worker}, trabalho: {trabalho.get('nome')}")
+        
+        tipo_trabalho = trabalho.get('tipo', '')
+        
+        # Para tarefas agendadas, o "cancelamento" é na verdade exclusão da configuração
+        if tipo_trabalho == 'tarefa_agendada' and worker is None:
+            resposta = QMessageBox.question(
+                self,
+                "Excluir Tarefa Agendada",
+                f"Deseja realmente EXCLUIR o agendamento da tarefa:\n\n'{trabalho.get('nome', 'Tarefa')}'?\n\n"
+                f"A tarefa não será mais executada automaticamente.",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No
+            )
+            
+            if resposta == QMessageBox.Yes:
+                print(f"[DEBUG GERENCIADOR] Excluindo configuração de agendamento...")
+                from PyQt5.QtCore import QSettings
+                settings = QSettings('NFE_System', 'BOT_NFE')
+                
+                # Remove todas as configurações de agendamento
+                settings.remove('agendador/ao_iniciar')
+                settings.remove('agendador/horario_ativo')
+                settings.remove('agendador/horario')
+                settings.remove('agendador/intervalo_ativo')
+                settings.remove('agendador/intervalo_horas')
+                settings.remove('agendador/tarefa_index')
+                settings.remove('agendador/tarefa_nome')
+                settings.remove('agendador/executar_apos_busca')
+                settings.remove('agendador/config_version')
+                settings.sync()
+                
+                print(f"[DEBUG GERENCIADOR] Configuração removida!")
+                
+                # Remove da lista de trabalhos ativos ANTES de atualizar
+                if self.parent_window and hasattr(self.parent_window, '_trabalhos_ativos'):
+                    self.parent_window._trabalhos_ativos = [
+                        t for t in self.parent_window._trabalhos_ativos 
+                        if t.get('tipo') != 'tarefa_agendada'
+                    ]
+                
+                # Atualiza lista IMEDIATAMENTE
+                self._atualizar_lista()
+                
+                QMessageBox.information(
+                    self,
+                    "Tarefa Excluída",
+                    "A configuração de agendamento foi removida com sucesso."
+                )
+            return
+        
+        # Para tarefas em execução, cancela o worker
         resposta = QMessageBox.question(
             self,
             "Cancelar Trabalho",
@@ -14368,9 +18632,17 @@ class GerenciadorTrabalhosDialog(QDialog):
                 print(f"[DEBUG GERENCIADOR] Chamando worker.cancelar()...")
                 worker.cancelar()
                 print(f"[DEBUG GERENCIADOR] Worker cancelado!")
+                trabalho['status'] = 'Cancelado'
             else:
-                print(f"[DEBUG GERENCIADOR] ERRO: worker é None!")
-            trabalho['status'] = 'Cancelado'
+                print(f"[DEBUG GERENCIADOR] Worker é None - removendo trabalho da lista...")
+                # Remove trabalho da lista
+                if self.parent_window and hasattr(self.parent_window, '_trabalhos_ativos'):
+                    self.parent_window._trabalhos_ativos = [
+                        t for t in self.parent_window._trabalhos_ativos 
+                        if t.get('nome') != trabalho.get('nome')
+                    ]
+                    print(f"[DEBUG GERENCIADOR] Trabalho removido da lista!")
+            
             self._atualizar_lista()
         else:
             print(f"[DEBUG GERENCIADOR] Usuário cancelou o cancelamento")
@@ -16809,12 +21081,17 @@ class StorageConfigDialog(QDialog):
             # Atualiza label de hierarquia
             if self.current_organizacao_tipo == 'TIPO_CERTIFICADO':
                 self.lbl_tipo_org.setText(
-                    "📂 <b>Tipo → Certificado → Mês</b><br>"
+                    "📂 <b>Tipo → Certificado → Data</b><br>"
                     "<span style='color: #666;'>Exemplo: NFe/61-MATPARCG/012026/</span>"
+                )
+            elif self.current_organizacao_tipo == 'CERTIFICADO_TIPO_DATA':
+                self.lbl_tipo_org.setText(
+                    "📂 <b>Certificado → Tipo → Data</b> ⭐<br>"
+                    "<span style='color: #666;'>Exemplo: 61-MATPARCG/NFe/012026/</span>"
                 )
             else:
                 self.lbl_tipo_org.setText(
-                    "📂 <b>Certificado → Tipo → Mês</b> (padrão)<br>"
+                    "📂 <b>Certificado → Data → Tipo</b> (antigo)<br>"
                     "<span style='color: #666;'>Exemplo: 61-MATPARCG/012026/NFe/</span>"
                 )
             
@@ -16867,11 +21144,13 @@ class StorageConfigDialog(QDialog):
             # Tipo de organização
             layout.addWidget(QLabel("Organização de pastas:"))
             combo_org = QComboBox()
-            combo_org.addItem("Certificado → Tipo → Mês (padrão)", "CERTIFICADO_TIPO")
-            combo_org.addItem("Tipo → Certificado → Mês (novo)", "TIPO_CERTIFICADO")
+            combo_org.addItem("Certificado → Tipo → Data 📅", "CERTIFICADO_TIPO_DATA")
+            combo_org.addItem("Tipo → Certificado → Data", "TIPO_CERTIFICADO")
+            combo_org.addItem("Certificado → Data → Tipo (antigo)", "CERTIFICADO_TIPO")
             combo_org.setToolTip(
-                "CERTIFICADO_TIPO: 61-MATPARCG/012026/NFe/\n"
-                "TIPO_CERTIFICADO: NFe/61-MATPARCG/012026/"
+                "CERTIFICADO_TIPO_DATA: 61-MATPARCG/NFe/012026/ ⭐ RECOMENDADO\n"
+                "TIPO_CERTIFICADO: NFe/61-MATPARCG/012026/\n"
+                "CERTIFICADO_TIPO: 61-MATPARCG/012026/NFe/ (compatibilidade)"
             )
             layout.addWidget(combo_org)
             
@@ -16884,7 +21163,9 @@ class StorageConfigDialog(QDialog):
                 org_tipo = combo_org.currentData()
                 if org_tipo == "TIPO_CERTIFICADO":
                     exemplo = "📁 Exemplo:\nNFe/\n  └─ 61-MATPARCG/\n      └─ 012026/\n          └─ arquivo.xml"
-                else:
+                elif org_tipo == "CERTIFICADO_TIPO_DATA":
+                    exemplo = "📁 Exemplo:\n61-MATPARCG/\n  └─ NFe/\n      └─ 012026/\n          └─ arquivo.xml"
+                else:  # CERTIFICADO_TIPO
                     exemplo = "📁 Exemplo:\n61-MATPARCG/\n  └─ 012026/\n      └─ NFe/\n          └─ arquivo.xml"
                 lbl_exemplo.setText(exemplo)
             
@@ -17201,52 +21482,48 @@ class StorageConfigDialog(QDialog):
             if not self.current_profile_id:
                 QMessageBox.warning(self, "Atenção", "Selecione um perfil para aplicar!")
                 return
-            
+
             # Lê configurações do perfil do banco
             conn = sqlite3.connect(self.db.db_path)
             cursor = conn.cursor()
-            
             cursor.execute("""
                 SELECT nome, pasta_base, formato_pasta_mes, xml_pdf_separado, organizacao_tipo
                 FROM perfis_armazenamento
                 WHERE id = ?
             """, (self.current_profile_id,))
-            
             result = cursor.fetchone()
             conn.close()
-            
+
             if not result:
                 QMessageBox.warning(self, "Erro", "Perfil não encontrado no banco de dados!")
                 return
-            
+
             nome_perfil, pasta_destino, formato_mes, xml_pdf_separado, organizacao_tipo = result
             organizacao_tipo = organizacao_tipo or 'CERTIFICADO_TIPO'
-            
+
             print(f"[INFO PERFIL] Aplicando perfil ID={self.current_profile_id}: '{nome_perfil}'")
-            print(f"[INFO PERFIL] organizacao_tipo={organizacao_tipo}, formato={formato_mes}")
-            
+
             if not pasta_destino:
                 QMessageBox.warning(self, "Atenção", "Configure a pasta base antes de aplicar!")
                 return
-            
+
             # Define texto de organização para exibição
             if organizacao_tipo == 'TIPO_CERTIFICADO':
-                texto_org = "Tipo → Certificado → Mês (NFe/Certificado/mmaaaa)"
+                texto_org = "Tipo → Certificado → Data (NFe/Certificado/mmaaaa)"
+            elif organizacao_tipo == 'CERTIFICADO_TIPO_DATA':
+                texto_org = "Certificado → Tipo → Data (Certificado/NFe/mmaaaa) ⭐"
             else:
-                texto_org = "Certificado → Tipo → Mês (Certificado/mmaaaa/NFe)"
-            
-            # Valida pasta destino
+                texto_org = "Certificado → Data → Tipo (Certificado/mmaaaa/NFe)"
+
+            # Valida / cria pasta destino
             try:
                 pasta_destino_path = Path(pasta_destino)
-                
                 if not pasta_destino_path.exists():
                     reply = QMessageBox.question(
-                        self,
-                        "Pasta não existe",
+                        self, "Pasta não existe",
                         f"A pasta de destino:\n{pasta_destino}\n\nNão existe. Deseja criá-la?",
                         QMessageBox.Yes | QMessageBox.No
                     )
-                    
                     if reply == QMessageBox.Yes:
                         pasta_destino_path.mkdir(parents=True, exist_ok=True)
                     else:
@@ -17254,21 +21531,16 @@ class StorageConfigDialog(QDialog):
             except Exception as e:
                 QMessageBox.warning(self, "Erro", f"Caminho inválido:\n{e}")
                 return
-            
-            # Pergunta confirmação
-            # Converte formato_mes de código para texto legível
+
             formatos_map = {
-                'AAAA-MM': 'Ano-Mês (2025-01)',
-                'MM-AAAA': 'Mês-Ano (01-2025)',
-                'MMAAAA': 'MêsAno (012025)',
-                'AAAA/MM': 'Ano/Mês (2025/01)',
+                'AAAA-MM': 'Ano-Mês (2025-01)', 'MM-AAAA': 'Mês-Ano (01-2025)',
+                'MMAAAA': 'MêsAno (012025)', 'AAAA/MM': 'Ano/Mês (2025/01)',
                 'MM/AAAA': 'Mês/Ano (01/2025)'
             }
             texto_formato = formatos_map.get(formato_mes, formato_mes)
-            
+
             reply = QMessageBox.question(
-                self,
-                "Confirmar Aplicação",
+                self, "Confirmar Aplicação",
                 f"Deseja copiar todos os XMLs e PDFs existentes para:\n\n"
                 f"📁 {pasta_destino}\n\n"
                 f"📅 Formato: {texto_formato}\n"
@@ -17278,286 +21550,309 @@ class StorageConfigDialog(QDialog):
                 f"Os arquivos originais NÃO serão modificados ou removidos.",
                 QMessageBox.Yes | QMessageBox.No
             )
-            
             if reply != QMessageBox.Yes:
                 return
-            
-            # Define pasta de origem (busca na pasta xmls local)
+
             pasta_origem = DATA_DIR / 'xmls'
-            
             if not pasta_origem.exists():
                 QMessageBox.information(self, "Informação", "Nenhuma pasta 'xmls' encontrada para copiar.")
                 return
-            
-            # Executa cópia com as configurações do perfil
-            self._copiar_arquivos_para_perfil(
-                pasta_origem, 
-                pasta_destino_path,
-                formato_mes,
-                xml_pdf_separado,
-                organizacao_tipo
+
+            # ── Cria diálogo de progresso não-bloqueante ──────────────────────────
+            self._copia_progress = QProgressDialog(
+                "Preparando cópia de arquivos...", "Cancelar", 0, 100, self
             )
-            
+            self._copia_progress.setWindowTitle("Aplicando Perfil - Copiando Arquivos")
+            self._copia_progress.setWindowModality(Qt.WindowModal)
+            self._copia_progress.setMinimumDuration(0)
+            self._copia_progress.setValue(0)
+            self._copia_progress.show()
+
+            # ── Worker que executa tudo em background ─────────────────────────────
+            from PyQt5.QtCore import QThread, pyqtSignal as _sig
+
+            class _CopiaWorker(QThread):
+                progress_update = _sig(int, str)      # (valor, label)
+                done_copy       = _sig(int, int, str) # (copiados, erros, msg_final)
+                error_copy      = _sig(str)
+
+                def __init__(self, origem, destino, formato_mes,
+                             xml_pdf_separado, organizacao_tipo, db):
+                    super().__init__()
+                    self.origem             = origem
+                    self.destino            = destino
+                    self.formato_mes        = formato_mes
+                    self.xml_pdf_separado   = xml_pdf_separado
+                    self.organizacao_tipo   = organizacao_tipo
+                    self.db                 = db
+                    self._cancelado         = False
+
+                def cancelar(self):
+                    self._cancelado = True
+
+                def run(self):
+                    try:
+                        import shutil, re
+                        from lxml import etree
+                        from datetime import datetime
+
+                        pastas_ignorar = ['Debug de notas', 'Resumos', 'Eventos', 'Outros',
+                                          'debug', 'resumos', 'eventos', 'outros']
+
+                        arquivos_xml = []
+                        for arquivo in self.origem.rglob('*.xml'):
+                            if any(p in arquivo.parts for p in pastas_ignorar):
+                                continue
+                            arquivos_xml.append(arquivo)
+
+                        total = len(arquivos_xml)
+                        if total == 0:
+                            self.done_copy.emit(0, 0, "Nenhum arquivo XML encontrado.")
+                            return
+
+                        self.progress_update.emit(0, f"Copiando {total} arquivo(s)...")
+
+                        # Mapeamento CNPJ → nome amigável
+                        mapeamento_nomes = {}
+                        mapeamento_reverso = {}
+                        try:
+                            certs = self.db.load_certificates()
+                            for cert in certs:
+                                informante = cert.get('informante', '')
+                                nome_cert  = cert.get('nome_certificado', '')
+                                if informante and nome_cert:
+                                    nome_limpo = re.sub(r'[\\/*?:"<>|]', "_", nome_cert).strip()
+                                    mapeamento_nomes[informante]    = nome_limpo
+                                    mapeamento_reverso[nome_limpo]  = informante
+                        except Exception as e:
+                            print(f"[ERRO] Ao carregar certificados: {e}")
+
+                        copiados = 0
+                        erros    = 0
+
+                        for idx, arquivo_xml in enumerate(arquivos_xml):
+                            if self._cancelado:
+                                self.done_copy.emit(copiados, erros, f"Cancelado pelo usuário. {copiados} copiado(s).")
+                                return
+
+                            try:
+                                nome_arquivo = arquivo_xml.name.upper()
+                                palavras_evento = ['EVENTO', 'CIENCIA', 'CONFIRMACAO', 'DESCONHECIMENTO',
+                                                   'NAO_REALIZADA', 'CANCELAMENTO', 'CARTA_CORRECAO']
+                                if any(p in nome_arquivo for p in palavras_evento):
+                                    continue
+
+                                caminho_relativo = arquivo_xml.relative_to(self.origem)
+                                partes = list(caminho_relativo.parts)
+                                if len(partes) < 3:
+                                    continue
+
+                                tipos_documento = {'NFE', 'NFSE', 'CTE', 'EVENTOS'}
+                                primeira_parte = partes[0].upper().replace('-', '').replace('_', '')
+
+                                if primeira_parte in tipos_documento:
+                                    if len(partes) < 4:
+                                        continue
+                                    cnpj_pasta = partes[1]
+                                    tipo_pasta = partes[0]
+                                else:
+                                    cnpj_pasta = partes[0]
+                                    tipo_pasta = partes[2] if len(partes) > 2 else partes[1]
+
+                                if "Eventos" in tipo_pasta or "Eventos" in str(arquivo_xml):
+                                    continue
+
+                                cnpj_normalizado = ''.join(c for c in cnpj_pasta if c.isdigit())
+                                if len(cnpj_normalizado) != 14:
+                                    cnpj_do_nome = mapeamento_reverso.get(cnpj_pasta)
+                                    if cnpj_do_nome and len(cnpj_do_nome) == 14:
+                                        cnpj_normalizado = cnpj_do_nome
+                                    else:
+                                        erros += 1
+                                        continue
+
+                                nome_cert = mapeamento_nomes.get(cnpj_normalizado)
+                                if not nome_cert:
+                                    erros += 1
+                                    continue
+
+                                pasta_cert = nome_cert
+                                ano = mes = None
+                                fluxo_arquivo = 'Entradas'
+
+                                try:
+                                    tree = etree.parse(str(arquivo_xml))
+                                    root = tree.getroot()
+                                    root_tag = root.tag.split('}')[-1] if '}' in root.tag else root.tag
+                                    ns = '{http://www.portalfiscal.inf.br/cte}' if 'cte' in root_tag.lower() else '{http://www.portalfiscal.inf.br/nfe}'
+
+                                    data_elem = (root.find(f'.//{ns}dhEmi') or
+                                                 root.find(f'.//{ns}dEmi') or
+                                                 root.find(f'.//{ns}dhRecbto'))
+                                    if data_elem is None:
+                                        _ns_nfse = '{http://www.sped.fazenda.gov.br/nfse}'
+                                        for _tag in ('dhEmi', 'DhEmi', 'DataEmissao', 'dhRecbto'):
+                                            data_elem = root.find(f'.//{_ns_nfse}{_tag}')
+                                            if data_elem is not None:
+                                                break
+                                    if data_elem is None:
+                                        for _tag in ('dhEmi', 'DhEmi', 'DataEmissao', 'dEmi'):
+                                            data_elem = root.find(f'.//{_tag}')
+                                            if data_elem is not None:
+                                                break
+
+                                    if data_elem is not None and data_elem.text:
+                                        data_str = data_elem.text.split('T')[0]
+                                        if len(data_str) >= 7:
+                                            ano = data_str[:4]
+                                            mes = data_str[5:7]
+
+                                    _ns_nfse = '{http://www.sped.fazenda.gov.br/nfse}'
+                                    _emit_cnpj = (
+                                        root.findtext('.//{http://www.portalfiscal.inf.br/nfe}emit/{http://www.portalfiscal.inf.br/nfe}CNPJ') or
+                                        root.findtext('.//{http://www.portalfiscal.inf.br/cte}emit/{http://www.portalfiscal.inf.br/cte}CNPJ') or
+                                        root.findtext(f'.//{_ns_nfse}DPS/{_ns_nfse}infDPS/{_ns_nfse}prest/{_ns_nfse}CNPJ') or
+                                        root.findtext('.//DPS/infDPS/prest/CNPJ') or
+                                        root.findtext(f'.//{_ns_nfse}emit/{_ns_nfse}CNPJ') or
+                                        root.findtext('.//emit/CNPJ') or
+                                        root.findtext(f'.//{_ns_nfse}Prestador/{_ns_nfse}CNPJ') or
+                                        root.findtext('.//Prestador/CNPJ') or ''
+                                    )
+                                    if re.sub(r'\D', '', _emit_cnpj) == cnpj_normalizado:
+                                        fluxo_arquivo = 'Saidas'
+                                except Exception:
+                                    pass
+
+                                if not ano or not mes:
+                                    candidatos = []
+                                    if len(partes) >= 2: candidatos.append(partes[1])
+                                    if len(partes) >= 3: candidatos.append(partes[2])
+                                    for dp in candidatos:
+                                        if '-' in dp and len(dp) == 7:
+                                            _a, _m = dp[:4], dp[5:7]
+                                            if _a.isdigit() and _m.isdigit() and 1 <= int(_m) <= 12:
+                                                ano, mes = _a, _m; break
+                                        elif len(dp) == 6 and dp.isdigit():
+                                            _m, _a = dp[:2], dp[2:6]
+                                            if 1 <= int(_m) <= 12:
+                                                mes, ano = _m, _a; break
+
+                                if not ano or not mes:
+                                    now = datetime.now()
+                                    ano, mes = str(now.year), f"{now.month:02d}"
+
+                                if len(ano) != 4 or len(mes) != 2 or not ano.isdigit() or not mes.isdigit():
+                                    erros += 1; continue
+
+                                if self.formato_mes == 'MM-AAAA':
+                                    ano_mes = f"{mes}-{ano}"
+                                elif self.formato_mes == 'MMAAAA':
+                                    ano_mes = f"{mes}{ano}"
+                                elif self.formato_mes == 'AAAA/MM':
+                                    ano_mes = f"{ano}/{mes}"
+                                elif self.formato_mes == 'MM/AAAA':
+                                    ano_mes = f"{mes}/{ano}"
+                                else:
+                                    ano_mes = f"{ano}-{mes}"
+
+                                if self.organizacao_tipo == 'CERTIFICADO_TIPO_DATA':
+                                    pasta_dest = self.destino / fluxo_arquivo / pasta_cert / tipo_pasta / ano_mes
+                                elif self.organizacao_tipo == 'TIPO_CERTIFICADO':
+                                    pasta_dest = self.destino / fluxo_arquivo / tipo_pasta / pasta_cert / ano_mes
+                                else:
+                                    if self.xml_pdf_separado:
+                                        pasta_dest = self.destino / fluxo_arquivo / pasta_cert / ano_mes / tipo_pasta
+                                    else:
+                                        pasta_dest = self.destino / fluxo_arquivo / pasta_cert / ano_mes
+
+                                pasta_dest.mkdir(parents=True, exist_ok=True)
+
+                                xml_destino = pasta_dest / arquivo_xml.name
+                                if not xml_destino.exists():
+                                    shutil.copy2(arquivo_xml, xml_destino)
+                                    copiados += 1
+                                    pdf_original = arquivo_xml.with_suffix('.pdf')
+                                    if pdf_original.exists():
+                                        pdf_destino = xml_destino.with_suffix('.pdf')
+                                        if not pdf_destino.exists():
+                                            shutil.copy2(pdf_original, pdf_destino)
+
+                            except Exception as e:
+                                print(f"[ERRO] Ao copiar {arquivo_xml.name}: {e}")
+                                erros += 1
+
+                            pct = int((idx + 1) / total * 100)
+                            self.progress_update.emit(pct, f"Copiando {idx + 1}/{total}: {arquivo_xml.name}")
+
+                        self.done_copy.emit(copiados, erros, "")
+
+                    except Exception as e:
+                        import traceback
+                        self.error_copy.emit(f"{e}\n{traceback.format_exc()}")
+
+            worker = _CopiaWorker(
+                pasta_origem, pasta_destino_path, formato_mes,
+                xml_pdf_separado, organizacao_tipo, self.db
+            )
+
+            def _on_progress(pct, label):
+                if not self._copia_progress.wasCanceled():
+                    self._copia_progress.setValue(pct)
+                    self._copia_progress.setLabelText(label)
+                else:
+                    worker.cancelar()
+
+            def _on_done(copiados, erros, msg_extra):
+                self._copia_progress.close()
+                if msg_extra:  # cancelado
+                    QMessageBox.information(self, "Cancelado", msg_extra)
+                    return
+                formatos_map2 = {
+                    'AAAA-MM': 'Ano-Mês (2025-01)', 'MM-AAAA': 'Mês-Ano (01-2025)',
+                    'MMAAAA': 'MêsAno (012025)', 'AAAA/MM': 'Ano/Mês (2025/01)',
+                    'MM/AAAA': 'Mês/Ano (01/2025)'
+                }
+                if organizacao_tipo == 'TIPO_CERTIFICADO':
+                    t_org = "Tipo → Certificado → Data"
+                elif organizacao_tipo == 'CERTIFICADO_TIPO_DATA':
+                    t_org = "Certificado → Tipo → Data ⭐"
+                else:
+                    t_org = "Certificado → Data → Tipo"
+                msg = (
+                    f"✅ Perfil aplicado com sucesso!\n\n"
+                    f"📊 Estatísticas:\n"
+                    f"   • Arquivos copiados: {copiados}\n"
+                    + (f"   • Erros: {erros}\n" if erros else "") +
+                    f"\n📁 Destino: {pasta_destino_path}\n"
+                    f"📅 Formato: {formatos_map2.get(formato_mes, formato_mes)}\n"
+                    f"📊 Hierarquia: {t_org}\n"
+                    f"📂 Subpastas: Entradas / Saidas\n"
+                    f"\n💡 Arquivos originais mantidos em:\n   {pasta_origem}"
+                )
+                QMessageBox.information(self, "Aplicação Concluída", msg)
+
+            def _on_error(msg):
+                self._copia_progress.close()
+                QMessageBox.critical(self, "Erro ao copiar arquivos", msg)
+
+            def _cleanup_copia_worker():
+                self._copia_worker = None
+                worker.deleteLater()
+
+            worker.progress_update.connect(_on_progress)
+            worker.done_copy.connect(_on_done)
+            worker.error_copy.connect(_on_error)
+            worker.finished.connect(_cleanup_copia_worker)
+
+            self._copia_worker = worker
+            worker.start()
+
         except Exception as e:
             QMessageBox.critical(self, "Erro", f"Erro ao aplicar perfil:\n{e}")
             print(f"[ERRO] _apply_profile: {e}")
             import traceback
             traceback.print_exc()
     
-    def _copiar_arquivos_para_perfil(self, origem: Path, destino: Path, formato_mes: str, xml_pdf_separado: int, organizacao_tipo: str):
-        """Copia arquivos XML/PDF da pasta de origem para o perfil - MODO RÁPIDO (sem reprocessar)
-        
-        Args:
-            origem: Pasta de origem (xmls local)
-            destino: Pasta de destino do perfil
-            formato_mes: Formato de mês (AAAA-MM, MM-AAAA, etc)
-            xml_pdf_separado: 1 = pastas separadas, 0 = mesma pasta
-            organizacao_tipo: 'CERTIFICADO_TIPO' ou 'TIPO_CERTIFICADO'
-        """
-        try:
-            import shutil
-            import re
-            from lxml import etree
-            from datetime import datetime
-            
-            # Cria diálogo de progresso
-            progress = QProgressDialog("Preparando cópia de arquivos...", "Cancelar", 0, 100, self)
-            progress.setWindowTitle("Aplicando Perfil - Copiando Arquivos")
-            progress.setWindowModality(Qt.WindowModal)
-            progress.setMinimumDuration(0)
-            progress.setValue(0)
-            
-            # Pastas a ignorar
-            pastas_ignorar = ['Debug de notas', 'Resumos', 'Eventos', 'Outros', 'debug', 'resumos', 'eventos', 'outros']
-            
-            # Lista arquivos XML
-            arquivos_xml = []
-            for arquivo in origem.rglob('*.xml'):
-                deve_ignorar = False
-                for parte in arquivo.parts:
-                    if parte in pastas_ignorar:
-                        deve_ignorar = True
-                        break
-                
-                if not deve_ignorar:
-                    arquivos_xml.append(arquivo)
-            
-            total = len(arquivos_xml)
-            if total == 0:
-                QMessageBox.information(self, "Informação", "Nenhum arquivo XML encontrado para copiar.")
-                return
-            
-            progress.setMaximum(total)
-            progress.setLabelText(f"Copiando {total} arquivo(s)...")
-            
-            # Carrega mapeamento de CNPJ -> Nome do Certificado
-            mapeamento_nomes = {}
-            try:
-                certs = self.db.load_certificates()
-                for cert in certs:
-                    informante = cert.get('informante', '')
-                    nome_cert = cert.get('nome_certificado', '')
-                    if informante and nome_cert:
-                        nome_limpo = re.sub(r'[\\/*?:"<>|]', "_", nome_cert).strip()
-                        mapeamento_nomes[informante] = nome_limpo
-            except Exception as e:
-                print(f"[ERRO] Ao carregar certificados: {e}")
-            
-            # Usa parâmetros recebidos (já lidos do perfil do banco)
-            copiados = 0
-            erros = 0
-            
-            for idx, arquivo_xml in enumerate(arquivos_xml):
-                if progress.wasCanceled():
-                    QMessageBox.information(self, "Cancelado", f"Cópia cancelada. {copiados} arquivo(s) copiado(s).")
-                    return
-                
-                try:
-                    # 🚫 FILTRO CRÍTICO: Verifica nome do arquivo ANTES de processar
-                    # APENAS NF-e, CT-e e NFS-e completas devem ser copiadas
-                    nome_arquivo = arquivo_xml.name.upper()
-                    palavras_evento = ['EVENTO', 'CIENCIA', 'CONFIRMACAO', 'DESCONHECIMENTO', 
-                                      'NAO_REALIZADA', 'CANCELAMENTO', 'CARTA_CORRECAO']
-                    
-                    if any(palavra in nome_arquivo for palavra in palavras_evento):
-                        print(f"[IGNORADO] Evento não copiado para perfil: {arquivo_xml.name}")
-                        continue
-                    
-                    # Extrai CNPJ da estrutura de pastas
-                    caminho_relativo = arquivo_xml.relative_to(origem)
-                    partes = list(caminho_relativo.parts)
-                    
-                    if len(partes) < 3:  # Precisa ter pelo menos: CNPJ/AAAA-MM/TIPO/arquivo.xml
-                        continue
-                    
-                    cnpj_pasta = partes[0]
-                    tipo_pasta = partes[2]  # NFe, CTe, etc.
-                    
-                    # 🚫 FILTRO ADICIONAL: Verifica se a pasta é de Eventos
-                    if "Eventos" in tipo_pasta or "Eventos" in str(arquivo_xml):
-                        print(f"[IGNORADO] Arquivo em pasta de eventos: {arquivo_xml.name}")
-                        continue
-                    
-                    # Normaliza CNPJ (remove caracteres especiais)
-                    cnpj_normalizado = ''.join(c for c in cnpj_pasta if c.isdigit())
-                    
-                    # 🚫 FILTRO CRÍTICO: Valida CNPJ antes de processar
-                    # Pastas legadas antigas (ex: "99-JL COMERCIO") têm CNPJ incompleto
-                    if len(cnpj_normalizado) != 14:
-                        print(f"[IGNORADO] Pasta com CNPJ inválido (len={len(cnpj_normalizado)}): {cnpj_pasta} - pulando...")
-                        continue
-                    
-                    # Busca nome do certificado (SEMPRE usa nome, nunca CNPJ)
-                    nome_cert = mapeamento_nomes.get(cnpj_normalizado)
-                    if not nome_cert:
-                        print(f"[AVISO] Nome do certificado não encontrado para CNPJ {cnpj_normalizado}")
-                        erros += 1
-                        continue  # Pula se não encontrar o nome
-                    
-                    pasta_cert = nome_cert
-                    
-                    # Lê apenas a data do XML (parse mínimo)
-                    ano = None
-                    mes = None
-                    
-                    try:
-                        tree = etree.parse(str(arquivo_xml))
-                        root = tree.getroot()
-                        
-                        # Detecta tipo de documento
-                        root_tag = root.tag.split('}')[-1] if '}' in root.tag else root.tag
-                        
-                        # Define namespace baseado no tipo
-                        if 'cte' in root_tag.lower():
-                            ns = '{http://www.portalfiscal.inf.br/cte}'
-                        else:
-                            ns = '{http://www.portalfiscal.inf.br/nfe}'
-                        
-                        # Busca data de emissão (tenta várias tags)
-                        data_elem = root.find(f'.//{ns}dhEmi')
-                        if data_elem is None:
-                            data_elem = root.find(f'.//{ns}dEmi')
-                        if data_elem is None:
-                            data_elem = root.find(f'.//{ns}dhRecbto')
-                        
-                        if data_elem is not None and data_elem.text:
-                            data_str = data_elem.text.split('T')[0]  # Remove hora se tiver
-                            if len(data_str) >= 7:  # AAAA-MM-DD
-                                ano = data_str[:4]
-                                mes = data_str[5:7]
-                                print(f"[DEBUG DATA] {arquivo_xml.name}: data extraída do XML = {ano}-{mes}")
-                    except Exception as e:
-                        print(f"[AVISO] Erro ao ler data do XML {arquivo_xml.name}: {e}")
-                    
-                    # Fallback 1: Tenta extrair da estrutura de pastas (AAAA-MM ou MMAAAA)
-                    if not ano or not mes:
-                        if len(partes) >= 2:
-                            data_pasta = partes[1]  # pode ser "2025-12" ou "122025"
-                            if '-' in data_pasta and len(data_pasta) == 7:
-                                # Formato AAAA-MM
-                                ano = data_pasta[:4]
-                                mes = data_pasta[5:7]
-                                print(f"[DEBUG DATA] {arquivo_xml.name}: data extraída da pasta = {ano}-{mes}")
-                            elif len(data_pasta) == 6 and data_pasta.isdigit():
-                                # Formato MMAAAA
-                                mes = data_pasta[:2]
-                                ano = data_pasta[2:6]
-                                print(f"[DEBUG DATA] {arquivo_xml.name}: data extraída da pasta MMAAAA = {ano}-{mes}")
-                    
-                    # Fallback 2: usa data atual
-                    if not ano or not mes:
-                        now = datetime.now()
-                        ano = str(now.year)
-                        mes = f"{now.month:02d}"
-                        print(f"[AVISO] {arquivo_xml.name}: usando data atual = {ano}-{mes}")
-                    
-                    # Valida ano e mês extraídos
-                    if len(ano) != 4 or len(mes) != 2 or not ano.isdigit() or not mes.isdigit():
-                        print(f"[ERRO] Data inválida para {arquivo_xml.name}: ano={ano}, mes={mes}")
-                        erros += 1
-                        continue
-                    
-                    # Aplica formato de mês configurado
-                    if formato_mes == 'MM-AAAA':
-                        ano_mes = f"{mes}-{ano}"
-                    elif formato_mes == 'MMAAAA':
-                        ano_mes = f"{mes}{ano}"
-                    elif formato_mes == 'AAAA/MM':
-                        ano_mes = f"{ano}/{mes}"
-                    elif formato_mes == 'MM/AAAA':
-                        ano_mes = f"{mes}/{ano}"
-                    else:  # AAAA-MM (padrão)
-                        ano_mes = f"{ano}-{mes}"
-                    
-                    print(f"[DEBUG PASTA] {arquivo_xml.name}: ano_mes final = {ano_mes}")
-                    
-                    # 🆕 Monta caminho de destino baseado em organizacao_tipo
-                    if organizacao_tipo == 'TIPO_CERTIFICADO':
-                        # Novo formato: Tipo/Certificado/mmaaaa
-                        # Exemplo: NFe/61-MATPARCG/012026/
-                        pasta_dest = destino / tipo_pasta / pasta_cert / ano_mes
-                    else:
-                        # Formato padrão: Certificado/mmaaaa/Tipo
-                        # Exemplo: 61-MATPARCG/012026/NFe/
-                        if xml_pdf_separado:
-                            pasta_dest = destino / pasta_cert / ano_mes / tipo_pasta
-                        else:
-                            # XML e PDF na mesma pasta: NOME/MES/
-                            pasta_dest = destino / pasta_cert / ano_mes
-                    
-                    pasta_dest.mkdir(parents=True, exist_ok=True)
-                    
-                    # Copia XML
-                    xml_destino = pasta_dest / arquivo_xml.name
-                    if not xml_destino.exists():
-                        shutil.copy2(arquivo_xml, xml_destino)
-                        copiados += 1
-                        
-                        # Copia PDF se existir
-                        pdf_original = arquivo_xml.with_suffix('.pdf')
-                        if pdf_original.exists():
-                            pdf_destino = xml_destino.with_suffix('.pdf')
-                            if not pdf_destino.exists():
-                                shutil.copy2(pdf_original, pdf_destino)
-                    
-                    progress.setValue(idx + 1)
-                    progress.setLabelText(f"Copiando {idx + 1}/{total}: {arquivo_xml.name}")
-                    QApplication.processEvents()
-                    
-                except Exception as e:
-                    print(f"[ERRO] Ao copiar {arquivo_xml.name}: {e}")
-                    erros += 1
-            
-            progress.close()
-            
-            # Mensagem final
-            formatos_map = {
-                'AAAA-MM': 'Ano-Mês (2025-01)',
-                'MM-AAAA': 'Mês-Ano (01-2025)',
-                'MMAAAA': 'MêsAno (012025)',
-                'AAAA/MM': 'Ano/Mês (2025/01)',
-                'MM/AAAA': 'Mês/Ano (01/2025)'
-            }
-            texto_formato = formatos_map.get(formato_mes, formato_mes)
-            texto_org = "Tipo → Certificado → Mês" if organizacao_tipo == 'TIPO_CERTIFICADO' else "Certificado → Tipo → Mês"
-            
-            msg = f"✅ Perfil aplicado com sucesso!\n\n"
-            msg += f"📊 Estatísticas:\n"
-            msg += f"   • Arquivos copiados: {copiados}\n"
-            if erros > 0:
-                msg += f"   • Erros: {erros}\n"
-            msg += f"\n📁 Destino: {destino}\n"
-            msg += f"📅 Formato aplicado: {texto_formato}\n"
-            msg += f"📊 Hierarquia: {texto_org}\n"
-            msg += f"\n💡 Os arquivos originais foram mantidos em:\n   {origem}"
-            
-            QMessageBox.information(self, "Aplicação Concluída", msg)
-            
-        except Exception as e:
-            QMessageBox.critical(self, "Erro", f"Erro ao copiar arquivos:\n{e}")
-            import traceback
-            traceback.print_exc()
-
 def main():
     # Parse argumentos de linha de comando
     parser = argparse.ArgumentParser(description='BOT Busca NFE')

@@ -61,16 +61,24 @@ if __name__ == "__main__":
         data = json.loads(input_data)
         task = data.get("task")
         payload = data.get("payload", {})
-        
+
+        _real_stdout = sys.stdout
+        sys.stdout = sys.stderr
+
         if task == "generate_pdf":
             result = generate_pdf(payload)
         elif task == "fetch_by_chave":
             result = fetch_by_chave(payload)
         else:
             result = {"ok": False, "error": f"Unknown task: {task}"}
-        
+
+        sys.stdout = _real_stdout
         print(json.dumps(result))
         sys.exit(0)
     except Exception as e:
+        try:
+            sys.stdout = _real_stdout  # type: ignore[name-defined]
+        except Exception:
+            pass
         print(json.dumps({"ok": False, "error": str(e)}))
         sys.exit(1)

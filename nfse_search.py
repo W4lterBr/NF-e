@@ -200,7 +200,8 @@ def get_data_dir():
     return data_dir
 
 BASE_DIR = get_data_dir()
-DB_PATH = BASE_DIR / "nfe_data.db"  # Banco principal do sistema
+# 🔴 CORREÇÃO PROFISSIONAL: Usa banco único (notas.db)
+DB_PATH = BASE_DIR / "notas.db"  # Banco único profissional do sistema
 
 # -------------------------------------------------------------------
 # Configuração de logs
@@ -280,11 +281,10 @@ class NFSeDatabase:
     
     def __init__(self, db_path=DB_PATH):
         self.db_path = db_path
-        # 🔧 CORREÇÃO: Importa DatabaseManager para reutilizar conexão do banco principal
+        # 🔧 CORREÇÃO PROFISSIONAL: Usa banco único
         from nfe_search import DatabaseManager
-        # 🔴 IMPORTANTE: Banco principal é 'notas.db', não 'nfe_data.db'
-        main_db_path = str(BASE_DIR / "notas.db")
-        self.main_db = DatabaseManager(main_db_path)
+        # ✅ DB_PATH já aponta para notas.db (banco único)
+        self.main_db = DatabaseManager(str(self.db_path))
         self._criar_tabelas()
     
     def _connect(self):
@@ -342,6 +342,14 @@ class NFSeDatabase:
                     atualizado_em TEXT
                 )
             ''')
+            
+            # Migração: adiciona atualizado_em se o banco foi criado sem a coluna
+            # (quando o banco foi criado pelo DatabaseManager principal, que não tem essa coluna)
+            try:
+                conn.execute("ALTER TABLE nsu_nfse ADD COLUMN atualizado_em TEXT")
+                logger.debug("✅ Migração: coluna atualizado_em adicionada à tabela nsu_nfse")
+            except Exception:
+                pass  # coluna já existe — sem problema
             
             conn.commit()
             logger.debug("✅ Tabelas NFS-e criadas/verificadas")
