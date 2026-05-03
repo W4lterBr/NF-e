@@ -21673,8 +21673,8 @@ class StorageConfigDialog(QDialog):
 
                                 nome_cert = mapeamento_nomes.get(cnpj_normalizado)
                                 if not nome_cert:
-                                    erros += 1
-                                    continue
+                                    # CNPJ sem certificado cadastrado: usa CNPJ como nome da pasta
+                                    nome_cert = cnpj_normalizado
 
                                 pasta_cert = nome_cert
                                 ano = mes = None
@@ -21686,9 +21686,11 @@ class StorageConfigDialog(QDialog):
                                     root_tag = root.tag.split('}')[-1] if '}' in root.tag else root.tag
                                     ns = '{http://www.portalfiscal.inf.br/cte}' if 'cte' in root_tag.lower() else '{http://www.portalfiscal.inf.br/nfe}'
 
-                                    data_elem = (root.find(f'.//{ns}dhEmi') or
-                                                 root.find(f'.//{ns}dEmi') or
-                                                 root.find(f'.//{ns}dhRecbto'))
+                                    data_elem = root.find(f'.//{ns}dhEmi')
+                                    if data_elem is None:
+                                        data_elem = root.find(f'.//{ns}dEmi')
+                                    if data_elem is None:
+                                        data_elem = root.find(f'.//{ns}dhRecbto')
                                     if data_elem is None:
                                         _ns_nfse = '{http://www.sped.fazenda.gov.br/nfse}'
                                         for _tag in ('dhEmi', 'DhEmi', 'DataEmissao', 'dhRecbto'):
