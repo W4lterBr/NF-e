@@ -21648,14 +21648,22 @@ class StorageConfigDialog(QDialog):
                                     continue
 
                                 tipos_documento = {'NFE', 'NFSE', 'CTE', 'EVENTOS'}
-                                primeira_parte = partes[0].upper().replace('-', '').replace('_', '')
+                                _norm = lambda s: s.upper().replace('-', '').replace('_', '')
+                                primeira_parte = _norm(partes[0])
+                                segunda_parte  = _norm(partes[1]) if len(partes) > 1 else ''
 
                                 if primeira_parte in tipos_documento:
+                                    # Estrutura: TIPO/CNPJ/.../arquivo.xml
                                     if len(partes) < 4:
                                         continue
                                     cnpj_pasta = partes[1]
                                     tipo_pasta = partes[0]
+                                elif segunda_parte in tipos_documento:
+                                    # Estrutura: CNPJ/TIPO/DATA/arquivo.xml
+                                    cnpj_pasta = partes[0]
+                                    tipo_pasta = partes[1]
                                 else:
+                                    # Estrutura: CNPJ/DATA/TIPO/arquivo.xml
                                     cnpj_pasta = partes[0]
                                     tipo_pasta = partes[2] if len(partes) > 2 else partes[1]
 
