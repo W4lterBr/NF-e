@@ -1,7 +1,12 @@
 ; Script Inno Setup para Busca XML
 ; Gera instalador profissional para Windows
-; Última atualização: 2026-04-15 (v1.2.5)
-; Notas:
+; Última atualização: 2026-05-03 (v1.2.6)
+; Notas v1.2.6:
+;   - Perfil armazenamento: CNPJs sem certificado cadastrado são ignorados (não geram pasta).
+;   - Perfil armazenamento: pasta de DATA (ex: 2026-03) não é mais criada como tipo de documento.
+;     Estrutura CNPJ/TIPO/DATA/arquivo.xml agora reconhecida corretamente.
+;   - Perfil armazenamento: corrigido FutureWarning lxml — 'or' chain substituído por 'is None' explícito.
+; Notas v1.2.5:
 ;   - CRÍTICO: Corrigido crash Qt5Core.dll (0xc0000409) — QThread.finished sobrescrito por pyqtSignal().
 ;   - PDF NFS-e: ETAPA 1 (disco) → ETAPA 2 (API ADN) → ETAPA 2.5 (LinkNFSe ABRASF) → ETAPA 3 (local).
 ;   - pdf_tipo no banco: OFICIAL (API/LinkNFSe) ou GENERICO (local reportlab).
