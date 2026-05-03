@@ -21681,8 +21681,8 @@ class StorageConfigDialog(QDialog):
 
                                 nome_cert = mapeamento_nomes.get(cnpj_normalizado)
                                 if not nome_cert:
-                                    # CNPJ sem certificado cadastrado: usa CNPJ como nome da pasta
-                                    nome_cert = cnpj_normalizado
+                                    # CNPJ sem certificado cadastrado: ignora silenciosamente
+                                    continue
 
                                 pasta_cert = nome_cert
                                 ano = mes = None
