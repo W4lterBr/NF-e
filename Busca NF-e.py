@@ -21569,237 +21569,8 @@ class StorageConfigDialog(QDialog):
             self._copia_progress.show()
 
             # ── Worker que executa tudo em background ─────────────────────────────
-            from PyQt5.QtCore import QThread, pyqtSignal as _sig
-
-            class _CopiaWorker(QThread):
-                progress_update = _sig(int, str)      # (valor, label)
-                done_copy       = _sig(int, int, str) # (copiados, erros, msg_final)
-                error_copy      = _sig(str)
-
-                def __init__(self, origem, destino, formato_mes,
-                             xml_pdf_separado, organizacao_tipo, db):
-                    super().__init__()
-                    self.origem             = origem
-                    self.destino            = destino
-                    self.formato_mes        = formato_mes
-                    self.xml_pdf_separado   = xml_pdf_separado
-                    self.organizacao_tipo   = organizacao_tipo
-                    self.db                 = db
-                    self._cancelado         = False
-
-                def cancelar(self):
-                    self._cancelado = True
-
-                def run(self):
-                    try:
-                        import shutil, re
-                        from lxml import etree
-                        from datetime import datetime
-
-                        pastas_ignorar = ['Debug de notas', 'Resumos', 'Eventos', 'Outros',
-                                          'debug', 'resumos', 'eventos', 'outros']
-
-                        arquivos_xml = []
-                        for arquivo in self.origem.rglob('*.xml'):
-                            if any(p in arquivo.parts for p in pastas_ignorar):
-                                continue
-                            arquivos_xml.append(arquivo)
-
-                        total = len(arquivos_xml)
-                        if total == 0:
-                            self.done_copy.emit(0, 0, "Nenhum arquivo XML encontrado.")
-                            return
-
-                        self.progress_update.emit(0, f"Copiando {total} arquivo(s)...")
-
-                        # Mapeamento CNPJ → nome amigável
-                        mapeamento_nomes = {}
-                        mapeamento_reverso = {}
-                        try:
-                            certs = self.db.load_certificates()
-                            for cert in certs:
-                                informante = cert.get('informante', '')
-                                nome_cert  = cert.get('nome_certificado', '')
-                                if informante and nome_cert:
-                                    nome_limpo = re.sub(r'[\\/*?:"<>|]', "_", nome_cert).strip()
-                                    mapeamento_nomes[informante]    = nome_limpo
-                                    mapeamento_reverso[nome_limpo]  = informante
-                        except Exception as e:
-                            print(f"[ERRO] Ao carregar certificados: {e}")
-
-                        copiados = 0
-                        erros    = 0
-
-                        for idx, arquivo_xml in enumerate(arquivos_xml):
-                            if self._cancelado:
-                                self.done_copy.emit(copiados, erros, f"Cancelado pelo usuário. {copiados} copiado(s).")
-                                return
-
-                            try:
-                                nome_arquivo = arquivo_xml.name.upper()
-                                palavras_evento = ['EVENTO', 'CIENCIA', 'CONFIRMACAO', 'DESCONHECIMENTO',
-                                                   'NAO_REALIZADA', 'CANCELAMENTO', 'CARTA_CORRECAO']
-                                if any(p in nome_arquivo for p in palavras_evento):
-                                    continue
-
-                                caminho_relativo = arquivo_xml.relative_to(self.origem)
-                                partes = list(caminho_relativo.parts)
-                                if len(partes) < 3:
-                                    continue
-
-                                tipos_documento = {'NFE', 'NFSE', 'CTE', 'EVENTOS'}
-                                _norm = lambda s: s.upper().replace('-', '').replace('_', '')
-                                primeira_parte = _norm(partes[0])
-                                segunda_parte  = _norm(partes[1]) if len(partes) > 1 else ''
-
-                                if primeira_parte in tipos_documento:
-                                    # Estrutura: TIPO/CNPJ/.../arquivo.xml
-                                    if len(partes) < 4:
-                                        continue
-                                    cnpj_pasta = partes[1]
-                                    tipo_pasta = partes[0]
-                                elif segunda_parte in tipos_documento:
-                                    # Estrutura: CNPJ/TIPO/DATA/arquivo.xml
-                                    cnpj_pasta = partes[0]
-                                    tipo_pasta = partes[1]
-                                else:
-                                    # Estrutura: CNPJ/DATA/TIPO/arquivo.xml
-                                    cnpj_pasta = partes[0]
-                                    tipo_pasta = partes[2] if len(partes) > 2 else partes[1]
-
-                                if "Eventos" in tipo_pasta or "Eventos" in str(arquivo_xml):
-                                    continue
-
-                                cnpj_normalizado = ''.join(c for c in cnpj_pasta if c.isdigit())
-                                if len(cnpj_normalizado) != 14:
-                                    cnpj_do_nome = mapeamento_reverso.get(cnpj_pasta)
-                                    if cnpj_do_nome and len(cnpj_do_nome) == 14:
-                                        cnpj_normalizado = cnpj_do_nome
-                                    else:
-                                        erros += 1
-                                        continue
-
-                                nome_cert = mapeamento_nomes.get(cnpj_normalizado)
-                                if not nome_cert:
-                                    # CNPJ sem certificado cadastrado: ignora silenciosamente
-                                    continue
-
-                                pasta_cert = nome_cert
-                                ano = mes = None
-                                fluxo_arquivo = 'Entradas'
-
-                                try:
-                                    tree = etree.parse(str(arquivo_xml))
-                                    root = tree.getroot()
-                                    root_tag = root.tag.split('}')[-1] if '}' in root.tag else root.tag
-                                    ns = '{http://www.portalfiscal.inf.br/cte}' if 'cte' in root_tag.lower() else '{http://www.portalfiscal.inf.br/nfe}'
-
-                                    data_elem = root.find(f'.//{ns}dhEmi')
-                                    if data_elem is None:
-                                        data_elem = root.find(f'.//{ns}dEmi')
-                                    if data_elem is None:
-                                        data_elem = root.find(f'.//{ns}dhRecbto')
-                                    if data_elem is None:
-                                        _ns_nfse = '{http://www.sped.fazenda.gov.br/nfse}'
-                                        for _tag in ('dhEmi', 'DhEmi', 'DataEmissao', 'dhRecbto'):
-                                            data_elem = root.find(f'.//{_ns_nfse}{_tag}')
-                                            if data_elem is not None:
-                                                break
-                                    if data_elem is None:
-                                        for _tag in ('dhEmi', 'DhEmi', 'DataEmissao', 'dEmi'):
-                                            data_elem = root.find(f'.//{_tag}')
-                                            if data_elem is not None:
-                                                break
-
-                                    if data_elem is not None and data_elem.text:
-                                        data_str = data_elem.text.split('T')[0]
-                                        if len(data_str) >= 7:
-                                            ano = data_str[:4]
-                                            mes = data_str[5:7]
-
-                                    _ns_nfse = '{http://www.sped.fazenda.gov.br/nfse}'
-                                    _emit_cnpj = (
-                                        root.findtext('.//{http://www.portalfiscal.inf.br/nfe}emit/{http://www.portalfiscal.inf.br/nfe}CNPJ') or
-                                        root.findtext('.//{http://www.portalfiscal.inf.br/cte}emit/{http://www.portalfiscal.inf.br/cte}CNPJ') or
-                                        root.findtext(f'.//{_ns_nfse}DPS/{_ns_nfse}infDPS/{_ns_nfse}prest/{_ns_nfse}CNPJ') or
-                                        root.findtext('.//DPS/infDPS/prest/CNPJ') or
-                                        root.findtext(f'.//{_ns_nfse}emit/{_ns_nfse}CNPJ') or
-                                        root.findtext('.//emit/CNPJ') or
-                                        root.findtext(f'.//{_ns_nfse}Prestador/{_ns_nfse}CNPJ') or
-                                        root.findtext('.//Prestador/CNPJ') or ''
-                                    )
-                                    if re.sub(r'\D', '', _emit_cnpj) == cnpj_normalizado:
-                                        fluxo_arquivo = 'Saidas'
-                                except Exception:
-                                    pass
-
-                                if not ano or not mes:
-                                    candidatos = []
-                                    if len(partes) >= 2: candidatos.append(partes[1])
-                                    if len(partes) >= 3: candidatos.append(partes[2])
-                                    for dp in candidatos:
-                                        if '-' in dp and len(dp) == 7:
-                                            _a, _m = dp[:4], dp[5:7]
-                                            if _a.isdigit() and _m.isdigit() and 1 <= int(_m) <= 12:
-                                                ano, mes = _a, _m; break
-                                        elif len(dp) == 6 and dp.isdigit():
-                                            _m, _a = dp[:2], dp[2:6]
-                                            if 1 <= int(_m) <= 12:
-                                                mes, ano = _m, _a; break
-
-                                if not ano or not mes:
-                                    now = datetime.now()
-                                    ano, mes = str(now.year), f"{now.month:02d}"
-
-                                if len(ano) != 4 or len(mes) != 2 or not ano.isdigit() or not mes.isdigit():
-                                    erros += 1; continue
-
-                                if self.formato_mes == 'MM-AAAA':
-                                    ano_mes = f"{mes}-{ano}"
-                                elif self.formato_mes == 'MMAAAA':
-                                    ano_mes = f"{mes}{ano}"
-                                elif self.formato_mes == 'AAAA/MM':
-                                    ano_mes = f"{ano}/{mes}"
-                                elif self.formato_mes == 'MM/AAAA':
-                                    ano_mes = f"{mes}/{ano}"
-                                else:
-                                    ano_mes = f"{ano}-{mes}"
-
-                                if self.organizacao_tipo == 'CERTIFICADO_TIPO_DATA':
-                                    pasta_dest = self.destino / fluxo_arquivo / pasta_cert / tipo_pasta / ano_mes
-                                elif self.organizacao_tipo == 'TIPO_CERTIFICADO':
-                                    pasta_dest = self.destino / fluxo_arquivo / tipo_pasta / pasta_cert / ano_mes
-                                else:
-                                    if self.xml_pdf_separado:
-                                        pasta_dest = self.destino / fluxo_arquivo / pasta_cert / ano_mes / tipo_pasta
-                                    else:
-                                        pasta_dest = self.destino / fluxo_arquivo / pasta_cert / ano_mes
-
-                                pasta_dest.mkdir(parents=True, exist_ok=True)
-
-                                xml_destino = pasta_dest / arquivo_xml.name
-                                if not xml_destino.exists():
-                                    shutil.copy2(arquivo_xml, xml_destino)
-                                    copiados += 1
-                                    pdf_original = arquivo_xml.with_suffix('.pdf')
-                                    if pdf_original.exists():
-                                        pdf_destino = xml_destino.with_suffix('.pdf')
-                                        if not pdf_destino.exists():
-                                            shutil.copy2(pdf_original, pdf_destino)
-
-                            except Exception as e:
-                                print(f"[ERRO] Ao copiar {arquivo_xml.name}: {e}")
-                                erros += 1
-
-                            pct = int((idx + 1) / total * 100)
-                            self.progress_update.emit(pct, f"Copiando {idx + 1}/{total}: {arquivo_xml.name}")
-
-                        self.done_copy.emit(copiados, erros, "")
-
-                    except Exception as e:
-                        import traceback
-                        self.error_copy.emit(f"{e}\n{traceback.format_exc()}")
-
+            # NOTA: _CopiaWorker está definido no nível de módulo (antes de main())
+            # para garantir compatibilidade com PyInstaller (metaclass Qt frozen).
             worker = _CopiaWorker(
                 pasta_origem, pasta_destino_path, formato_mes,
                 xml_pdf_separado, organizacao_tipo, self.db
@@ -21863,6 +21634,241 @@ class StorageConfigDialog(QDialog):
             import traceback
             traceback.print_exc()
     
+# ─────────────────────────────────────────────────────────────────────────────
+# _CopiaWorker: worker de cópia do perfil de armazenamento
+# OBRIGATÓRIO estar no nível de módulo (não dentro de método) para que o
+# sistema de metaclass do Qt funcione corretamente no executável PyInstaller.
+# ─────────────────────────────────────────────────────────────────────────────
+class _CopiaWorker(QThread):
+    progress_update = pyqtSignal(int, str)      # (valor, label)
+    done_copy       = pyqtSignal(int, int, str) # (copiados, erros, msg_final)
+    error_copy      = pyqtSignal(str)
+
+    def __init__(self, origem, destino, formato_mes,
+                 xml_pdf_separado, organizacao_tipo, db):
+        super().__init__()
+        self.origem             = origem
+        self.destino            = destino
+        self.formato_mes        = formato_mes
+        self.xml_pdf_separado   = xml_pdf_separado
+        self.organizacao_tipo   = organizacao_tipo
+        self.db                 = db
+        self._cancelado         = False
+
+    def cancelar(self):
+        self._cancelado = True
+
+    def run(self):
+        try:
+            import shutil, re
+            from lxml import etree
+            from datetime import datetime
+
+            pastas_ignorar = ['Debug de notas', 'Resumos', 'Eventos', 'Outros',
+                              'debug', 'resumos', 'eventos', 'outros']
+
+            arquivos_xml = []
+            for arquivo in self.origem.rglob('*.xml'):
+                if any(p in arquivo.parts for p in pastas_ignorar):
+                    continue
+                arquivos_xml.append(arquivo)
+
+            total = len(arquivos_xml)
+            if total == 0:
+                self.done_copy.emit(0, 0, "Nenhum arquivo XML encontrado.")
+                return
+
+            self.progress_update.emit(0, f"Copiando {total} arquivo(s)...")
+
+            # Mapeamento CNPJ → nome amigável
+            mapeamento_nomes = {}
+            mapeamento_reverso = {}
+            try:
+                certs = self.db.load_certificates()
+                for cert in certs:
+                    informante = cert.get('informante', '')
+                    nome_cert  = cert.get('nome_certificado', '')
+                    if informante and nome_cert:
+                        nome_limpo = re.sub(r'[\\/*?:"<>|]', "_", nome_cert).strip()
+                        mapeamento_nomes[informante]    = nome_limpo
+                        mapeamento_reverso[nome_limpo]  = informante
+            except Exception as e:
+                print(f"[ERRO] Ao carregar certificados: {e}")
+
+            copiados = 0
+            erros    = 0
+
+            for idx, arquivo_xml in enumerate(arquivos_xml):
+                if self._cancelado:
+                    self.done_copy.emit(copiados, erros, f"Cancelado pelo usuário. {copiados} copiado(s).")
+                    return
+
+                try:
+                    nome_arquivo = arquivo_xml.name.upper()
+                    palavras_evento = ['EVENTO', 'CIENCIA', 'CONFIRMACAO', 'DESCONHECIMENTO',
+                                       'NAO_REALIZADA', 'CANCELAMENTO', 'CARTA_CORRECAO']
+                    if any(p in nome_arquivo for p in palavras_evento):
+                        continue
+
+                    caminho_relativo = arquivo_xml.relative_to(self.origem)
+                    partes = list(caminho_relativo.parts)
+                    if len(partes) < 3:
+                        continue
+
+                    tipos_documento = {'NFE', 'NFSE', 'CTE', 'EVENTOS'}
+                    _norm = lambda s: s.upper().replace('-', '').replace('_', '')
+                    primeira_parte = _norm(partes[0])
+                    segunda_parte  = _norm(partes[1]) if len(partes) > 1 else ''
+
+                    if primeira_parte in tipos_documento:
+                        # Estrutura: TIPO/CNPJ/.../arquivo.xml
+                        if len(partes) < 4:
+                            continue
+                        cnpj_pasta = partes[1]
+                        tipo_pasta = partes[0]
+                    elif segunda_parte in tipos_documento:
+                        # Estrutura: CNPJ/TIPO/DATA/arquivo.xml
+                        cnpj_pasta = partes[0]
+                        tipo_pasta = partes[1]
+                    else:
+                        # Estrutura: CNPJ/DATA/TIPO/arquivo.xml
+                        cnpj_pasta = partes[0]
+                        tipo_pasta = partes[2] if len(partes) > 2 else partes[1]
+
+                    if "Eventos" in tipo_pasta or "Eventos" in str(arquivo_xml):
+                        continue
+
+                    cnpj_normalizado = ''.join(c for c in cnpj_pasta if c.isdigit())
+                    if len(cnpj_normalizado) != 14:
+                        cnpj_do_nome = mapeamento_reverso.get(cnpj_pasta)
+                        if cnpj_do_nome and len(cnpj_do_nome) == 14:
+                            cnpj_normalizado = cnpj_do_nome
+                        else:
+                            erros += 1
+                            continue
+
+                    nome_cert = mapeamento_nomes.get(cnpj_normalizado)
+                    if not nome_cert:
+                        # CNPJ sem certificado cadastrado: ignora silenciosamente
+                        continue
+
+                    pasta_cert = nome_cert
+                    ano = mes = None
+                    fluxo_arquivo = 'Entradas'
+
+                    try:
+                        tree = etree.parse(str(arquivo_xml))
+                        root = tree.getroot()
+                        root_tag = root.tag.split('}')[-1] if '}' in root.tag else root.tag
+                        ns = '{http://www.portalfiscal.inf.br/cte}' if 'cte' in root_tag.lower() else '{http://www.portalfiscal.inf.br/nfe}'
+
+                        data_elem = root.find(f'.//{ns}dhEmi')
+                        if data_elem is None:
+                            data_elem = root.find(f'.//{ns}dEmi')
+                        if data_elem is None:
+                            data_elem = root.find(f'.//{ns}dhRecbto')
+                        if data_elem is None:
+                            _ns_nfse = '{http://www.sped.fazenda.gov.br/nfse}'
+                            for _tag in ('dhEmi', 'DhEmi', 'DataEmissao', 'dhRecbto'):
+                                data_elem = root.find(f'.//{_ns_nfse}{_tag}')
+                                if data_elem is not None:
+                                    break
+                        if data_elem is None:
+                            for _tag in ('dhEmi', 'DhEmi', 'DataEmissao', 'dEmi'):
+                                data_elem = root.find(f'.//{_tag}')
+                                if data_elem is not None:
+                                    break
+
+                        if data_elem is not None and data_elem.text:
+                            data_str = data_elem.text.split('T')[0]
+                            if len(data_str) >= 7:
+                                ano = data_str[:4]
+                                mes = data_str[5:7]
+
+                        _ns_nfse = '{http://www.sped.fazenda.gov.br/nfse}'
+                        _emit_cnpj = (
+                            root.findtext('.//{http://www.portalfiscal.inf.br/nfe}emit/{http://www.portalfiscal.inf.br/nfe}CNPJ') or
+                            root.findtext('.//{http://www.portalfiscal.inf.br/cte}emit/{http://www.portalfiscal.inf.br/cte}CNPJ') or
+                            root.findtext(f'.//{_ns_nfse}DPS/{_ns_nfse}infDPS/{_ns_nfse}prest/{_ns_nfse}CNPJ') or
+                            root.findtext('.//DPS/infDPS/prest/CNPJ') or
+                            root.findtext(f'.//{_ns_nfse}emit/{_ns_nfse}CNPJ') or
+                            root.findtext('.//emit/CNPJ') or
+                            root.findtext(f'.//{_ns_nfse}Prestador/{_ns_nfse}CNPJ') or
+                            root.findtext('.//Prestador/CNPJ') or ''
+                        )
+                        if re.sub(r'\D', '', _emit_cnpj) == cnpj_normalizado:
+                            fluxo_arquivo = 'Saidas'
+                    except Exception:
+                        pass
+
+                    if not ano or not mes:
+                        candidatos = []
+                        if len(partes) >= 2: candidatos.append(partes[1])
+                        if len(partes) >= 3: candidatos.append(partes[2])
+                        for dp in candidatos:
+                            if '-' in dp and len(dp) == 7:
+                                _a, _m = dp[:4], dp[5:7]
+                                if _a.isdigit() and _m.isdigit() and 1 <= int(_m) <= 12:
+                                    ano, mes = _a, _m; break
+                            elif len(dp) == 6 and dp.isdigit():
+                                _m, _a = dp[:2], dp[2:6]
+                                if 1 <= int(_m) <= 12:
+                                    mes, ano = _m, _a; break
+
+                    if not ano or not mes:
+                        now = datetime.now()
+                        ano, mes = str(now.year), f"{now.month:02d}"
+
+                    if len(ano) != 4 or len(mes) != 2 or not ano.isdigit() or not mes.isdigit():
+                        erros += 1; continue
+
+                    if self.formato_mes == 'MM-AAAA':
+                        ano_mes = f"{mes}-{ano}"
+                    elif self.formato_mes == 'MMAAAA':
+                        ano_mes = f"{mes}{ano}"
+                    elif self.formato_mes == 'AAAA/MM':
+                        ano_mes = f"{ano}/{mes}"
+                    elif self.formato_mes == 'MM/AAAA':
+                        ano_mes = f"{mes}/{ano}"
+                    else:
+                        ano_mes = f"{ano}-{mes}"
+
+                    if self.organizacao_tipo == 'CERTIFICADO_TIPO_DATA':
+                        pasta_dest = self.destino / fluxo_arquivo / pasta_cert / tipo_pasta / ano_mes
+                    elif self.organizacao_tipo == 'TIPO_CERTIFICADO':
+                        pasta_dest = self.destino / fluxo_arquivo / tipo_pasta / pasta_cert / ano_mes
+                    else:
+                        if self.xml_pdf_separado:
+                            pasta_dest = self.destino / fluxo_arquivo / pasta_cert / ano_mes / tipo_pasta
+                        else:
+                            pasta_dest = self.destino / fluxo_arquivo / pasta_cert / ano_mes
+
+                    pasta_dest.mkdir(parents=True, exist_ok=True)
+
+                    xml_destino = pasta_dest / arquivo_xml.name
+                    if not xml_destino.exists():
+                        shutil.copy2(arquivo_xml, xml_destino)
+                        copiados += 1
+                        pdf_original = arquivo_xml.with_suffix('.pdf')
+                        if pdf_original.exists():
+                            pdf_destino = xml_destino.with_suffix('.pdf')
+                            if not pdf_destino.exists():
+                                shutil.copy2(pdf_original, pdf_destino)
+
+                except Exception as e:
+                    print(f"[ERRO] Ao copiar {arquivo_xml.name}: {e}")
+                    erros += 1
+
+                pct = int((idx + 1) / total * 100)
+                self.progress_update.emit(pct, f"Copiando {idx + 1}/{total}: {arquivo_xml.name}")
+
+            self.done_copy.emit(copiados, erros, "")
+
+        except Exception as e:
+            import traceback
+            self.error_copy.emit(f"{e}\n{traceback.format_exc()}")
+
+
 def main():
     # Parse argumentos de linha de comando
     parser = argparse.ArgumentParser(description='BOT Busca NFE')

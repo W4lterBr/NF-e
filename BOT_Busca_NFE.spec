@@ -2,7 +2,7 @@
 # Busca XML - PyInstaller Spec File
 # Desenvolvido por: DWM System Developer
 # Site: https://dwmsystems.up.railway.app/
-# Última atualização: 2026-05-03
+# Última atualização: 2026-05-04
 
 import os
 from pathlib import Path

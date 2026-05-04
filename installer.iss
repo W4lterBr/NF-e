@@ -1,6 +1,9 @@
 ; Script Inno Setup para Busca XML
 ; Gera instalador profissional para Windows
-; Última atualização: 2026-05-03 (v1.2.6)
+; Última atualização: 2026-05-04 (v1.2.7)
+; Notas v1.2.7:
+;   - CRÍTICO: _CopiaWorker movido para nível de módulo (fora de método) — fix trava no .exe PyInstaller.
+;     QThread com pyqtSignal definido dentro de método não funciona no executável congelado.
 ; Notas v1.2.6:
 ;   - Perfil armazenamento: CNPJs sem certificado cadastrado são ignorados (não geram pasta).
 ;   - Perfil armazenamento: pasta de DATA (ex: 2026-03) não é mais criada como tipo de documento.
