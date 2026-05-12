@@ -1,6 +1,11 @@
 ; Script Inno Setup para Busca XML
 ; Gera instalador profissional para Windows
-; Última atualização: 2026-05-04 (v1.2.7)
+; Última atualização: 2026-05-12 (v1.2.8)
+; Notas v1.2.8:
+;   - NFS-e ABRASF: corrigido regex r'\\D' que impedia normalização de CNPJ (comparacao falhava).
+;   - NFS-e ABRASF: pasta de backup usava MMAAAA hard-coded (ex: 042026); corrigido para AAAA-MM.
+;   - NFS-e ADN: backup local nao mais muda de estrutura ao trocar perfil de armazenamento.
+;     Estrutura fixa: xmls/CNPJ/NFSE/AAAA-MM/ (independente de organizacao_tipo).
 ; Notas v1.2.7:
 ;   - CRÍTICO: _CopiaWorker movido para nível de módulo (fora de método) — fix trava no .exe PyInstaller.
 ;     QThread com pyqtSignal definido dentro de método não funciona no executável congelado.

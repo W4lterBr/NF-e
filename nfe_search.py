@@ -4747,26 +4747,13 @@ def salvar_nfse_detalhada(xml_content, nsu, informante):
             
             logger.debug(f"[NFSE-SALVAR] Data: {ano}-{mes}, Formatado: {ano_mes}")
             
-            # Define estrutura de pastas baseado no perfil ativo
+            # Backup local: estrutura FIXA CNPJ/TIPO/AAAA-MM/ (independente do perfil externo).
+            # Usar o organizacao_tipo do perfil no backup local causava estruturas diferentes
+            # a cada troca de perfil, dispersando arquivos em vários padrões de pasta.
             tipo_base = "NFSE"  # Tipo base para NFS-e
-            pasta_base = str(base_dir / "xmls")
             pasta_certificado = informante  # CNPJ do informante
-            
-            # Aplica lógica de organização
-            if organizacao_tipo == 'TIPO_CERTIFICADO':
-                # 🎨 PERFIL: TIPO → CERTIFICADO → DATA
-                xml_dir = base_dir / "xmls" / tipo_base / pasta_certificado / ano_mes
-                logger.debug(f"[NFSE-SALVAR] Estrutura TIPO_CERTIFICADO: {tipo_base}/{pasta_certificado}/{ano_mes}/")
-            
-            elif organizacao_tipo == 'CERTIFICADO_TIPO_DATA':
-                # 🎨 PERFIL: CERTIFICADO → TIPO → DATA (novo v1.1.28)
-                xml_dir = base_dir / "xmls" / pasta_certificado / tipo_base / ano_mes
-                logger.debug(f"[NFSE-SALVAR] Estrutura CERTIFICADO_TIPO_DATA: {pasta_certificado}/{tipo_base}/{ano_mes}/")
-            
-            else:  # CERTIFICADO_TIPO (padrão)
-                # 🎨 PERFIL: CERTIFICADO → DATA → TIPO
-                xml_dir = base_dir / "xmls" / pasta_certificado / ano_mes / tipo_base
-                logger.debug(f"[NFSE-SALVAR] Estrutura CERTIFICADO_TIPO: {pasta_certificado}/{ano_mes}/{tipo_base}/")
+            xml_dir = base_dir / "xmls" / pasta_certificado / tipo_base / ano_mes
+            logger.debug(f"[NFSE-SALVAR] Estrutura backup local: {pasta_certificado}/{tipo_base}/{ano_mes}/")
             
             xml_dir.mkdir(parents=True, exist_ok=True)
             
@@ -5168,7 +5155,7 @@ def _salvar_nfse_abrasf(xml_nota, informante, numero, db):
     if inf_id and inf_id.startswith('NFS'):
         chave = inf_id[3:]
     elif prest_cnpj and numero:
-        chave = f"{_re.sub(r'\\D','',prest_cnpj)}_{str(numero).zfill(15)}"
+        chave = f"{_re.sub(r'\D','',prest_cnpj)}_{str(numero).zfill(15)}"
     else:
         chave = inf_id or f"ABRASF_{informante}_{numero}"
 
@@ -5184,20 +5171,18 @@ def _salvar_nfse_abrasf(xml_nota, informante, numero, db):
 
     # --- salva XML em disco ---
     informante_norm = _re.sub(r'\D', '', informante)
-    year_month = data_emissao[:7].replace('-', '') if len(data_emissao) >= 7 else _dt.now().strftime('%m%Y')
-    pasta_nfse = get_data_dir() / "xmls" / informante_norm / year_month[:4] + year_month[4:] / "NFSE"
-    # Formata corretamente: MMAAAA → pasta 042026
-    mm   = data_emissao[5:7] if len(data_emissao) >= 7 else _dt.now().strftime('%m')
     aaaa = data_emissao[:4]  if len(data_emissao) >= 4 else _dt.now().strftime('%Y')
-    pasta_nfse = get_data_dir() / "xmls" / informante_norm / f"{mm}{aaaa}" / "NFSE"
+    mm   = data_emissao[5:7] if len(data_emissao) >= 7 else _dt.now().strftime('%m')
+    # Backup local: SEMPRE AAAA-MM (independente do perfil de armazenamento)
+    pasta_nfse = get_data_dir() / "xmls" / informante_norm / f"{aaaa}-{mm}" / "NFSE"
     pasta_nfse.mkdir(parents=True, exist_ok=True)
     xml_file = pasta_nfse / f"NFSe_{numero}.xml"
     xml_file.write_bytes(xml_nota if isinstance(xml_nota, bytes) else xml_nota.encode('utf-8'))
     logger.info(f"[ABRASF] XML salvo: {xml_file}")
 
     # --- persiste no banco ---
-    informante_cnpj = _re.sub(r'\\D', '', informante)
-    if informante_cnpj == _re.sub(r'\\D', '', prest_cnpj or ''):
+    informante_cnpj = _re.sub(r'\D', '', informante)
+    if informante_cnpj == _re.sub(r'\D', '', prest_cnpj or ''):
         cnpj_emitente = prest_cnpj
         cnpj_dest     = toma_cnpj or ''
         nome_emitente = prest_nome
