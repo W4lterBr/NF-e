@@ -1,0 +1,87 @@
+# ========================================================================
+# GUIA: Como Descobrir o Endpoint de Notas Emitidas no Portal ADN
+# ========================================================================
+
+## PASSO 1: Abrir Portal ADN com DevTools
+
+1. Abra o navegador (Chrome ou Edge)
+2. Pressione F12 para abrir DevTools
+3. Vá na aba "Network" (Rede)
+4. Acesse: https://adn.nfse.gov.br
+5. Faça login com o certificado COOPSERVIÇOS
+
+## PASSO 2: Capturar Requisição de Notas Emitidas
+
+1. No portal ADN, clique em "Notas emitidas"
+2. Preencha período: 19/01/2026 a 18/02/2026
+3. Clique em "Filtrar"
+4. Na aba Network, procure por requisições do tipo:
+   - XHR (XMLHttpRequest)
+   - Fetch
+   - Com status 200 (sucesso)
+
+## PASSO 3: Identificar Endpoint Correto
+
+Procure por requisições com URL contendo:
+- /emitidas
+- /nfse
+- /consulta
+- /lista
+
+Exemplo do que você vai ver:
+```
+Request URL: https://adn.nfse.gov.br/adn/nfse/emitidas?dataInicial=2026-01-19&dataFinal=2026-02-18
+Request Method: GET
+Status Code: 200
+```
+
+## PASSO 4: Copiar Informações
+
+Clique na requisição e copie:
+
+a) URL completa
+b) Query Parameters (parâmetros)
+c) Request Headers (cabeçalhos)
+d) Response (resposta JSON)
+
+## PASSO 5: Enviar Informações
+
+Cole as informações aqui no chat:
+
+```
+URL: [cole aqui]
+Parâmetros: [cole aqui]
+Headers especiais: [cole aqui se houver]
+```
+
+## EXEMPLO DO QUE PROCURAR:
+
+No DevTools, você verá algo como:
+
+```
+GET https://adn.nfse.gov.br/adn/v1/nfse/emitidas
+Query Params:
+  - cnpj: 56237242000158
+  - dataInicial: 2026-01-19
+  - dataFinal: 2026-02-18
+  - page: 1
+  - size: 50
+
+Response:
+{
+  "data": [
+    {
+      "numero": "2600000001",
+      "dataEmissao": "2026-02-13",
+      "chave": "...",
+      "valor": 57845.58
+    },
+    ...
+  ]
+}
+```
+
+========================================================================
+IMPORTANTE: Com essas informações, consigo implementar a busca
+automática completa!
+========================================================================

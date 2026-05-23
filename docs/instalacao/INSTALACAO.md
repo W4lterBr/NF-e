@@ -1,313 +1,191 @@
-# 📦 Guia de Instalação - BOT Busca NFE
-
-## Sistema de Busca e Gerenciamento de NF-e, CT-e e NFS-e
-
----
+# 🚀 Guia de Instalação - Busca NFE
 
 ## 📋 Requisitos do Sistema
 
-### Windows
-- **Sistema Operacional**: Windows 10 ou 11 (64-bit)
-- **Python**: 3.10 ou superior
-- **RAM**: Mínimo 4GB (Recomendado 8GB)
-- **Espaço em Disco**: 500MB livres
-- **Internet**: Conexão estável para comunicação com SEFAZ
-
-### Linux (Opcional)
-- Ubuntu 20.04+, Debian 11+, ou distribuições compatíveis
-- Python 3.10+
-- Pacotes: `python3-dev`, `libxml2-dev`, `libxslt1-dev`
+- **Sistema Operacional:** Windows 10/11 (64-bit)
+- **Python:** 3.10, 3.11 ou 3.12
+- **Espaço em disco:** ~500 MB para o projeto + dependências
+- **RAM:** Mínimo 4GB (Recomendado 8GB)
 
 ---
 
-## 🚀 Instalação Passo a Passo
+## 📥 Instalação em Outro PC
 
-### 1️⃣ Instalar Python
+### **Método 0: Instalação AUTOMÁTICA** ⭐ **NOVO!**
 
-#### Windows:
-1. Baixe Python em: https://www.python.org/downloads/
-2. **IMPORTANTE**: Marque a opção "Add Python to PATH"
-3. Escolha "Install Now"
-4. Verifique a instalação:
-   ```cmd
-   python --version
-   ```
+**O jeito mais fácil!** Script inteligente que detecta tudo automaticamente:
 
-#### Linux:
 ```bash
-sudo apt update
-sudo apt install python3 python3-pip python3-venv python3-dev
-sudo apt install libxml2-dev libxslt1-dev  # Para lxml
+# 1. Extraia ou clone o projeto
+# 2. Execute o instalador automático:
+instalar_auto.bat
 ```
 
+**Pronto!** O script faz tudo sozinho:
+- ✅ Detecta Python automaticamente (py, python, python3, locais comuns)
+- ✅ Verifica versão (3.10+)
+- ✅ Cria ambiente virtual
+- ✅ Instala todas as dependências
+- ✅ Verifica pacotes críticos
+- ✅ Sistema de retry (3 tentativas)
+
+📖 **Documentação completa:** [README_INSTALADOR.md](README_INSTALADOR.md)
+
 ---
 
-### 2️⃣ Baixar o Sistema
+### **Método 1: Instalação Rápida (Manual)**
 
-**Opção A - Download ZIP:**
-1. Baixe o arquivo ZIP do sistema
-2. Extraia para uma pasta (ex: `C:\BOT-Busca-NFE\`)
-
-**Opção B - Git (Recomendado):**
 ```bash
-git clone <URL_DO_REPOSITORIO> C:\BOT-Busca-NFE
-cd C:\BOT-Busca-NFE
-```
+# 1. Clone ou extraia o projeto
+git clone https://github.com/W4lterBr/NF-e.git
+cd NF-e
 
----
-
-### 3️⃣ Criar Ambiente Virtual
-
-```cmd
-# Windows (CMD)
-cd C:\BOT-Busca-NFE
+# 2. Crie ambiente virtual
 python -m venv .venv
 
-# Ativar ambiente virtual
+# 3. Ative o ambiente virtual
 .venv\Scripts\activate
-```
 
-```bash
-# Linux
-cd /caminho/para/BOT-Busca-NFE
-python3 -m venv .venv
-
-# Ativar ambiente virtual
-source .venv/bin/activate
-```
-
-**✅ Você verá `(.venv)` no início do prompt**
-
----
-
-### 4️⃣ Instalar Dependências
-
-```cmd
-# Com ambiente virtual ATIVADO:
-pip install --upgrade pip
+# 4. Instale as dependências
 pip install -r requirements.txt
-```
 
-**⏱️ Aguarde 5-10 minutos para instalação completa**
-
----
-
-### 5️⃣ Verificar Instalação
-
-Execute o script de verificação:
-
-```cmd
-python -c "import PyQt5; import lxml; import requests; import cryptography; print('✅ Todas as dependências instaladas com sucesso!')"
+# 5. Execute o sistema
+python "Busca NF-e.py"
 ```
 
 ---
 
-## 📁 Estrutura de Pastas Obrigatórias
+### **Método 2: Instalação com Versões Exatas**
 
-O sistema criará automaticamente, mas você pode criar manualmente:
+Use este método se precisar reproduzir o ambiente **exatamente** como está neste PC:
 
-```
-BOT-Busca-NFE/
-├── modules/              # Módulos Python (OBRIGATÓRIO)
-├── Arquivo_xsd/          # Schemas XSD para validação (OBRIGATÓRIO)
-├── Icone/                # Ícones da interface (OBRIGATÓRIO)
-│   └── xml.png
-├── xmls/                 # XMLs baixados (CRIADO AUTOMATICAMENTE)
-├── logs/                 # Logs do sistema (CRIADO AUTOMATICAMENTE)
-├── .venv/                # Ambiente virtual Python
-├── notas.db              # Banco de dados (CRIADO AUTOMATICAMENTE)
-├── api_credentials.csv   # Credenciais Nuvem Fiscal (OPCIONAL)
-└── requirements.txt      # Dependências Python
-```
-
----
-
-## 🔧 Configuração Inicial
-
-### 1. Certificados Digitais
-
-1. Inicie o sistema:
-   ```cmd
-   python interface_pyqt5.py
-   ```
-
-2. Vá em **Certificados > Adicionar Certificado**
-
-3. Preencha:
-   - **Caminho**: Selecione arquivo `.pfx` ou `.p12`
-   - **Senha**: Senha do certificado
-   - **CNPJ/CPF**: Titular do certificado
-   - **Informante**: CNPJ que irá buscar notas (pode ser diferente)
-   - **UF**: Estado (código UF, ex: 35 para SP)
-
-4. Clique em **Salvar**
-
-### 2. Credenciais Nuvem Fiscal (Opcional - para NFS-e)
-
-Crie o arquivo `api_credentials.csv`:
-
-```csv
-Client ID,Client Secret
-seu_client_id,seu_client_secret
-```
-
----
-
-## ▶️ Executando o Sistema
-
-### Modo Interface Gráfica (Recomendado)
-
-```cmd
-# Ative o ambiente virtual primeiro
-.venv\Scripts\activate
-
-# Execute a interface
-python interface_pyqt5.py
-```
-
-### Modo Terminal (Busca Automática)
-
-```cmd
-python nfe_search.py
-```
-
----
-
-## 🛠️ Solução de Problemas
-
-### ❌ Erro: "ModuleNotFoundError: No module named 'PyQt5'"
-**Solução:**
-```cmd
-# Verifique se o ambiente virtual está ativado
-.venv\Scripts\activate
-
-# Reinstale
-pip install PyQt5
-```
-
-### ❌ Erro: "lxml installation failed"
-**Windows - Solução:**
-```cmd
-# Baixe wheel pré-compilado:
-pip install lxml --only-binary :all:
-```
-
-**Linux - Solução:**
 ```bash
-sudo apt install python3-dev libxml2-dev libxslt1-dev
-pip install lxml
-```
+# Siga passos 1-3 do Método 1, depois:
 
-### ❌ Erro: "No module named 'modules'"
-**Solução:**
-```cmd
-# Certifique-se de estar no diretório correto
-cd C:\BOT-Busca-NFE
+# 4. Instale versões exatas
+pip install -r requirements-frozen.txt
 
-# Verifique se a pasta modules existe
-dir modules
-```
-
-### ❌ Erro certificado: "Unable to read certificate"
-**Solução:**
-1. Verifique se o arquivo `.pfx` ou `.p12` está acessível
-2. Confirme se a senha está correta
-3. Tente exportar o certificado novamente (ICP-Brasil)
-
-### ❌ Interface não abre no Linux
-**Solução:**
-```bash
-sudo apt install python3-pyqt5
-export QT_QPA_PLATFORM=xcb
-python interface_pyqt5.py
+# 5. Execute o sistema
+python "Busca NF-e.py"
 ```
 
 ---
 
-## 📊 Primeiros Passos Após Instalação
+### **Método 3: Instalador Executável (Usuário Final)**
 
-1. **Adicione um Certificado Digital** (Menu Certificados)
-2. **Configure Intervalo de Busca** (Menu Tarefas)
-3. **Execute Busca Manual** (Botão "Buscar Notas")
-4. **Verifique XMLs Baixados** na pasta `xmls/`
-5. **Gere PDFs** clicando 2x nas notas
+Para usuários que **não precisam do ambiente de desenvolvimento**:
+
+1. Baixe o instalador: `Output\Busca_XML_Setup_v1.0.96.exe`
+2. Execute o instalador
+3. Siga as instruções na tela
+4. Pronto! O sistema está instalado e pronto para uso
 
 ---
 
-## 🔄 Atualizações
+## 🔧 Verificação da Instalação
 
-### Manual:
-1. Baixe nova versão
-2. Substitua arquivos (MANTENHA `notas.db` e `xmls/`)
-3. Reinstale dependências:
-   ```cmd
-   pip install -r requirements.txt --upgrade
-   ```
+Após instalar, verifique se tudo está correto:
 
-### Git:
 ```bash
-git pull origin main
-pip install -r requirements.txt --upgrade
+# Com ambiente virtual ativado
+python -c "import PyQt5, lxml, requests, cryptography; print('✅ Instalação OK!')"
+```
+
+Ou execute o script de verificação:
+
+```bash
+python verificar_instalacao.py
+```
+
+---
+
+## 📦 Estrutura de Pastas Necessárias
+
+O sistema criará automaticamente as pastas necessárias na primeira execução:
+
+```
+Busca NFE/
+├── .venv/              # Ambiente virtual
+├── modules/            # Módulos do sistema
+├── Arquivo_xsd/        # Schemas XSD (incluído no projeto)
+├── Icone/              # Ícones da interface (incluído no projeto)
+├── xmls/               # XMLs baixados (criado automaticamente)
+├── logs/               # Logs do sistema (criado automaticamente)
+└── Output/             # PDFs gerados (criado automaticamente)
+```
+
+---
+
+## 🐛 Problemas Comuns
+
+### **Erro: "No module named 'PyQt5'"**
+
+```bash
+pip install PyQt5==5.15.11
+```
+
+### **Erro: "Microsoft Visual C++ 14.0 is required"**
+
+1. Baixe: [Visual C++ Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/)
+2. Instale apenas "Desktop development with C++"
+3. Reinicie e tente novamente
+
+### **Erro: "lxml installation failed"**
+
+```bash
+pip install --upgrade pip wheel
+pip install lxml==5.2.2
+```
+
+---
+
+## 🔐 Certificados Digitais
+
+O sistema requer certificados digitais A1 (.pfx) para comunicação com a SEFAZ.
+
+**Primeira execução:**
+1. Abra o sistema
+2. Menu **Configurações → Certificados**
+3. Clique em **"Adicionar Certificado"**
+4. Selecione seu arquivo `.pfx` e informe a senha
+
+---
+
+## 📚 Documentação Completa
+
+- **Build:** [BUILD_README.md](BUILD_README.md)
+- **Sistema:** [docs/sistema/DOCUMENTACAO_SISTEMA.md](docs/sistema/DOCUMENTACAO_SISTEMA.md)
+- **Certificados:** [docs/certificados/CERTIFICADOS_README.md](docs/certificados/CERTIFICADOS_README.md)
+- **Troubleshooting:** [docs/troubleshooting/](docs/troubleshooting/)
+
+---
+
+## 💻 Desenvolvimento
+
+Para contribuir com o projeto:
+
+```bash
+# Instale dependências de desenvolvimento
+pip install PyInstaller autopep8 pylint pytest
+
+# Execute testes
+pytest tests/
+
+# Compile executável
+.\build.bat
 ```
 
 ---
 
 ## 📞 Suporte
 
-### Logs do Sistema:
-- Localização: `logs/busca_nfe_YYYY-MM-DD.log`
-- Útil para diagnóstico de erros
-
-### Informações do Sistema:
-```cmd
-python --version
-pip list
-```
+- **GitHub:** https://github.com/W4lterBr/NF-e
+- **Issues:** https://github.com/W4lterBr/NF-e/issues
+- **Documentação:** [docs/README.md](docs/README.md)
 
 ---
 
-## ⚠️ Avisos Importantes
-
-1. **Certificado Digital**: 
-   - Obrigatório para NF-e e CT-e
-   - Deve estar dentro da validade
-   - Tipo A1 (arquivo .pfx)
-
-2. **Conexão Internet**:
-   - Necessária para comunicação com SEFAZ
-   - Firewall pode bloquear - libere Python
-
-3. **Antivírus**:
-   - Pode bloquear execução
-   - Adicione pasta à lista de exceções
-
-4. **Backup**:
-   - Faça backup regular de `notas.db`
-   - XMLs estão em `xmls/` - também fazer backup
-
----
-
-## 📝 Licença
-
-Este sistema é proprietário. Uso restrito conforme contrato.
-
----
-
-## 🎯 Recursos Principais
-
-- ✅ Busca automática NF-e (Distribuição DFe)
-- ✅ Busca automática CT-e
-- ✅ Busca NFS-e (múltiplos municípios)
-- ✅ Geração de PDF de NF-e/CT-e
-- ✅ Manifestação de eventos (Ciência, Confirmação, etc.)
-- ✅ Controle anti-duplicata de manifestações
-- ✅ Filtros avançados por CNPJ, data, valor
-- ✅ Exportação para Excel/CSV
-- ✅ Atualização automática
-- ✅ Multi-certificado (matriz e filiais)
-
----
-
-**Versão do Documento**: 2.0  
-**Última Atualização**: 18/12/2025  
-**Compatível com**: Python 3.10+ | Windows 10/11 | Linux Ubuntu 20.04+
+**Desenvolvido por:** DWM System Developer  
+**Site:** https://dwmsystems.up.railway.app/  
+**Versão:** 1.0.96  
+**Última atualização:** 06/02/2026

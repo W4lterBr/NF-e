@@ -1,0 +1,43 @@
+# ====================================
+# BOT - Busca NFE - Requirements (FROZEN)
+# Versões exatas para reprodução do ambiente
+# Data: 06/02/2026
+# Python: 3.12
+# ====================================
+
+# Interface Gráfica
+PyQt5==5.15.11
+PyQt5-Qt5==5.15.2
+PyQt5_sip==12.15.0
+
+# Processamento XML
+lxml==5.2.2
+
+# Requisições HTTP e SOAP
+requests==2.32.3
+requests-pkcs12==1.25
+urllib3==2.2.2
+zeep==4.3.1
+
+# Criptografia e Certificados Digitais
+cryptography==46.0.4
+pyOpenSSL==24.2.1
+wincertstore==0.2.1
+signxml==4.0.2
+
+# PDF Generation
+reportlab==4.2.2
+PyPDF2==3.0.1
+
+# Manipulação de Imagens
+Pillow==10.1.0
+
+# Excel Export
+openpyxl==3.1.5
+
+# Data e Tempo
+python-dateutil==2.9.0.post0
+
+# Utilitários
+python-dotenv==1.0.0
+psutil==6.0.0

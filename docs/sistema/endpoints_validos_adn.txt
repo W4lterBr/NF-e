@@ -1,0 +1,45 @@
+ENDPOINTS VÁLIDOS ADN NACIONAL
+================================================================================
+
+429 - https://adn.nfse.gov.br/contribuintes/dfe
+   Existe mas rate limit
+
+429 - https://adn.nfse.gov.br/contribuintes/nfse
+   Existe mas rate limit
+
+429 - https://adn.nfse.gov.br/contribuintes/NFSe
+   Existe mas rate limit
+
+429 - https://adn.nfse.gov.br/contribuintes/nfs-e
+   Existe mas rate limit
+
+429 - https://adn.nfse.gov.br/contribuintes/nfse/emitidas
+   Existe mas rate limit
+
+429 - https://adn.nfse.gov.br/contribuintes/NFSe/emitidas
+   Existe mas rate limit
+
+429 - https://adn.nfse.gov.br/contribuintes/consulta/nfse
+   Existe mas rate limit
+
+429 - https://adn.nfse.gov.br/contribuintes/consulta/emitidas
+   Existe mas rate limit
+
+429 - https://adn.nfse.gov.br/contribuintes/nfse/periodo
+   Existe mas rate limit
+
+429 - https://adn.nfse.gov.br/contribuintes/periodo
+   Existe mas rate limit
+
+429 - https://adn.nfse.gov.br/contribuintes/nfse/lista
+   Existe mas rate limit
+
+429 - https://adn.nfse.gov.br/contribuintes/lista
+   Existe mas rate limit
+
+429 - https://adn.nfse.gov.br/contribuintes/documentos
+   Existe mas rate limit
+
+429 - https://adn.nfse.gov.br/contribuintes/documentos/emitidos
+   Existe mas rate limit
+

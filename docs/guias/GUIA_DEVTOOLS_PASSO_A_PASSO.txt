@@ -1,0 +1,156 @@
+# ============================================================================
+# GUIA PASSO A PASSO: Descobrir Endpoint de Notas Emitidas no Portal ADN
+# ============================================================================
+
+## PREPARAÇÃO
+
+1. Abra o navegador Chrome ou Edge
+2. Certifique-se de ter o certificado COOPSERVIÇOS instalado
+3. Tenha este guia à mão
+
+## PASSO 1: ABRIR DEVTOOLS ANTES DE ACESSAR O PORTAL
+
+🔧 IMPORTANTE: Abra as DevTools ANTES de fazer login!
+
+a) Abra uma aba em branco
+b) Pressione F12 (ou Ctrl+Shift+I)
+c) Clique na aba "Network" (Rede)
+d) ✅ Marque a opção "Preserve log" (Preservar registro)
+
+## PASSO 2: ACESSAR O PORTAL ADN
+
+URL: https://adn.nfse.gov.br
+
+a) Cole a URL na barra de endereço
+b) Pressione Enter
+c) Faça login com o certificado COOPSERVIÇOS quando solicitado
+
+## PASSO 3: ACESSAR "NOTAS EMITIDAS"
+
+a) No portal ADN, procure o menu ou opção "Notas emitidas"
+b) Clique nessa opção
+c) Você verá requisições aparecendo na aba Network
+
+## PASSO 4: FILTRAR PERÍODO E CAPTURAR REQUISIÇÃO
+
+a) Configure o período:
+   - Data Inicial: 19/01/2026
+   - Data Final: 18/02/2026
+
+b) Clique no botão "Filtrar" ou "Consultar"
+
+c) Na aba Network, você verá várias requisições aparecendo
+
+## PASSO 5: IDENTIFICAR A REQUISIÇÃO CORRETA
+
+🎯 Procure por requisições com:
+   - Type: xhr, fetch ou json
+   - Status: 200 (sucesso)
+   - Name contendo: "emitida", "nfse", "nota", "lista", "periodo"
+
+💡 DICA: Use o filtro na aba Network:
+   - Digite: "nfse" ou "emitida" na caixa de busca
+
+## PASSO 6: COPIAR INFORMAÇÕES DA REQUISIÇÃO
+
+Clique na requisição que retornou as notas e copie:
+
+### A) URL COMPLETA
+   - Clique na requisição
+   - Aba "Headers" (Cabeçalhos)
+   - Procure "Request URL:"
+   - Copie a URL completa
+
+   Exemplo:
+   https://adn.nfse.gov.br/contribuintes/nfse/emitidas?dataInicial=2026-01-19&dataFinal=2026-02-18
+
+### B) QUERY PARAMETERS (Parâmetros)
+   - Ainda na aba "Headers"
+   - Role até "Query String Parameters"
+   - Copie todos os parâmetros
+
+   Exemplo:
+   dataInicial: 2026-01-19
+   dataFinal: 2026-02-18
+   page: 1
+   size: 50
+
+### C) REQUEST HEADERS (Cabeçalhos da Requisição) - OPCIONAL
+   - Role até "Request Headers"
+   - Veja se há algum cabeçalho especial além dos padrões
+   - Copie se houver algo como: X-API-Key, Authorization, etc.
+
+### D) RESPONSE (Resposta JSON)
+   - Clique na aba "Response" ou "Preview"
+   - Você verá a estrutura JSON das notas
+   - Copie UMA nota completa como exemplo
+
+   Exemplo:
+   {
+     "data": [
+       {
+         "numero": "2600000001",
+         "dataEmissao": "2026-02-13",
+         "chave": "31...",
+         "valor": 57845.58,
+         ...
+       }
+     ]
+   }
+
+## PASSO 7: ENVIAR INFORMAÇÕES PARA MIM
+
+Cole aqui no chat:
+
+```
+=== ENDPOINT DESCOBERTO ===
+
+URL Completa:
+[cole aqui]
+
+Método HTTP:
+[ ] GET
+[ ] POST
+[ ] PUT
+
+Query Parameters:
+[cole aqui]
+
+Headers Especiais (se houver):
+[cole aqui ou escreva "nenhum"]
+
+Exemplo de Resposta JSON (uma nota):
+[cole aqui]
+```
+
+## ❓ PROBLEMAS COMUNS
+
+### "Não encontro a opção 'Notas emitidas'"
+- Procure por: "Consultar notas", "Minhas notas", "Documentos emitidos"
+- Ou navegue pelos menus principais: Serviços, Consultas, Emissão
+
+### "A aba Network está vazia"
+- ✅ Certifique-se de marcar "Preserve log"
+- Recarregue a página (F5) com DevTools aberto
+
+### "Muitas requisições aparecem"
+- Use o filtro: digite "nfse" ou "json"
+- Procure por Status 200 (verde)
+- Ignore requisições para imagens (.png, .jpg, .svg)
+
+### "Não sei qual requisição é a correta"
+- Procure pela maior em tamanho (Size)
+- Clique e veja a resposta - deve conter os dados das notas
+- Tipo deve ser "json" ou "xhr"
+
+## ✅ CHECKLIST FINAL
+
+Antes de enviar, confirme que tem:
+- [ ] URL completa
+- [ ] Método HTTP (GET/POST)
+- [ ] Parâmetros da query string
+- [ ] Exemplo de resposta JSON
+
+============================================================================
+Com essas informações, implemento a busca automática em 5 minutos!
+============================================================================

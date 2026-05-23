@@ -1,0 +1,43 @@
+=== ENDPOINT DESCOBERTO ===
+
+URL Completa:
+(Cole aqui a URL completa que aparece em "Request URL")
+Exemplo: https://adn.nfse.gov.br/contribuintes/nfse/emitidas?dataInicial=2026-01-19&dataFinal=2026-02-18
+
+
+Método HTTP:
+[ ] GET
+[ ] POST
+[ ] PUT
+[ ] Outro: _______
+
+
+Query Parameters (parâmetros da URL):
+(Cole aqui os parâmetros que aparecem em "Query String Parameters")
+Exemplo:
+dataInicial: 2026-01-19
+dataFinal: 2026-02-18
+page: 1
+size: 50
+
+
+Headers Especiais (se houver):
+(Cole aqui qualquer header diferente de Accept, Content-Type, User-Agent)
+(Se não houver nenhum especial, escreva "nenhum")
+
+
+
+Exemplo de Resposta JSON:
+(Cole aqui um exemplo da estrutura JSON retornada - pode copiar da aba "Preview" ou "Response")
+(Não precisa copiar TODAS as notas, apenas uma ou duas para eu ver a estrutura)
+
+
+
+=== INFORMAÇÕES ADICIONAIS (opcional) ===
+
+Total de notas retornadas na consulta:
+(Quantas notas de 2025/2026 você viu na lista?)
+
+
+Observações:
+(Alguma informação adicional que achar relevante)
