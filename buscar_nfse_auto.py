@@ -58,31 +58,25 @@ def salvar_xml_nfse(db, cnpj, xml_content, numero_nfse, data_emissao):
         from modules.database import DatabaseManager
         
         # Salva localmente (backup) usando função padrão
-        resultado_local = salvar_xml_por_certificado(xml_content, cnpj)
+        resultado_local = salvar_xml_por_certificado(xml_content, cnpj, pasta_base="xmls")
         caminho_local = resultado_local[0] if isinstance(resultado_local, tuple) else resultado_local
         logger.info(f"   💾 XML salvo localmente (backup): {caminho_local}")
         
-        # Verifica se há storage configurado
+        # Salva em TODOS os perfis ativos (sistema multi-perfis)
         try:
             from nfe_search import get_data_dir
             _db_path = str(get_data_dir() / 'notas.db')
             db_main = DatabaseManager(_db_path)
-            pasta_storage = db_main.get_config('storage_pasta_base', 'xmls')
+            nome_cert = db_main.get_cert_nome_by_informante(cnpj)
             
-            if pasta_storage and pasta_storage != 'xmls':
-                # Busca nome amigável do certificado
-                nome_cert = db_main.get_cert_nome_by_informante(cnpj)
-                
-                # Salva também no storage
-                resultado_storage = salvar_xml_por_certificado(xml_content, cnpj, pasta_base=pasta_storage, nome_certificado=nome_cert)
-                caminho_storage = resultado_storage[0] if isinstance(resultado_storage, tuple) else resultado_storage
-                logger.info(f"   💾 XML salvo no armazenamento: {caminho_storage}")
-                return (caminho_local, caminho_storage)
-            else:
-                return (caminho_local, None)
+            resultado_perfis = salvar_xml_por_certificado(xml_content, cnpj, pasta_base=None, nome_certificado=nome_cert)
+            caminho_perfis = resultado_perfis[0] if isinstance(resultado_perfis, tuple) else resultado_perfis
+            if caminho_perfis:
+                logger.info(f"   💾 XML salvo nos perfis de armazenamento: {caminho_perfis}")
+            return (caminho_local, caminho_perfis)
                 
         except Exception as e:
-            logger.warning(f"   ⚠️  Não foi possível salvar no storage: {e}")
+            logger.warning(f"   ⚠️  Não foi possível salvar nos perfis: {e}")
             return (caminho_local, None)
         
     except Exception as e:

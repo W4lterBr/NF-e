@@ -1399,6 +1399,7 @@ class MainWindow(QMainWindow):
                 
                 def run(self):
                     try:
+                        import sys as _sys_w1; _sys_w1.path.insert(0, str(BASE_DIR)) if str(BASE_DIR) not in _sys_w1.path else None
                         from nfe_search import atualizar_status_notas_lote
                         stats = atualizar_status_notas_lote(
                             self.db,
@@ -1528,6 +1529,7 @@ class MainWindow(QMainWindow):
                 
                 def run(self):
                     try:
+                        import sys as _sys_w2; _sys_w2.path.insert(0, str(BASE_DIR)) if str(BASE_DIR) not in _sys_w2.path else None
                         from nfe_search import atualizar_status_notas_lote
                         
                         # Primeiro: NF-es
@@ -4166,10 +4168,12 @@ class MainWindow(QMainWindow):
                             from datetime import datetime
                             year_month = datetime.now().strftime("%Y-%m")
                         
-                        xmls_root = DATA_DIR / "xmls" / informante / tipo / year_month
-                        xmls_root.mkdir(parents=True, exist_ok=True)
-                        xml_file = xmls_root / f"{chave}.xml"
-                        xml_file.write_text(xml_text, encoding='utf-8')
+                        import sys as _sys_av; _sys_av.path.insert(0, str(BASE_DIR)) if str(BASE_DIR) not in _sys_av.path else None
+                        from nfe_search import salvar_xml_por_certificado
+                        _nome_cert_av = self.db.get_cert_nome_by_informante(informante)
+                        _res_av = salvar_xml_por_certificado(xml_text, informante, pasta_base="xmls", nome_certificado=_nome_cert_av)
+                        xml_file = Path(_res_av[0] if isinstance(_res_av, tuple) else _res_av) if _res_av else DATA_DIR / "xmls" / informante / tipo / year_month / f"{chave}.xml"
+                        salvar_xml_por_certificado(xml_text, informante, pasta_base=None, nome_certificado=_nome_cert_av)
                         
                         # Atualiza banco
                         self.db.register_xml_download(chave, str(xml_file), informante)
@@ -6050,6 +6054,7 @@ class MainWindow(QMainWindow):
         
         # Busca na SEFAZ
         try:
+            import sys as _sys_bxd; _sys_bxd.path.insert(0, str(BASE_DIR)) if str(BASE_DIR) not in _sys_bxd.path else None
             from nfe_search import consultar_nfe_por_chave
             
             self.set_status(f"Buscando XML completo da chave {chave[:10]}...")
@@ -6094,6 +6099,7 @@ class MainWindow(QMainWindow):
                     )
                 else:
                     # XML completo obtido com sucesso
+                    import sys as _sys_bxd2; _sys_bxd2.path.insert(0, str(BASE_DIR)) if str(BASE_DIR) not in _sys_bxd2.path else None
                     from nfe_search import salvar_xml_por_certificado
                     
                     # 🆕 ARMAZENAMENTO AUTOMÁTICO: Salva em backup local + TODOS os perfis ativos
@@ -6316,6 +6322,7 @@ class MainWindow(QMainWindow):
         is_cte = modelo == '57'
         
         try:
+            import sys as _sys_bxp; _sys_bxp.path.insert(0, str(BASE_DIR)) if str(BASE_DIR) not in _sys_bxp.path else None
             from nfe_search import NFeService, salvar_xml_por_certificado, extrair_nota_detalhada
             from nfe_search import cte_consultar_por_chave
             from modules.manifestacao_service import ManifestacaoService
@@ -6400,7 +6407,36 @@ class MainWindow(QMainWindow):
                                 status="REGISTRADA",
                                 protocolo=protocolo
                             )
-                            
+
+                            # Salva XML de resposta da manifestação na pasta de Eventos
+                            try:
+                                from datetime import datetime as _dtn_ev
+                                _inf_ev = informante or cert_cnpj
+                                _ano_mes_ev = _dtn_ev.now().strftime('%Y-%m')
+                                _ts_ev = _dtn_ev.now().strftime('%Y%m%d%H%M%S')
+                                _nome_ev = f"{chave}_210210_{_ts_ev}.xml"
+                                _pasta_ev_local = DATA_DIR / "xmls" / _inf_ev / _ano_mes_ev / "Eventos"
+                                _pasta_ev_local.mkdir(parents=True, exist_ok=True)
+                                _dest_ev_local = _pasta_ev_local / _nome_ev
+                                if xml_resposta and not _dest_ev_local.exists():
+                                    _dest_ev_local.write_text(xml_resposta, encoding='utf-8')
+                                try:
+                                    with self.db._connect() as _conn_ev:
+                                        _perfis_ev = _conn_ev.execute(
+                                            "SELECT pasta_base FROM perfis_armazenamento WHERE ativo=1"
+                                        ).fetchall()
+                                    for (_perf_pasta,) in _perfis_ev:
+                                        _pasta_ev_perf = Path(_perf_pasta) / _inf_ev / _ano_mes_ev / "Eventos"
+                                        _pasta_ev_perf.mkdir(parents=True, exist_ok=True)
+                                        _dest_ev_perf = _pasta_ev_perf / _nome_ev
+                                        if xml_resposta and not _dest_ev_perf.exists():
+                                            _dest_ev_perf.write_text(xml_resposta, encoding='utf-8')
+                                except Exception as _pe_ev:
+                                    print(f"[MANIFESTAÇÃO] Aviso ao salvar evento nos perfis: {_pe_ev}")
+                                print(f"[MANIFESTAÇÃO] 💾 XML evento salvo: {_dest_ev_local}")
+                            except Exception as _se_ev:
+                                print(f"[MANIFESTAÇÃO] Aviso ao salvar XML do evento: {_se_ev}")
+
                             self.set_status("⏱️ Aguardando processamento SEFAZ (3s)...", 0)
                             QApplication.processEvents()
                             time.sleep(3)  # Aguarda SEFAZ processar a manifestação
@@ -6851,6 +6887,7 @@ class MainWindow(QMainWindow):
             cert_cnpj: CNPJ do certificado
         """
         try:
+            import sys as _sys_adl; _sys_adl.path.insert(0, str(BASE_DIR)) if str(BASE_DIR) not in _sys_adl.path else None
             from nfe_search import NFeService, salvar_xml_por_certificado, extrair_nota_detalhada, XMLProcessor
             
             print(f"[AUTO-DOWNLOAD] 🔄 Buscando XML completo da chave {chave[:25]}...")
@@ -7266,6 +7303,7 @@ class MainWindow(QMainWindow):
                 
                 if xml_resposta and ('retCancNFe' in xml_resposta or 'procEventoNFe' in xml_resposta):
                     # Salva o evento
+                    import sys as _sys_bec; _sys_bec.path.insert(0, str(BASE_DIR)) if str(BASE_DIR) not in _sys_bec.path else None
                     from nfe_search import salvar_xml_por_certificado
                     
                     # 🆕 ARMAZENAMENTO AUTOMÁTICO: Salva em backup local + TODOS os perfis ativos
@@ -9349,11 +9387,6 @@ class MainWindow(QMainWindow):
                 )
                 return
             
-            # ✅ NÃO salva XML de retorno da manifestação (retEnvEvento)
-            # O retEnvEvento é apenas a confirmação do protocolo, não contém a nota fiscal
-            # O XML completo da nota será baixado separadamente se necessário
-            # Removido: salvar_xml_por_certificado(xml_resposta, ...) - causava SEM_NUMERO-SEM_NOME.xml
-            
             # Registra no banco
             self.db.register_manifestacao(
                 chave=chave,
@@ -9362,7 +9395,35 @@ class MainWindow(QMainWindow):
                 status="REGISTRADA",
                 protocolo=protocolo
             )
-            
+
+            # Salva XML de resposta da manifestação na pasta de Eventos
+            try:
+                from datetime import datetime as _dtn_ev
+                _ano_mes_ev = _dtn_ev.now().strftime('%Y-%m')
+                _ts_ev = _dtn_ev.now().strftime('%Y%m%d%H%M%S')
+                _nome_ev = f"{chave}_{tipo_evento}_{_ts_ev}.xml"
+                _pasta_ev_local = DATA_DIR / "xmls" / informante / _ano_mes_ev / "Eventos"
+                _pasta_ev_local.mkdir(parents=True, exist_ok=True)
+                _dest_ev_local = _pasta_ev_local / _nome_ev
+                if xml_resposta and not _dest_ev_local.exists():
+                    _dest_ev_local.write_text(xml_resposta, encoding='utf-8')
+                try:
+                    with self.db._connect() as _conn_ev:
+                        _perfis_ev = _conn_ev.execute(
+                            "SELECT pasta_base FROM perfis_armazenamento WHERE ativo=1"
+                        ).fetchall()
+                    for (_perf_pasta,) in _perfis_ev:
+                        _pasta_ev_perf = Path(_perf_pasta) / informante / _ano_mes_ev / "Eventos"
+                        _pasta_ev_perf.mkdir(parents=True, exist_ok=True)
+                        _dest_ev_perf = _pasta_ev_perf / _nome_ev
+                        if xml_resposta and not _dest_ev_perf.exists():
+                            _dest_ev_perf.write_text(xml_resposta, encoding='utf-8')
+                except Exception as _pe_ev:
+                    print(f"[MANIFESTAÇÃO] Aviso ao salvar evento nos perfis: {_pe_ev}")
+                print(f"[MANIFESTAÇÃO] 💾 XML evento salvo: {_dest_ev_local}")
+            except Exception as _se_ev:
+                print(f"[MANIFESTAÇÃO] Aviso ao salvar XML do evento: {_se_ev}")
+
             # 🔄 AUTO-DOWNLOAD: Baixa XML completo automaticamente após manifestação
             should_download_xml = False
             
@@ -10548,11 +10609,13 @@ class MainWindow(QMainWindow):
                             data_emissao = (self.item.get('data_emissao') or '')[:10]
                             if chave and informante:
                                 year_month = data_emissao[:7] if len(data_emissao) >= 7 else datetime.now().strftime("%Y-%m")
-                                xmls_root = DATA_DIR / "xmls" / informante / tipo / year_month
-                                xmls_root.mkdir(parents=True, exist_ok=True)
-                                xml_file = xmls_root / f"{chave}.xml"
-                                xml_file.write_text(xml_text, encoding='utf-8')
+                                import sys as _sys_dl; _sys_dl.path.insert(0, str(BASE_DIR)) if str(BASE_DIR) not in _sys_dl.path else None
+                                from nfe_search import salvar_xml_por_certificado
+                                _nome_cert_dl = self.parent_window.db.get_cert_nome_by_informante(informante)
+                                _res_dl = salvar_xml_por_certificado(xml_text, informante, pasta_base="xmls", nome_certificado=_nome_cert_dl)
+                                xml_file = Path(_res_dl[0] if isinstance(_res_dl, tuple) else _res_dl) if _res_dl else DATA_DIR / "xmls" / informante / tipo / year_month / f"{chave}.xml"
                                 saved_xml_path = str(xml_file)
+                                salvar_xml_por_certificado(xml_text, informante, pasta_base=None, nome_certificado=_nome_cert_dl)
                                 self.parent_window.db.register_xml_download(chave, saved_xml_path, informante)
                                 upd = {'chave': chave, 'xml_status': 'COMPLETO', 'informante': informante}
                                 for k in ['ie_tomador', 'nome_emitente', 'cnpj_emitente', 'numero',
@@ -12841,18 +12904,37 @@ class MainWindow(QMainWindow):
             
             # Registra no banco
             self.db.register_manifestacao(chave, tipo_evento, informante, status, protocolo)
-            
+
+            # Salva XML de resposta da manifestação na pasta de Eventos
+            _dest_ev_local = None
+            try:
+                from datetime import datetime as _dtn_ev
+                _ano_mes_ev = _dtn_ev.now().strftime('%Y-%m')
+                _ts_ev = _dtn_ev.now().strftime('%Y%m%d%H%M%S')
+                _nome_ev = f"{chave}_{tipo_evento}_{_ts_ev}.xml"
+                _pasta_ev_local = DATA_DIR / "xmls" / informante / _ano_mes_ev / "Eventos"
+                _pasta_ev_local.mkdir(parents=True, exist_ok=True)
+                _dest_ev_local = _pasta_ev_local / _nome_ev
+                if xml_resposta and not _dest_ev_local.exists():
+                    _dest_ev_local.write_text(xml_resposta, encoding='utf-8')
+                try:
+                    with self.db._connect() as _conn_ev:
+                        _perfis_ev = _conn_ev.execute(
+                            "SELECT pasta_base FROM perfis_armazenamento WHERE ativo=1"
+                        ).fetchall()
+                    for (_perf_pasta,) in _perfis_ev:
+                        _pasta_ev_perf = Path(_perf_pasta) / informante / _ano_mes_ev / "Eventos"
+                        _pasta_ev_perf.mkdir(parents=True, exist_ok=True)
+                        _dest_ev_perf = _pasta_ev_perf / _nome_ev
+                        if xml_resposta and not _dest_ev_perf.exists():
+                            _dest_ev_perf.write_text(xml_resposta, encoding='utf-8')
+                except Exception as _pe_ev:
+                    print(f"[MANIFESTAÇÃO] Aviso ao salvar evento nos perfis: {_pe_ev}")
+                print(f"[MANIFESTAÇÃO] 💾 XML evento salvo: {_dest_ev_local}")
+            except Exception as _se_ev:
+                print(f"[MANIFESTAÇÃO] Aviso ao salvar XML do evento: {_se_ev}")
+
             progress.close()
-            
-            # Salva automaticamente os arquivos XML e PDF
-            import os
-            pasta_base = os.path.join(os.getcwd(), "xmls", "Manifestação manual")
-            os.makedirs(pasta_base, exist_ok=True)
-            
-            # ✅ NÃO salva retEnvEvento (apenas confirmação, não contém nota)
-            # Manifestação registrada no banco, XML completo será baixado separadamente
-            arquivos_salvos = True  # Considera salvo pois foi registrado no banco
-            # Removido: _salvar_arquivos_manifestacao_automatico(..., xml_resposta) - causava SEM_NUMERO-SEM_NOME.xml
             
             # Atualiza tabelas
             self.refresh_table()
@@ -12863,8 +12945,8 @@ class MainWindow(QMainWindow):
             msg_sucesso += f"📋 Protocolo: {protocolo}\n"
             msg_sucesso += f"💬 {mensagem}\n\n"
             
-            if arquivos_salvos:
-                msg_sucesso += f"📁 Arquivos salvos em:\n{pasta_base}"
+            if _dest_ev_local:
+                msg_sucesso += f"📁 XML de evento salvo em:\n{_dest_ev_local}"
             
             QMessageBox.information(
                 self.manifestacao_dialog,
@@ -13373,7 +13455,7 @@ class MainWindow(QMainWindow):
                                         _ym = _data[:7]
 
                                     # Save each note as its own XML file
-                                    _folder = DATA_DIR / 'xmls' / _informante / 'NFSE' / _ym
+                                    _folder = DATA_DIR / 'xmls' / _informante / 'NFSe' / _ym  # NFSe (padrão consistente)
                                     _folder.mkdir(parents=True, exist_ok=True)
                                     _dest = _folder / (f"NFSe_{_num}.xml" if _num else f"{_chave}.xml")
 
@@ -13381,12 +13463,22 @@ class MainWindow(QMainWindow):
                                     _nfse_node = _inf.getparent()
                                     if _nfse_node is None or _nfse_node is tree:
                                         _nfse_node = _inf
-                                    _dest.write_bytes(
-                                        etree.tostring(_deepcopy(_nfse_node),
+                                    _xml_bytes = etree.tostring(_deepcopy(_nfse_node),
                                                        xml_declaration=True,
                                                        encoding='UTF-8',
                                                        pretty_print=True)
-                                    )
+                                    _dest.write_bytes(_xml_bytes)
+
+                                    # Salva em todos os perfis ativos de armazenamento
+                                    try:
+                                        import sys as _sys_nfse
+                                        if str(BASE_DIR) not in _sys_nfse.path:
+                                            _sys_nfse.path.insert(0, str(BASE_DIR))
+                                        from nfe_search import salvar_xml_por_certificado as _salvar_nfse
+                                        _nome_cert_imp = self.db.get_cert_nome_by_informante(_informante)
+                                        _salvar_nfse(_xml_bytes.decode('utf-8'), _informante, pasta_base=None, nome_certificado=_nome_cert_imp)
+                                    except Exception as _pe:
+                                        print(f"[IMPORTAR] Aviso ao salvar nos perfis: {_pe}")
 
                                     self.db.register_xml_download(_chave, str(_dest), _informante)
                                     self.db.save_note({
@@ -13517,7 +13609,19 @@ class MainWindow(QMainWindow):
                     
                     # Copia o arquivo
                     shutil.copy2(xml_file, dest_file)
-                    
+
+                    # Salva em todos os perfis ativos de armazenamento
+                    try:
+                        import sys as _sys_imp
+                        if str(BASE_DIR) not in _sys_imp.path:
+                            _sys_imp.path.insert(0, str(BASE_DIR))
+                        from nfe_search import salvar_xml_por_certificado as _salvar_imp
+                        _xml_content_imp = dest_file.read_text(encoding='utf-8')
+                        _nome_cert_imp = self.db.get_cert_nome_by_informante(informante)
+                        _salvar_imp(_xml_content_imp, informante, pasta_base=None, nome_certificado=_nome_cert_imp)
+                    except Exception as _pe:
+                        print(f"[IMPORTAR] Aviso ao salvar nos perfis: {_pe}")
+
                     # Registra no banco de dados
                     self.db.register_xml_download(chave, str(dest_file), informante)
                     
@@ -13924,8 +14028,19 @@ class MainWindow(QMainWindow):
                 inf_nd, numero_nd, data_nd, tipo_nd = nd_row
                 # Nome amigável do certificado (ex: '99-JL COMERCIO')
                 nome_cert_nd = self.db.get_cert_nome_by_informante(inf_nd) if inf_nd else None
-                # Pasta base de armazenamento configurada
-                storage_base = self.db.get_config('storage_pasta_base', '') or ''
+                # Busca todas as pastas de perfis ativos (multi-perfis)
+                _storage_bases_xml = []
+                try:
+                    with self.db._connect() as _pc_xml:
+                        for _pr_xml in _pc_xml.execute("SELECT pasta_base FROM perfis_armazenamento WHERE ativo=1 AND pasta_base IS NOT NULL").fetchall():
+                            if _pr_xml[0] and _pr_xml[0] != 'xmls' and _pr_xml[0] not in _storage_bases_xml:
+                                _storage_bases_xml.append(_pr_xml[0])
+                except Exception:
+                    pass
+                if not _storage_bases_xml:
+                    _leg_xml = self.db.get_config('storage_pasta_base', '') or ''
+                    if _leg_xml and _leg_xml != 'xmls':
+                        _storage_bases_xml = [_leg_xml]
                 # Deriva todos os formatos de data possíveis
                 datas_cands = []
                 if data_nd and len(data_nd) >= 7:
@@ -13950,18 +14065,18 @@ class MainWindow(QMainWindow):
                             # NFS-e: xmls/{cert}/{MM}/{NFSE}/
                             candidatos.append(DATA_DIR / 'xmls' / pasta_cert / data_fmt / 'NFSE')
                             candidatos.append(DATA_DIR / 'xmls' / pasta_cert / data_fmt / 'NFSe')
-                            if storage_base and storage_base != 'xmls':
-                                candidatos.append(Path(storage_base) / pasta_cert / data_fmt / 'NFSe')
-                                candidatos.append(Path(storage_base) / pasta_cert / data_fmt / 'NFSE')
+                            for _sb_xml in _storage_bases_xml:
+                                candidatos.append(Path(_sb_xml) / pasta_cert / data_fmt / 'NFSe')
+                                candidatos.append(Path(_sb_xml) / pasta_cert / data_fmt / 'NFSE')
                         else:
                             # NF-e/CT-e — todas as estruturas possíveis
                             candidatos.append(DATA_DIR / 'xmls' / tipo_base_nd / pasta_cert / data_fmt)
                             candidatos.append(DATA_DIR / 'xmls' / pasta_cert / data_fmt / tipo_base_nd)
                             candidatos.append(DATA_DIR / 'xmls' / pasta_cert / data_fmt)
-                            if storage_base and storage_base != 'xmls':
-                                candidatos.append(Path(storage_base) / pasta_cert / data_fmt / tipo_base_nd)
-                                candidatos.append(Path(storage_base) / pasta_cert / data_fmt)
-                                candidatos.append(Path(storage_base) / tipo_base_nd / pasta_cert / data_fmt)
+                            for _sb_xml in _storage_bases_xml:
+                                candidatos.append(Path(_sb_xml) / pasta_cert / data_fmt / tipo_base_nd)
+                                candidatos.append(Path(_sb_xml) / pasta_cert / data_fmt)
+                                candidatos.append(Path(_sb_xml) / tipo_base_nd / pasta_cert / data_fmt)
                 # Remove duplicatas preservando ordem
                 seen_c = set()
                 candidatos = [c for c in candidatos if not (str(c) in seen_c or seen_c.add(str(c)))]
@@ -14101,7 +14216,19 @@ class MainWindow(QMainWindow):
             if nd_row:
                 inf_nd, numero_nd, data_nd, tipo_nd = nd_row
                 nome_cert_nd = self.db.get_cert_nome_by_informante(inf_nd) if inf_nd else None
-                storage_base = self.db.get_config('storage_pasta_base', '') or ''
+                # Busca todas as pastas de perfis ativos (multi-perfis)
+                _storage_bases_pdf = []
+                try:
+                    with self.db._connect() as _pc_pdf:
+                        for _pr_pdf in _pc_pdf.execute("SELECT pasta_base FROM perfis_armazenamento WHERE ativo=1 AND pasta_base IS NOT NULL").fetchall():
+                            if _pr_pdf[0] and _pr_pdf[0] != 'xmls' and _pr_pdf[0] not in _storage_bases_pdf:
+                                _storage_bases_pdf.append(_pr_pdf[0])
+                except Exception:
+                    pass
+                if not _storage_bases_pdf:
+                    _leg_pdf = self.db.get_config('storage_pasta_base', '') or ''
+                    if _leg_pdf and _leg_pdf != 'xmls':
+                        _storage_bases_pdf = [_leg_pdf]
                 datas_cands = []
                 if data_nd and len(data_nd) >= 7:
                     ano_d = data_nd[0:4]
@@ -14126,19 +14253,19 @@ class MainWindow(QMainWindow):
                             # Layout alternativo: xmls/NFSe/{cnpj}/{period}/
                             candidatos.append(DATA_DIR / 'xmls' / 'NFSe' / pasta_cert / data_fmt)
                             candidatos.append(DATA_DIR / 'xmls' / 'NFSE' / pasta_cert / data_fmt)
-                            if storage_base and storage_base != 'xmls':
-                                candidatos.append(Path(storage_base) / pasta_cert / data_fmt / 'NFSe')
-                                candidatos.append(Path(storage_base) / pasta_cert / data_fmt / 'NFSE')
-                                candidatos.append(Path(storage_base) / 'NFSe' / pasta_cert / data_fmt)
-                                candidatos.append(Path(storage_base) / 'NFSE' / pasta_cert / data_fmt)
+                            for _sb_pdf in _storage_bases_pdf:
+                                candidatos.append(Path(_sb_pdf) / pasta_cert / data_fmt / 'NFSe')
+                                candidatos.append(Path(_sb_pdf) / pasta_cert / data_fmt / 'NFSE')
+                                candidatos.append(Path(_sb_pdf) / 'NFSe' / pasta_cert / data_fmt)
+                                candidatos.append(Path(_sb_pdf) / 'NFSE' / pasta_cert / data_fmt)
                         else:
                             candidatos.append(DATA_DIR / 'xmls' / tipo_base_nd / pasta_cert / data_fmt)
                             candidatos.append(DATA_DIR / 'xmls' / pasta_cert / data_fmt / tipo_base_nd)
                             candidatos.append(DATA_DIR / 'xmls' / pasta_cert / data_fmt)
-                            if storage_base and storage_base != 'xmls':
-                                candidatos.append(Path(storage_base) / pasta_cert / data_fmt / tipo_base_nd)
-                                candidatos.append(Path(storage_base) / pasta_cert / data_fmt)
-                                candidatos.append(Path(storage_base) / tipo_base_nd / pasta_cert / data_fmt)
+                            for _sb_pdf in _storage_bases_pdf:
+                                candidatos.append(Path(_sb_pdf) / pasta_cert / data_fmt / tipo_base_nd)
+                                candidatos.append(Path(_sb_pdf) / pasta_cert / data_fmt)
+                                candidatos.append(Path(_sb_pdf) / tipo_base_nd / pasta_cert / data_fmt)
                 seen_c = set()
                 candidatos = [c for c in candidatos if not (str(c) in seen_c or seen_c.add(str(c)))]
                 for pasta in candidatos:
@@ -16144,6 +16271,7 @@ class MainWindow(QMainWindow):
                             cert_uf = next((c for c in certs if c.get('informante') == informante), certs[0] if certs else None)
                             
                             if cert_uf and chave and len(chave) == 44:
+                                import sys as _sys_sw; _sys_sw.path.insert(0, str(BASE_DIR)) if str(BASE_DIR) not in _sys_sw.path else None
                                 from nfe_search import NFeService, salvar_xml_por_certificado
                                 from lxml import etree
                                 
@@ -16839,6 +16967,7 @@ class GerenciadorTrabalhosDialog(QDialog):
                 print("[DEBUG WORKER] ========== AutoVerificacaoWorker.run() INICIADO ==========")
                 try:
                     print("[DEBUG WORKER] Importando módulos...")
+                    import sys as _sys_av2; _sys_av2.path.insert(0, str(BASE_DIR)) if str(BASE_DIR) not in _sys_av2.path else None
                     from nfe_search import DatabaseManager, NFeService, salvar_xml_por_certificado
                     from lxml import etree
                     
@@ -17879,6 +18008,7 @@ class GerenciadorTrabalhosDialog(QDialog):
             
             def run(self):
                 try:
+                    import sys as _sys_rp2; _sys_rp2.path.insert(0, str(BASE_DIR)) if str(BASE_DIR) not in _sys_rp2.path else None
                     from nfe_search import DatabaseManager, NFeService, salvar_xml_por_certificado, extrair_nota_detalhada
                     from lxml import etree
                     
@@ -18017,10 +18147,8 @@ class GerenciadorTrabalhosDialog(QDialog):
                             # Salva em xmls/
                             salvar_xml_por_certificado(xml_completo, informante, pasta_base="xmls", nome_certificado=nome_cert)
                             
-                            # Salva em storage se configurado
-                            pasta_storage = db_nfe.get_config('storage_pasta_base', 'xmls')
-                            if pasta_storage and pasta_storage != 'xmls':
-                                salvar_xml_por_certificado(xml_completo, informante, pasta_base=pasta_storage, nome_certificado=nome_cert)
+                            # Salva em TODOS os perfis ativos (sistema multi-perfis)
+                            salvar_xml_por_certificado(xml_completo, informante, pasta_base=None, nome_certificado=nome_cert)
                             
                             # Cria parser temporário para extrair nota
                             from nfe_search import XMLProcessor
@@ -20957,6 +21085,8 @@ class StorageConfigDialog(QDialog):
                     (nome, pasta_base, formato_pasta_mes, xml_pdf_separado, organizacao_tipo, ativo, is_default)
                     VALUES (?, ?, ?, ?, ?, 1, 1)
                 """, ("Perfil 1", pasta_base, formato_mes, xml_pdf_separado, 'CERTIFICADO_TIPO'))
+                conn.commit()
+                print("[INFO] Tabela de perfis criada e Perfil 1 migrado")
             else:
                 # Tabela já existe - verifica se tem coluna organizacao_tipo
                 cursor.execute("PRAGMA table_info(perfis_armazenamento)")
@@ -20965,9 +21095,7 @@ class StorageConfigDialog(QDialog):
                     # Adiciona coluna para bancos antigos
                     cursor.execute("ALTER TABLE perfis_armazenamento ADD COLUMN organizacao_tipo TEXT DEFAULT 'CERTIFICADO_TIPO'")
                     print("[INFO] Coluna 'organizacao_tipo' adicionada aos perfis existentes")
-                
-                conn.commit()
-                print("[INFO] Tabela de perfis criada e Perfil 1 migrado")
+                    conn.commit()
             
             conn.close()
         except Exception as e:
@@ -21434,16 +21562,6 @@ class StorageConfigDialog(QDialog):
         
         if folder:
             self.pasta_edit.setText(folder)
-        
-        folder = QFileDialog.getExistingDirectory(
-            self,
-            "Selecionar Pasta de Armazenamento",
-            initial_dir,
-            QFileDialog.ShowDirsOnly | QFileDialog.DontResolveSymlinks
-        )
-        
-        if folder:
-            self.pasta_edit.setText(folder)
     
     def _update_example(self):
         """Atualiza o exemplo de caminho conforme as configurações"""
@@ -21668,8 +21786,9 @@ class _CopiaWorker(QThread):
                               'debug', 'resumos', 'eventos', 'outros']
 
             arquivos_xml = []
+            _pastas_ignorar_lower = {p.lower() for p in pastas_ignorar}
             for arquivo in self.origem.rglob('*.xml'):
-                if any(p in arquivo.parts for p in pastas_ignorar):
+                if any(p.lower() in _pastas_ignorar_lower for p in arquivo.parts):
                     continue
                 arquivos_xml.append(arquivo)
 
@@ -21735,8 +21854,12 @@ class _CopiaWorker(QThread):
                         cnpj_pasta = partes[0]
                         tipo_pasta = partes[2] if len(partes) > 2 else partes[1]
 
-                    if "Eventos" in tipo_pasta or "Eventos" in str(arquivo_xml):
+                    if "eventos" in tipo_pasta.lower() or "eventos" in str(arquivo_xml).lower():
                         continue
+
+                    # Normaliza tipo para nomes consistentes no destino
+                    _TIPO_MAP = {'NFE': 'NFe', 'NFCE': 'NFCe', 'NFSE': 'NFSe', 'CTE': 'CTe'}
+                    tipo_pasta = _TIPO_MAP.get(_norm(tipo_pasta), tipo_pasta)
 
                     cnpj_normalizado = ''.join(c for c in cnpj_pasta if c.isdigit())
                     if len(cnpj_normalizado) != 14:

@@ -5180,6 +5180,13 @@ def _salvar_nfse_abrasf(xml_nota, informante, numero, db):
     xml_file.write_bytes(xml_nota if isinstance(xml_nota, bytes) else xml_nota.encode('utf-8'))
     logger.info(f"[ABRASF] XML salvo: {xml_file}")
 
+    # Salva também em todos os perfis de armazenamento ativos
+    try:
+        _xml_str_abrasf = xml_nota.decode('utf-8') if isinstance(xml_nota, bytes) else xml_nota
+        salvar_xml_por_certificado(_xml_str_abrasf, informante_norm, pasta_base=None)
+    except Exception as _pe_abrasf:
+        logger.warning(f"[ABRASF] Aviso ao salvar NFS-e nos perfis: {_pe_abrasf}")
+
     # --- persiste no banco ---
     informante_cnpj = _re.sub(r'\D', '', informante)
     if informante_cnpj == _re.sub(r'\D', '', prest_cnpj or ''):
