@@ -623,7 +623,7 @@ def parse_nfse(xml_path: str, informante: str = "") -> Dict[str, Any]:
 # NFS-e (padrão ABRASF – DominioWeb / sistemas municipais)
 # ---------------------------------------------------------------------------
 
-_NS_ABRASF = {"ab": "http:/www.abrasf.org.br/nfse.xsd"}
+_NS_ABRASF = {"ab": "http://www.abrasf.org.br/nfse.xsd"}
 
 
 def parse_nfse_abrasf(xml_path: str, informante: str = "") -> List[Dict[str, Any]]:
@@ -749,10 +749,8 @@ def parse_nfce(xml_path: str, informante: str = "") -> Dict[str, Any]:
         found = el.find(path, _NS)
         return (found.text or "").strip() if found is not None else ""
 
-    try:
-        tree = etree.parse(xml_path)
-        root = tree.getroot()
-    except Exception:
+    root = _parse_tree(xml_path)
+    if root is None:
         return {}
 
     # Suporte a nfeProc ou NFe como raiz

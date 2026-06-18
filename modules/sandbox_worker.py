@@ -8,6 +8,19 @@ import subprocess
 from pathlib import Path
 from typing import Dict, Any, Optional
 
+
+def _safe_print(msg: str) -> None:
+    """print() que nunca quebra por encoding. Quando o stdout está redirecionado
+    (pipe/arquivo em vez de console real), o Windows costuma usar cp1252, que não
+    representa emojis — isso já travou a inicialização do app em produção
+    (UnicodeEncodeError em pleno import deste módulo). Tenta o print normal e,
+    se falhar por encoding, refaz em ASCII puro."""
+    try:
+        print(msg)
+    except UnicodeEncodeError:
+        print(msg.encode("ascii", errors="replace").decode("ascii"))
+
+
 # Import BrazilFiscalReport at top level for PyInstaller detection
 BRAZILFISCALREPORT_AVAILABLE = False
 Danfe = None
@@ -17,9 +30,9 @@ try:
     from brazilfiscalreport.danfe import Danfe
     from brazilfiscalreport.dacte import Dacte
     BRAZILFISCALREPORT_AVAILABLE = True
-    print("✅ brazilfiscalreport loaded successfully")
+    _safe_print("✅ brazilfiscalreport loaded successfully")
 except ImportError as e:
-    print(f"⚠️ First attempt failed: {e}")
+    _safe_print(f"⚠️ First attempt failed: {e}")
     # Try alternative import for frozen mode
     try:
         import sys
@@ -27,14 +40,14 @@ except ImportError as e:
             # In frozen mode, try to import from _internal
             base_path = Path(sys._MEIPASS) if hasattr(sys, '_MEIPASS') else Path(sys.executable).parent / '_internal'
             sys.path.insert(0, str(base_path))
-            print(f"🔍 Trying from: {base_path}")
-        
+            _safe_print(f"🔍 Trying from: {base_path}")
+
         from brazilfiscalreport.danfe import Danfe
         from brazilfiscalreport.dacte import Dacte
         BRAZILFISCALREPORT_AVAILABLE = True
-        print("✅ brazilfiscalreport loaded successfully (second attempt)")
+        _safe_print("✅ brazilfiscalreport loaded successfully (second attempt)")
     except Exception as e2:
-        print(f"❌ brazilfiscalreport not available - {e2}")
+        _safe_print(f"❌ brazilfiscalreport not available - {e2}")
         import traceback
         traceback.print_exc()
 

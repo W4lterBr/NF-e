@@ -22,14 +22,16 @@ if not getattr(sys, 'frozen', False):
     sys.path.insert(0, str(Path(__file__).parent))
 
 from nfse_search import NFSeDatabase, logger, URLS_MUNICIPIOS, consultar_cnpj
-from modules.nfse_service import NFSeService, consultar_nfse_incremental
+from modules.nfse_service import NFSeService, consultar_nfse_incremental, consultar_danfse_oficial, extrair_chave_nfse
 from lxml import etree
 
 # Importa salvar_nfse_detalhada para salvar em notas_detalhadas (banco principal)
 from nfe_search import salvar_nfse_detalhada
 
-# PDF da NFS-e é baixado APENAS via API oficial do Ambiente Nacional (ADN).
-# Não há geração local de PDF — município não integrado = mensagem informativa.
+# FLUXO OBRIGATÓRIO DE PDF (igual em toda a base — buscar_nfse_auto.py, pdf_simple.py,
+# "Gerar PDFs Pendentes"): 1) tenta o DANFSe OFICIAL via consultar_danfse_oficial()
+# (Ambiente Nacional); 2) se indisponível, gera localmente com gerar_danfse_profissional
+# (WeasyPrint -> ReportLab). Nunca pula direto para geração local sem tentar a API antes.
 
 
 def salvar_xml_nfse(db, cnpj, xml_content, numero_nfse, data_emissao):
@@ -81,6 +83,8 @@ def salvar_xml_nfse(db, cnpj, xml_content, numero_nfse, data_emissao):
         
     except Exception as e:
         logger.error(f"   ❌ Erro ao salvar XML: {e}")
+        from modules.log_categorias import log_falha
+        log_falha('storage', documento=f"salvar XML NFS-e numero={numero_nfse}", cnpj=cnpj, erro=e)
         return (None, None)
 
 
@@ -222,72 +226,76 @@ def buscar_nfse_ambiente_nacional(db, cert_data, config_nfse, busca_completa=Fal
                     notas_salvas += 1
                     logger.info(f"   ✅ NFS-e {numero_nfse}: R$ {valor_servicos} salva")
                     
-                    # Tenta baixar DANFSE (PDF) logo após salvar XML
+                    # Baixa DANFSe (PDF) logo após salvar XML.
+                    # FALLBACK OBRIGATÓRIO: PDF oficial (ADN) -> geração local (gerar_danfse_profissional).
+                    # Nenhuma exceção aqui pode deixar a nota sem PDF nenhum (antes, se a API ADN
+                    # falhasse — ex.: município não integrado, erro 502/503 — a nota ficava sem PDF
+                    # até o usuário abrir manualmente na interface).
                     try:
-                        # A chave de acesso da NFS-e está no atributo Id da tag infNFSe
-                        # Formato: "NFS31062001213891738000138250000000157825012270096818"
-                        # Precisamos remover o prefixo "NFS" para obter a chave de 50 dígitos
-                        inf_nfse = tree.find('.//nfse:infNFSe', namespaces=ns)
-                        chave_acesso = None
-                        
-                        if inf_nfse is not None:
-                            chave_id = inf_nfse.get('Id', '')
-                            if chave_id and chave_id.startswith('NFS'):
-                                chave_acesso = chave_id[3:]  # Remove prefixo "NFS"
-                        
-                        if chave_acesso:
+                        chave_acesso, motivo_chave = extrair_chave_nfse(xml_content)
+                        if not chave_acesso:
+                            logger.warning(f"   ⚠️  NFS-e {numero_nfse}: {motivo_chave} - PDF não disponível")
+                        elif not caminho_xml_local:
+                            logger.warning(f"   ⚠️  NFS-e {numero_nfse} sem caminho de XML local - PDF não pode ser salvo")
+                        else:
+                            pdf_path_local = caminho_xml_local.replace('.xml', '.pdf')
+
                             logger.info(f"   📄 Baixando DANFSe OFICIAL (PDF) para {numero_nfse}...")
-                            
-                            # Usa o mesmo serviço NFS-e para baixar o PDF OFICIAL
-                            # O DANFSe é o PDF oficial gerado pelo Ambiente Nacional
-                            # Similar ao DANFE da NF-e, com layout padronizado
-                            nfse_service = NFSeService(
-                                cert_path=cert_path,
-                                senha=senha,
-                                informante=informante,
-                                cuf=cuf,
-                                ambiente='producao'
+                            resultado_pdf = consultar_danfse_oficial(
+                                chave_acesso, cert_path, senha, informante, cuf,
+                                ambiente='producao', numero=numero_nfse, cnpj_prestador=cnpj, retry=1
                             )
-                            
-                            # Tenta baixar com retry (3 tentativas)
-                            pdf_content = nfse_service.consultar_danfse(chave_acesso, retry=1)
-                            
-                            if pdf_content:
-                                # Salva PDF OFICIAL no mesmo local do XML (LOCAL)
-                                if caminho_xml_local:
-                                    pdf_path_local = caminho_xml_local.replace('.xml', '.pdf')
-                                    with open(pdf_path_local, 'wb') as f:
-                                        f.write(pdf_content)
-                                    logger.info(f"   ✅ DANFSe OFICIAL salvo (local): {pdf_path_local}")
-                                
-                                # Salva PDF OFICIAL no mesmo local do XML (STORAGE)
+
+                            pdf_tipo = None
+                            if resultado_pdf['ok']:
+                                with open(pdf_path_local, 'wb') as f:
+                                    f.write(resultado_pdf['pdf_bytes'])
+                                pdf_tipo = 'OFICIAL'
+                                logger.info(f"   ✅ DANFSe OFICIAL salvo (local): {pdf_path_local}")
+
                                 if caminho_xml_storage:
                                     pdf_path_storage = caminho_xml_storage.replace('.xml', '.pdf')
                                     with open(pdf_path_storage, 'wb') as f:
-                                        f.write(pdf_content)
+                                        f.write(resultado_pdf['pdf_bytes'])
                                     logger.info(f"   ✅ DANFSe OFICIAL salvo (storage): {pdf_path_storage}")
-
                             else:
-                                # PDF não disponível — município não integrado ao ADN ou nota cancelada
-                                logger.info(f"   ℹ️  PDF não retornado pela API ADN (sem conteúdo)")
-                                logger.info(f"   ℹ️  Município possivelmente não integrado ao Padrão Nacional ADN")
+                                # FALLBACK OBRIGATÓRIO: PDF oficial indisponível -> gera localmente.
+                                logger.info(f"   ℹ️  PDF oficial indisponível ({resultado_pdf['motivo'][:100]}) — tentando geração local")
+                                try:
+                                    from gerar_danfse_profissional import gerar_danfse_profissional
+                                    if gerar_danfse_profissional(xml_content, pdf_path_local):
+                                        pdf_tipo = 'GENERICO'
+                                        logger.info(f"   ✅ DANFSe gerado localmente (fallback): {pdf_path_local}")
 
-                        else:
-                            logger.warning(f"   ⚠️  NFS-e {numero_nfse} sem ChaveAcesso - PDF não disponível")
-                    
+                                        if caminho_xml_storage:
+                                            pdf_path_storage = caminho_xml_storage.replace('.xml', '.pdf')
+                                            import shutil as _shutil_pdf
+                                            _shutil_pdf.copy2(pdf_path_local, pdf_path_storage)
+                                            logger.info(f"   ✅ DANFSe (fallback) copiado para storage: {pdf_path_storage}")
+                                    else:
+                                        logger.warning(f"   ⚠️  Geração local do DANFSe também falhou para {numero_nfse}")
+                                except Exception as e_local:
+                                    logger.error(f"   ❌ Erro na geração local do DANFSe (fallback) para {numero_nfse}: {e_local}")
+
+                            # 📝 Registra caminho + tipo do PDF no banco principal (notas_detalhadas).
+                            # Sem isso, o PDF existe em disco mas o sistema não sabe e tenta de novo
+                            # a cada "Gerar PDFs Pendentes", ou o usuário precisa abrir manualmente.
+                            if pdf_tipo:
+                                try:
+                                    db.main_db.atualizar_pdf_path(chave_acesso, str(Path(pdf_path_local).resolve()), pdf_tipo)
+                                except Exception as e_reg:
+                                    logger.warning(f"   ⚠️  Erro ao registrar pdf_path no banco para {chave_acesso[:20]}…: {e_reg}")
+
                     except Exception as e_pdf:
-                        _e_str = str(e_pdf)
-                        logger.info(f"   ℹ️  PDF indisponível via API: {_e_str[:120]}")
-                        if '502' in _e_str or '503' in _e_str or '504' in _e_str or 'Bad Gateway' in _e_str or 'Gateway' in _e_str:
-                            logger.info(f"   ℹ️  Erro {('502' if '502' in _e_str else '503' if '503' in _e_str else '504')} (servidor ADN instável) — PDF pode ser baixado depois via Atualizar PDFs")
-                        else:
-                            logger.info(f"   ℹ️  Município não integrado ao Padrão Nacional ADN — PDF indisponível")
-                            logger.info(f"   ℹ️  Isso NÃO é um bug! Acontece quando:")
-                            logger.info(f"   ℹ️    • Município não integrado ao Padrão Nacional ADN")
-                            logger.info(f"   ℹ️    • Em breve o município irá aderir ao Padrão!")
+                        logger.error(f"   ❌ Erro inesperado ao processar PDF de {numero_nfse}: {e_pdf}")
+                        from modules.log_categorias import log_falha
+                        log_falha('pdf', documento=f"NFS-e numero={numero_nfse}",
+                                   chave=locals().get('chave_acesso'), cnpj=cnpj, erro=e_pdf)
                     
             except Exception as e:
                 logger.error(f"   ❌ Erro ao processar NSU={nsu}: {e}")
+                from modules.log_categorias import log_falha
+                log_falha('nfse', documento=f"NSU={nsu} numero={locals().get('numero_nfse')}", cnpj=cnpj, erro=e)
                 continue
         
         logger.info(f"\n{'='*70}")
@@ -300,6 +308,8 @@ def buscar_nfse_ambiente_nacional(db, cert_data, config_nfse, busca_completa=Fal
         logger.error(f"❌ Erro na busca via Ambiente Nacional: {e}")
         import traceback
         traceback.print_exc()
+        from modules.log_categorias import log_falha
+        log_falha('nfse', documento="busca via Ambiente Nacional", cnpj=cnpj, erro=e)
         return []
 
 
@@ -316,14 +326,27 @@ def processar_certificado(db, cert_data, busca_completa=False):
         int: Numero de notas encontradas
     """
     cnpj, cert_path, senha, informante, cuf = cert_data
-    
+
     logger.info(f"\n{'='*70}")
     logger.info(f"PROCESSANDO CERTIFICADO: {cnpj}")
     logger.info(f"{'='*70}")
     logger.info(f"Informante: {informante}")
     logger.info(f"UF: {cuf}")
     logger.info(f"Certificado: {cert_path}")
-    
+
+    # 🔒 Validação ANTES de qualquer tentativa de conexão com o ADN/município —
+    # evita gastar chamadas de rede com um certificado vencido/inválido.
+    from modules.certificate_manager import validar_certificado
+    cert_info = validar_certificado(cert_path, senha)
+    if cert_info["expirado"]:
+        logger.error(f"🔴 [{cnpj}] Certificado VENCIDO ({cert_info['motivo']}) — pulando NFS-e deste certificado")
+        return 0
+    if not cert_info["valido"]:
+        logger.error(f"🔴 [{cnpj}] Certificado inválido ({cert_info['motivo']}) — pulando NFS-e deste certificado")
+        return 0
+    if cert_info["motivo"]:
+        logger.warning(f"🟡 [{cnpj}] {cert_info['motivo']}")
+
     # Busca configuracoes NFS-e para este CNPJ (provedores municipais)
     configs = db.get_config_nfse(cnpj)
     

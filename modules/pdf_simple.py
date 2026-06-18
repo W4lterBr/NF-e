@@ -117,84 +117,98 @@ def generate_danfe_pdf(xml_text: str, out_path: str, tipo: str = "NFe",
             # ========== ETAPA 2: TENTA BAIXAR DA API ADN (PDF OFICIAL) ==========
             # Tenta o PDF oficial primeiro. Se a API não estiver disponível (404, timeout, ABRASF),
             # cai no ETAPA 3 (geração local) como fallback.
+            # Usa as funções únicas e canônicas (modules.nfse_service) — mesmas usadas por
+            # buscar_nfse_auto.py e pela rede de segurança "Gerar PDFs Pendentes" — para
+            # garantir extração de chave, validação de resposta e log consistentes em todo
+            # o sistema (logs/nfse_pdf.log).
             debug_log("ETAPA 2: Tentando baixar PDF oficial da API ADN...")
-            
-            # Extrai chave de acesso do XML
+
             try:
-                debug_log("Extraindo chave de acesso do XML...")
                 from lxml import etree
+                from modules.nfse_service import extrair_chave_nfse, consultar_danfse_oficial
+
                 ns = {'nfse': 'http://www.sped.fazenda.gov.br/nfse'}
                 tree = etree.fromstring(xml_text.encode('utf-8') if isinstance(xml_text, str) else xml_text)
-                inf_nfse = tree.find('.//nfse:infNFSe', namespaces=ns)
-                chave_acesso = None
-                
-                if inf_nfse is not None:
-                    chave_id = inf_nfse.get('Id', '')
-                    debug_log(f"Atributo Id encontrado: {chave_id}")
-                    if chave_id and chave_id.startswith('NFS'):
-                        chave_acesso = chave_id[3:]
-                        debug_log(f"✅ Chave extraída: {chave_acesso[:10]}...{chave_acesso[-10:]} (len={len(chave_acesso)})")
-                    else:
-                        debug_log(f"❌ Id não começa com 'NFS': {chave_id}")
+
+                chave_acesso, motivo_chave = extrair_chave_nfse(xml_text)
+                if chave_acesso:
+                    debug_log(f"✅ Chave extraída: {chave_acesso[:10]}...{chave_acesso[-10:]} (len={len(chave_acesso)})" +
+                              (f" [{motivo_chave}]" if motivo_chave else ""))
                 else:
-                    debug_log("❌ Elemento infNFSe não encontrado no XML")
-                
-                # Tenta obter PDF oficial da API (timeout curto: 1 tentativa de 10s)
-                if chave_acesso and len(chave_acesso) >= 44:
-                    debug_log(f"Chave válida ({len(chave_acesso)} dígitos) - buscando certificado...")
+                    debug_log(f"❌ Chave de acesso não encontrada: {motivo_chave}")
+
+                if chave_acesso:
+                    debug_log("Buscando certificado correspondente...")
                     try:
                         # Obtém credenciais do certificado configurado
                         from nfse_search import NFSeDatabase
                         db = NFSeDatabase()
                         certificados = db.get_certificados()
-                        
+
                         if certificados:
-                            cnpj, cert_path, senha, informante, cuf = certificados[0]
+                            # 🔧 Com múltiplos certificados cadastrados, usar sempre certificados[0]
+                            # falha quando essa NFS-e pertence a outra empresa (a API ADN só aceita
+                            # a consulta do certificado prestador/tomador/intermediário do documento).
+                            # Casa pelo CNPJ do prestador/tomador extraído do próprio XML; só usa o
+                            # primeiro certificado como último recurso (preserva comportamento antigo
+                            # quando há apenas 1 certificado, ou quando não é possível identificar).
+                            cnpjs_doc = set()
+                            for _xp in (
+                                './/nfse:DPS/nfse:infDPS/nfse:prest/nfse:CNPJ',
+                                './/nfse:emit/nfse:CNPJ',
+                                './/nfse:DPS/nfse:infDPS/nfse:toma/nfse:CNPJ',
+                            ):
+                                _v = tree.findtext(_xp, namespaces=ns)
+                                if _v:
+                                    cnpjs_doc.add(''.join(c for c in _v if c.isdigit()))
+
+                            cert_escolhido = None
+                            if cnpjs_doc:
+                                for _cert in certificados:
+                                    _cnpj_cert, _cert_path, _senha, _informante, _cuf = _cert
+                                    _digits = {
+                                        ''.join(c for c in str(_cnpj_cert or '') if c.isdigit()),
+                                        ''.join(c for c in str(_informante or '') if c.isdigit()),
+                                    }
+                                    if _digits & cnpjs_doc:
+                                        cert_escolhido = _cert
+                                        break
+
+                            if cert_escolhido is None:
+                                cert_escolhido = certificados[0]
+                                debug_log("⚠️ Não foi possível casar certificado pelo CNPJ do documento — usando o primeiro cadastrado")
+
+                            cnpj, cert_path, senha, informante, cuf = cert_escolhido
                             debug_log(f"✅ Certificado encontrado: {cnpj}")
-                            
-                            # Cria serviço NFS-e e tenta baixar PDF oficial
-                            debug_log("Criando NFSeService...")
-                            from modules.nfse_service import NFSeService
-                            nfse_service = NFSeService(cert_path, senha, informante, cuf, 'producao')
-                            debug_log("✅ NFSeService criado com sucesso")
-                            
-                            debug_log(f"Chamando consultar_danfse(chave={chave_acesso[:10]}..., retry=1)...")
-                            pdf_content = nfse_service.consultar_danfse(chave_acesso, retry=1)
-                            
-                            if pdf_content:
-                                Path(out_path).write_bytes(pdf_content)
-                                debug_log(f"✅✅✅ PDF OFICIAL SALVO DA API ({len(pdf_content):,} bytes)")
+
+                            numero_log = tree.findtext('.//nfse:nNFSe', namespaces=ns) or tree.findtext('.//nNFSe')
+                            resultado_pdf = consultar_danfse_oficial(
+                                chave_acesso, cert_path, senha, informante, cuf,
+                                ambiente='producao', numero=numero_log, cnpj_prestador=cnpj, retry=1
+                            )
+
+                            if resultado_pdf['ok']:
+                                Path(out_path).write_bytes(resultado_pdf['pdf_bytes'])
+                                debug_log(f"✅✅✅ PDF OFICIAL SALVO DA API ({len(resultado_pdf['pdf_bytes']):,} bytes)")
                                 debug_log(f"Arquivo: {out_path}")
                                 debug_log("=" * 80)
-                                print(f"[PDF] ✅ PDF OFICIAL obtido da API do governo ({len(pdf_content):,} bytes)", file=sys.stderr)
+                                print(f"[PDF] ✅ PDF OFICIAL obtido da API do governo ({len(resultado_pdf['pdf_bytes']):,} bytes)", file=sys.stderr)
                                 return {"ok": True, "pdf_tipo": "OFICIAL"}
                             else:
-                                debug_log("❌ API retornou None (sem conteúdo)")
+                                debug_log(f"❌ PDF oficial indisponível: {resultado_pdf['motivo']}")
+                                if '404' in resultado_pdf['motivo']:
+                                    debug_log("ℹ️  404 = NFS-e NÃO DISPONÍVEL na API do Ambiente Nacional — NÃO é um bug!")
+                                    debug_log("    Acontece quando município não integrado ao ADN, nota legada, etc.")
+                                print(f"[PDF] API oficial indisponível: {resultado_pdf['motivo']}", file=sys.stderr)
+                                # Continua para ETAPA 2.5 / 3 (fallback)
                         else:
                             debug_log("❌ Nenhum certificado configurado no banco")
                     except Exception as e:
-                        debug_log(f"❌ ERRO na API: {type(e).__name__}: {str(e)}")
+                        debug_log(f"❌ ERRO ao buscar certificado/consultar API: {type(e).__name__}: {str(e)}")
                         import traceback
                         debug_log(f"Stack trace:\n{traceback.format_exc()}")
-                        
-                        # Explicação sobre erro 404
-                        if '404' in str(e):
-                            debug_log("=" * 80)
-                            debug_log("ℹ️  ERRO 404 = NFS-e NÃO DISPONÍVEL na API do Ambiente Nacional")
-                            debug_log("    Isso NÃO é um bug! Acontece quando:")
-                            debug_log("    • Município não integrado ao Padrão Nacional ADN")
-                            debug_log("    • Nota emitida por sistema legado (pré-2024)")
-                            debug_log("    • Sistema municipal independente")
-                            debug_log("    • Nota em processamento ou cancelada")
-                            debug_log("=" * 80)
-                        
                         print(f"[PDF] API indisponível: {e}", file=sys.stderr)
                         # Continua para geração local
-                else:
-                    if not chave_acesso:
-                        debug_log("❌ Chave de acesso não foi extraída do XML")
-                    else:
-                        debug_log(f"❌ Chave muito curta ({len(chave_acesso)} < 44 dígitos)")
             except Exception as e:
                 debug_log(f"❌ ERRO ao extrair chave: {type(e).__name__}: {str(e)}")
                 import traceback
@@ -218,8 +232,7 @@ def generate_danfe_pdf(xml_text: str, out_path: str, tipo: str = "NFe",
                 link_nfse = None
                 if is_abrasf:
                     debug_log("   ✅ Formato ABRASF detectado — buscando campo LinkNFSe...")
-                    # Namespace ABRASF usa barra simples (padrão do DominioWeb / outros)
-                    ns_ab = {"ab": "http:/www.abrasf.org.br/nfse.xsd"}
+                    ns_ab = {"ab": "http://www.abrasf.org.br/nfse.xsd"}
                     el = tree_ab.find('.//ab:LinkNFSe', ns_ab)
                     if el is None:
                         el = tree_ab.find('.//LinkNFSe')
@@ -436,6 +449,10 @@ def generate_danfe_pdf(xml_text: str, out_path: str, tipo: str = "NFe",
             pass
         
         # Last resort: save XML as text file with .pdf extension (better than nothing)
+        from modules.log_categorias import log_falha
+        log_falha('pdf', documento=f"{tipo} (todos os mecanismos de geração falharam)",
+                   erro="BrazilFiscalReport, brazilnum e reportlab indisponíveis/falharam — "
+                        "salvando texto simples como último recurso", nivel='WARNING')
         Path(out_path).write_text(
             f"DOCUMENTO FISCAL ELETRÔNICO\\n\\n"
             f"Tipo: {tipo}\\n\\n"
@@ -444,10 +461,15 @@ def generate_danfe_pdf(xml_text: str, out_path: str, tipo: str = "NFe",
             encoding='utf-8'
         )
         return True
-    
+
     except Exception as e:
         import sys
         print(f"[PDF Error] {e}", file=sys.stderr)
+        try:
+            from modules.log_categorias import log_falha
+            log_falha('pdf', documento=f"{tipo}", erro=e)
+        except Exception:
+            pass
         return False
 
 

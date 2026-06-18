@@ -98,14 +98,7 @@ class CTeService:
             ambiente: 'producao' ou 'homologacao'
         """
         logger.debug(f"Inicializando CTeService: informante={informante}, cUF={cuf}, ambiente={ambiente}")
-        
-        # Configura sessão HTTP com certificado
-        sess = requests.Session()
-        sess.verify = False  # Desabilita verificação SSL
-        sess.mount('https://', requests_pkcs12.Pkcs12Adapter(
-            pkcs12_filename=cert_path, pkcs12_password=senha
-        ))
-        
+
         # Seleciona endpoints (principal e alternativo)
         if ambiente == 'producao':
             url_principal = URL_CTE_DISTRIBUICAO_PROD
@@ -113,6 +106,19 @@ class CTeService:
         else:
             url_principal = URL_CTE_DISTRIBUICAO_HOM
             url_alternativa = URL_CTE_DISTRIBUICAO_HOM_SVRS
+
+        # 🔒 Verificação do certificado do servidor habilitada por padrão (protege
+        # contra MITM); só desabilita — e registra em logs/certificado_seguranca.log —
+        # para hosts com cadeia de certificado mal configurada.
+        from modules.certificate_manager import determinar_verify_para_host
+        verificar_servidor = determinar_verify_para_host(url_principal, cert_path, senha)
+
+        # Configura sessão HTTP com certificado
+        sess = requests.Session()
+        sess.verify = verificar_servidor
+        sess.mount('https://', requests_pkcs12.Pkcs12Adapter(
+            pkcs12_filename=cert_path, pkcs12_password=senha
+        ))
         
         # Configuração de transporte com timeout maior (60s) para CT-e
         trans = Transport(session=sess, timeout=60, operation_timeout=60)

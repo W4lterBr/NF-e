@@ -623,5 +623,11 @@ def gerar_danfce(xml_content: str | bytes, pdf_path: str) -> bool:
             return True
     except Exception as e_rl:
         print(f"[DANFCE] ReportLab também falhou: {e_rl}", file=sys.stderr)
+        try:
+            from modules.log_categorias import log_falha
+            log_falha('pdf', documento=f"DANFCE numero={dados.get('n_nf')}",
+                       chave=dados.get('chave'), cnpj=dados.get('emit_cnpj'), erro=e_rl)
+        except Exception:
+            pass
 
     return False

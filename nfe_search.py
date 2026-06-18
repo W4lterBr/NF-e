@@ -843,6 +843,21 @@ def extrair_nfe_detalhado(xml_txt, parser, db, chave, informante=None, nsu_docum
             "informante": str(informante or ""),
             "nsu": nsu_final  # 🔒 NSU preservado mesmo em erro
         }
+
+
+def extrair_nfce_detalhado(xml_txt, parser, db, chave, informante=None, nsu_documento=None):
+    """
+    Extrai informações detalhadas de uma NFC-e (modelo 65).
+
+    NFC-e usa exatamente a mesma estrutura XML de NF-e (infNFe/ide/emit/dest/det/total),
+    diferindo apenas no <mod> (65) e no destinatário, que é opcional. Reaproveita
+    extrair_nfe_detalhado() e apenas corrige o campo 'tipo' para 'NFC-e'.
+    """
+    nota = extrair_nfe_detalhado(xml_txt, parser, db, chave, informante, nsu_documento)
+    nota["tipo"] = "NFC-e"
+    return nota
+
+
 # -------------------------------------------------------------------
 # Salvar XML na pasta
 # -------------------------------------------------------------------
@@ -916,6 +931,9 @@ def _registrar_caminho_salvo(chave, cnpj_cpf, caminho, tipo='LOCAL', perfil_nome
         logger.debug(f"📝 Caminho registrado [{tipo}] {chave[:10]}… → {caminho}")
     except Exception as e:
         logger.warning(f"⚠️ Erro ao registrar caminho no banco: {e}")
+        from modules.log_categorias import log_falha
+        categoria = 'database' if 'locked' in str(e).lower() or 'database' in str(e).lower() else 'storage'
+        log_falha(categoria, documento=f"registrar caminho [{tipo}]", chave=chave, cnpj=cnpj_cpf, erro=e, nivel='WARNING')
 
 
 def _indexar_xml_no_banco(xml_path: str, cnpj_cpf: str, tipo_doc: str, caminho_pdf: str = None):
@@ -1209,8 +1227,17 @@ def _salvar_xml_single_profile(xml, cnpj_cpf, pasta_base="xmls", nome_certificad
         
         # Determina a pasta e tipo baseado no documento
         if root_tag in ['nfeProc', 'NFe']:
-            tipo_pasta = "NFe"
-            tipo_doc = "NFe"
+            # NFC-e usa o mesmo root tag de NF-e (nfeProc/NFe) — só o <mod> diferencia.
+            # mod=65 é NFC-e (Consumidor), mod=55 é NF-e — precisa checar antes de
+            # classificar como NF-e genérica, senão NFC-e fica misturada na pasta errada.
+            ns_nfe = '{http://www.portalfiscal.inf.br/nfe}'
+            mod_doc = root.findtext(f'.//{ns_nfe}mod') or root.findtext('.//mod') or ''
+            if mod_doc == '65':
+                tipo_pasta = "NFCe"
+                tipo_doc = "NFCe"
+            else:
+                tipo_pasta = "NFe"
+                tipo_doc = "NFe"
         elif root_tag in ['cteProc', 'CTe']:
             tipo_pasta = "CTe"
             tipo_doc = "CTe"
@@ -1230,8 +1257,8 @@ def _salvar_xml_single_profile(xml, cnpj_cpf, pasta_base="xmls", nome_certificad
         
         # 🚫 FILTRO CRÍTICO: Perfis de armazenamento APENAS para documentos fiscais completos
         # Eventos, Resumos, Ciências e Outros NÃO devem ser salvos nos perfis
-        # Apenas NF-e, CT-e e NFS-e completas devem ir para os perfis de armazenamento
-        if pasta_base != "xmls" and tipo_doc not in ["NFe", "CTe", "NFS-e"]:
+        # Apenas NF-e, CT-e, NFS-e e NFC-e completas devem ir para os perfis de armazenamento
+        if pasta_base != "xmls" and tipo_doc not in ["NFe", "CTe", "NFS-e", "NFCe"]:
             logger.debug(f"🚫 [IGNORADO] {tipo_doc} não será salvo no perfil de armazenamento (apenas backup local)")
             return None
         
@@ -1239,9 +1266,9 @@ def _salvar_xml_single_profile(xml, cnpj_cpf, pasta_base="xmls", nome_certificad
         # Chave é extraída aqui para ser usada como nome do arquivo
         chave = None
         try:
-            if tipo_doc in ["NFe", "CTe"]:
-                ns = '{http://www.portalfiscal.inf.br/nfe}' if tipo_doc == "NFe" else '{http://www.portalfiscal.inf.br/cte}'
-                infNFe = root.find(f'.//{ns}infNFe') if tipo_doc == "NFe" else root.find(f'.//{ns}infCte')
+            if tipo_doc in ["NFe", "CTe", "NFCe"]:
+                ns = '{http://www.portalfiscal.inf.br/cte}' if tipo_doc == "CTe" else '{http://www.portalfiscal.inf.br/nfe}'
+                infNFe = root.find(f'.//{ns}infCte') if tipo_doc == "CTe" else root.find(f'.//{ns}infNFe')
                 if infNFe is not None:
                     chave_id = infNFe.attrib.get('Id', '')
                     if chave_id:
@@ -1279,14 +1306,14 @@ def _salvar_xml_single_profile(xml, cnpj_cpf, pasta_base="xmls", nome_certificad
         xNome = None
         data_raw = None
         
-        # Para NFe/CTe completas
-        if tipo_doc in ["NFe", "CTe"]:
-            ns = '{http://www.portalfiscal.inf.br/nfe}' if tipo_doc == "NFe" else '{http://www.portalfiscal.inf.br/cte}'
+        # Para NFe/CTe/NFCe completas
+        if tipo_doc in ["NFe", "CTe", "NFCe"]:
+            ns = '{http://www.portalfiscal.inf.br/cte}' if tipo_doc == "CTe" else '{http://www.portalfiscal.inf.br/nfe}'
             ide = root.find(f'.//{ns}ide')
             emit = root.find(f'.//{ns}emit')
-            
+
             if ide is not None:
-                nNF = ide.findtext(f'{ns}nNF' if tipo_doc == "NFe" else f'{ns}nCT')
+                nNF = ide.findtext(f'{ns}nNF' if tipo_doc != "CTe" else f'{ns}nCT')
                 dEmi = ide.findtext(f'{ns}dEmi')
                 dhEmi = ide.findtext(f'{ns}dhEmi')
                 data_raw = dEmi or dhEmi
@@ -1465,11 +1492,11 @@ def _salvar_xml_single_profile(xml, cnpj_cpf, pasta_base="xmls", nome_certificad
         # Entradas = documento recebido de terceiros (emitente ≠ certificado)
         # Saidas  = documento emitido pela própria empresa (emitente == certificado)
         fluxo = 'Entradas'  # padrão conservador
-        if tipo_doc in ('NFe', 'CTe'):
+        if tipo_doc in ('NFe', 'CTe', 'NFCe'):
             try:
-                _ns_emit = ('{http://www.portalfiscal.inf.br/nfe}'
-                            if tipo_doc == 'NFe'
-                            else '{http://www.portalfiscal.inf.br/cte}')
+                _ns_emit = ('{http://www.portalfiscal.inf.br/cte}'
+                            if tipo_doc == 'CTe'
+                            else '{http://www.portalfiscal.inf.br/nfe}')
                 _emit_cnpj = root.findtext(f'.//{_ns_emit}emit/{_ns_emit}CNPJ') or ''
                 _cert_clean = re.sub(r'\D', '', cnpj_cpf or '')
                 _emit_clean = re.sub(r'\D', '', _emit_cnpj)
@@ -1558,8 +1585,8 @@ def _salvar_xml_single_profile(xml, cnpj_cpf, pasta_base="xmls", nome_certificad
         
         # ⚠️ REGISTRO NO BANCO (xmls_baixados) - feito acima via _registrar_caminho_salvo
 
-        # Gerar PDF automaticamente (apenas para NFe/CTe completas)
-        if tipo_doc in ["NFe", "CTe"]:
+        # Gerar PDF automaticamente (NFe/CTe/NFCe completas)
+        if tipo_doc in ["NFe", "CTe", "NFCe"]:
             try:
                 caminho_pdf = caminho_xml.replace('.xml', '.pdf')
                 if not os.path.exists(caminho_pdf):
@@ -1595,6 +1622,8 @@ def _salvar_xml_single_profile(xml, cnpj_cpf, pasta_base="xmls", nome_certificad
         logger.error(f"[ERRO ao salvar XML de {cnpj_cpf}]: {e}")
         import traceback
         traceback.print_exc()
+        from modules.log_categorias import log_falha
+        log_falha('storage', documento=f"salvar XML em {pasta_base}", cnpj=cnpj_cpf, erro=e)
         return None  # ❌ Erro ao salvar
 # -------------------------------------------------------------------
 # Validação de XML com XSD
@@ -2221,28 +2250,34 @@ class DatabaseManager:
                 pass  # Não bloqueia o save se a checagem falhar
 
             # 🔒 INSERT com campo NSU incluído
-            conn.execute('''
-                INSERT OR REPLACE INTO notas_detalhadas (
-                    chave, ie_tomador, nome_emitente, cnpj_emitente, numero,
-                    data_emissao, tipo, valor, cfop, vencimento, ncm, uf, natureza,
-                    base_icms, valor_icms, v_ibs, v_cbs, status, atualizado_em, cnpj_destinatario,
-                    nome_destinatario, xml_status, informante, nsu
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ''', (
-                nota['chave'], nota['ie_tomador'], nota['nome_emitente'], nota['cnpj_emitente'],
-                nota['numero'], nota['data_emissao'], nota['tipo'], nota['valor'],
-                nota.get('cfop', ''), nota.get('vencimento', ''), nota.get('ncm', ''),
-                nota.get('uf', ''), nota.get('natureza', ''),
-                nota.get('base_icms', ''), nota.get('valor_icms', ''),
-                nota.get('v_ibs', ''), nota.get('v_cbs', ''),
-                nota['status'], nota['atualizado_em'],
-                nota.get('cnpj_destinatario', ''),
-                nota.get('nome_destinatario', ''),
-                xml_status,  # Usa o status validado
-                informante_a_salvar,  # 🔒 Informante protegido contra sobrescrita
-                nsu  # 🔒 NSU OBRIGATÓRIO - campo crítico para rastreamento
-            ))
-            conn.commit()
+            try:
+                conn.execute('''
+                    INSERT OR REPLACE INTO notas_detalhadas (
+                        chave, ie_tomador, nome_emitente, cnpj_emitente, numero,
+                        data_emissao, tipo, valor, cfop, vencimento, ncm, uf, natureza,
+                        base_icms, valor_icms, v_ibs, v_cbs, status, atualizado_em, cnpj_destinatario,
+                        nome_destinatario, xml_status, informante, nsu
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    nota['chave'], nota['ie_tomador'], nota['nome_emitente'], nota['cnpj_emitente'],
+                    nota['numero'], nota['data_emissao'], nota['tipo'], nota['valor'],
+                    nota.get('cfop', ''), nota.get('vencimento', ''), nota.get('ncm', ''),
+                    nota.get('uf', ''), nota.get('natureza', ''),
+                    nota.get('base_icms', ''), nota.get('valor_icms', ''),
+                    nota.get('v_ibs', ''), nota.get('v_cbs', ''),
+                    nota['status'], nota['atualizado_em'],
+                    nota.get('cnpj_destinatario', ''),
+                    nota.get('nome_destinatario', ''),
+                    xml_status,  # Usa o status validado
+                    informante_a_salvar,  # 🔒 Informante protegido contra sobrescrita
+                    nsu  # 🔒 NSU OBRIGATÓRIO - campo crítico para rastreamento
+                ))
+                conn.commit()
+            except Exception as e:
+                from modules.log_categorias import log_falha
+                log_falha('database', documento=f"salvar_nota_detalhada tipo={nota.get('tipo')}",
+                           chave=chave, cnpj=nota.get('cnpj_emitente'), erro=e)
+                raise
             # ⚡ PERFORMANCE: O commit é feito AUTOMATICAMENTE pelo context manager
             # quando o 'with' termina, garantindo transações em lote eficientes.
             # Ao processar milhares de documentos, o SQLite otimiza os commits.
@@ -2276,7 +2311,20 @@ class DatabaseManager:
                                 senha = crypto.decrypt(senha)
                                 logger.debug(f"Senha descriptografada para {informante}")
                             else:
-                                logger.warning(f"⚠️ Senha do certificado {informante} está em texto plano!")
+                                # Texto plano no banco — criptografa e persiste agora
+                                # para eliminar definitivamente o texto plano (em vez de
+                                # apenas avisar e deixar a senha vulnerável indefinidamente).
+                                logger.warning(f"⚠️ Senha do certificado {informante} estava em texto plano — criptografando agora")
+                                senha_criptografada = crypto.encrypt(senha)
+                                try:
+                                    with self._connect() as conn_fix:
+                                        conn_fix.execute(
+                                            "UPDATE certificados SET senha = ? WHERE cnpj_cpf = ?",
+                                            (senha_criptografada, cnpj)
+                                        )
+                                        conn_fix.commit()
+                                except Exception as e_fix:
+                                    logger.error(f"Falha ao re-criptografar senha do certificado {informante}: {e_fix}")
                         except Exception as e:
                             logger.error(f"Erro ao descriptografar senha de {informante}: {e}")
                     
@@ -3127,25 +3175,30 @@ class DatabaseManager:
             cnpj: CNPJ/CPF do informante
             caminho_arquivo: Caminho completo onde o XML foi salvo (opcional mas recomendado)
         """
-        with self._connect() as conn:
-            if caminho_arquivo:
-                # Registra ou atualiza com o caminho do arquivo
-                conn.execute('''
-                    INSERT INTO xmls_baixados (chave, cnpj_cpf, caminho_arquivo, baixado_em)
-                    VALUES (?, ?, ?, datetime('now'))
-                    ON CONFLICT(chave) DO UPDATE SET
-                        caminho_arquivo = excluded.caminho_arquivo,
-                        baixado_em = datetime('now')
-                ''', (chave, cnpj, caminho_arquivo))
-                logger.debug(f"XML registrado: {chave} (CNPJ {cnpj}) → {caminho_arquivo}")
-            else:
-                # Compatibilidade: apenas registra chave e CNPJ
-                conn.execute(
-                    "INSERT OR IGNORE INTO xmls_baixados (chave,cnpj_cpf) VALUES (?,?)",
-                    (chave, cnpj)
-                )
-                logger.debug(f"XML registrado: {chave} (CNPJ {cnpj}) - caminho não informado")
-            conn.commit()
+        try:
+            with self._connect() as conn:
+                if caminho_arquivo:
+                    # Registra ou atualiza com o caminho do arquivo
+                    conn.execute('''
+                        INSERT INTO xmls_baixados (chave, cnpj_cpf, caminho_arquivo, baixado_em)
+                        VALUES (?, ?, ?, datetime('now'))
+                        ON CONFLICT(chave) DO UPDATE SET
+                            caminho_arquivo = excluded.caminho_arquivo,
+                            baixado_em = datetime('now')
+                    ''', (chave, cnpj, caminho_arquivo))
+                    logger.debug(f"XML registrado: {chave} (CNPJ {cnpj}) → {caminho_arquivo}")
+                else:
+                    # Compatibilidade: apenas registra chave e CNPJ
+                    conn.execute(
+                        "INSERT OR IGNORE INTO xmls_baixados (chave,cnpj_cpf) VALUES (?,?)",
+                        (chave, cnpj)
+                    )
+                    logger.debug(f"XML registrado: {chave} (CNPJ {cnpj}) - caminho não informado")
+                conn.commit()
+        except Exception as e:
+            from modules.log_categorias import log_falha
+            log_falha('database', documento="registrar_xml", chave=chave, cnpj=cnpj, erro=e)
+            raise
 
     def atualizar_pdf_path(self, chave: str, pdf_path: str, pdf_tipo: str = None) -> bool:
         """
@@ -3171,6 +3224,8 @@ class DatabaseManager:
                 return True
         except Exception as e:
             logger.error(f"[ERRO] Falha ao atualizar pdf_path para {chave}: {e}")
+            from modules.log_categorias import log_falha
+            log_falha('database', documento="atualizar_pdf_path", chave=chave, erro=e)
             return False
 
     def get_chaves_missing_status(self):
@@ -3583,8 +3638,15 @@ def cte_consultar_por_chave(chave: str, cert_path, senha, informante: str = '',
     try:
         import requests
         import requests_pkcs12 as _rpkcs12
+        from modules.certificate_manager import determinar_verify_para_host
+
+        # 🔒 Verificação do certificado do servidor habilitada por padrão; só
+        # desabilita (e registra em logs/certificado_seguranca.log) para hosts
+        # com cadeia de certificado mal configurada.
+        verificar_servidor = determinar_verify_para_host(url, cert_path, senha)
+
         sess = requests.Session()
-        sess.verify = False
+        sess.verify = verificar_servidor
         sess.mount('https://', _rpkcs12.Pkcs12Adapter(
             pkcs12_filename=cert_path, pkcs12_password=senha
         ))
@@ -3630,31 +3692,41 @@ class NFeService:
         import urllib3
         import requests
         from requests_pkcs12 import Pkcs12Adapter
-        
-        # Desabilita warnings de SSL
-        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-        
+        from modules.certificate_manager import determinar_verify_para_host
+
+        # Desabilita warnings de SSL apenas quando realmente formos operar sem
+        # verificação (host específico com cadeia mal configurada — ver abaixo).
+        # 🔒 Verificação do certificado do SERVIDOR habilitada por padrão (protege
+        # contra MITM). Antes este código desabilitava a verificação para TODAS
+        # as conexões; agora só desabilita para hosts cuja cadeia de certificado
+        # esteja de fato mal configurada, e isso é registrado em
+        # logs/certificado_seguranca.log (nunca silenciosamente).
+        verificar_servidor = determinar_verify_para_host(URL_DISTRIBUICAO, cert_path, senha)
+        if not verificar_servidor:
+            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
         # Configura sessão com certificado PKCS12
         sess = requests.Session()
-        sess.verify = False  # Desabilita verificação SSL
-        
+        sess.verify = verificar_servidor
+
         # 🔧 TIMEOUT CONFIGURÁVEL - Evita esperar 300s (5 minutos!)
         sess.timeout = 60  # 60 segundos é suficiente para WSDL
-        
+
         # Corrige conflito SSL em Python 3.10+
         # Cria adapter personalizado com contexto SSL corrigido
         class CustomPkcs12Adapter(Pkcs12Adapter):
             def init_poolmanager(self, *args, **kwargs):
                 ctx = ssl.create_default_context()
-                ctx.check_hostname = False
-                ctx.verify_mode = ssl.CERT_NONE
+                if not verificar_servidor:
+                    ctx.check_hostname = False
+                    ctx.verify_mode = ssl.CERT_NONE
                 kwargs['ssl_context'] = ctx
                 return super().init_poolmanager(*args, **kwargs)
-        
+
         sess.mount('https://', CustomPkcs12Adapter(
             pkcs12_filename=cert_path, pkcs12_password=senha
         ))
-        
+
         trans = Transport(session=sess)
         
         # 🔥 USA CACHE PARA WSDL - Muito mais rápido e evita timeouts
@@ -4480,6 +4552,8 @@ def processar_cte(db, cert_data):
     except Exception as e:
         logger.error(f"❌ [{inf}] ERRO CRÍTICO ao processar CT-e: {e}")
         logger.exception(f"Erro ao processar CT-e para {inf}: {e}")
+        from modules.log_categorias import log_falha
+        log_falha('cte', documento=f"NSU={locals().get('ult_nsu_cte')}", cnpj=inf, erro=e)
 
 
 def salvar_nfse_detalhada(xml_content, nsu, informante):
@@ -4790,17 +4864,15 @@ def salvar_nfse_detalhada(xml_content, nsu, informante):
         
         try:
             # Caminho correto: IBSCBS > totCIBS > gIBS/gCBS
-            tot_cibs = (
-                tree.find('.//nfse:IBSCBS/nfse:totCIBS', namespaces=ns) or
-                tree.find('.//IBSCBS/totCIBS')
-            )
+            tot_cibs = tree.find('.//nfse:IBSCBS/nfse:totCIBS', namespaces=ns)
+            if tot_cibs is None:
+                tot_cibs = tree.find('.//IBSCBS/totCIBS')
 
             if tot_cibs is not None:
                 # IBS total: <gIBS><vIBSTot>
-                g_ibs = (
-                    tot_cibs.find('nfse:gIBS', namespaces=ns) or
-                    tot_cibs.find('gIBS')
-                )
+                g_ibs = tot_cibs.find('nfse:gIBS', namespaces=ns)
+                if g_ibs is None:
+                    g_ibs = tot_cibs.find('gIBS')
                 if g_ibs is not None:
                     v_ibs = (
                         g_ibs.findtext('nfse:vIBSTot', namespaces=ns) or
@@ -4808,10 +4880,9 @@ def salvar_nfse_detalhada(xml_content, nsu, informante):
                     )
 
                 # CBS total: <gCBS><vCBS>
-                g_cbs = (
-                    tot_cibs.find('nfse:gCBS', namespaces=ns) or
-                    tot_cibs.find('gCBS')
-                )
+                g_cbs = tot_cibs.find('nfse:gCBS', namespaces=ns)
+                if g_cbs is None:
+                    g_cbs = tot_cibs.find('gCBS')
                 if g_cbs is not None:
                     v_cbs = (
                         g_cbs.findtext('nfse:vCBS', namespaces=ns) or
@@ -5033,10 +5104,18 @@ def processar_nfse(cert_data, db):
             logger.info(f"📦 [{inf}] NFS-e: Extraindo documentos...")
             docs_processados = 0
             doc_count = 0
-            
+            maior_nsu_processado = None  # 🔧 fallback de watermark — ver comentário abaixo
+
             for nsu, xml_nfse, tipo_doc in nfse_svc.extrair_documentos(resp_nfse):
                 doc_count += 1
                 logger.info(f"📄 [{inf}] NFS-e: Processando doc {doc_count}, NSU={nsu}, tipo={tipo_doc}")
+
+                try:
+                    nsu_num = int(nsu)
+                    if maior_nsu_processado is None or nsu_num > maior_nsu_processado:
+                        maior_nsu_processado = nsu_num
+                except (TypeError, ValueError):
+                    pass
 
                 # Valida XML
                 if not nfse_svc.validar_xml(xml_nfse):
@@ -5066,10 +5145,20 @@ def processar_nfse(cert_data, db):
                 except Exception as e:
                     logger.error(f"❌ [{inf}] Erro ao processar NFS-e NSU={nsu}: {e}")
                     continue
-            
+
             logger.info(f"📊 [{inf}] NFS-e: {docs_processados} documentos processados nesta iteração")
-            
-            # Atualiza NSU
+
+            # Atualiza NSU.
+            # 🔧 BUG REAL CORRIGIDO: esta API (GET /contribuintes/DFe/{NSU}) frequentemente
+            # devolve ultNSU="000000000000000" no envelope mesmo quando retorna documentos
+            # reais com NSU próprio cada um (ex.: lote com 45 docs, NSU 103..152, e ainda
+            # assim ultNSU=0). O código antigo só confiava no ultNSU do envelope e, quando
+            # vinha zerado, desistia e quebrava o loop SEM NUNCA avançar o NSU — fazendo o
+            # sistema reprocessar o mesmo lote para sempre e nunca alcançar documentos novos
+            # (era exatamente por isso que NFS-e novas paravam de aparecer). Agora, quando o
+            # envelope não traz um ultNSU confiável mas documentos foram de fato processados,
+            # usa o maior NSU individual visto no lote como novo watermark — mesma lógica
+            # (correta) já usada em consultar_nfse_incremental() (modules/nfse_service.py).
             if ult_nfse and ult_nfse != "000000000000000":
                 if ult_nfse != ult_nsu_nfse:
                     logger.info(f"✅ [{inf}] NFS-e: NSU atualizado de {ult_nsu_nfse} → {ult_nfse}")
@@ -5078,8 +5167,18 @@ def processar_nfse(cert_data, db):
                 else:
                     logger.info(f"🛑 [{inf}] NFS-e: NSU não mudou ({ult_nsu_nfse}), finalizando")
                     break
+            elif maior_nsu_processado is not None:
+                novo_nsu = str(maior_nsu_processado).zfill(15)
+                if novo_nsu != ult_nsu_nfse:
+                    logger.info(f"✅ [{inf}] NFS-e: ultNSU ausente/zerado na resposta — usando maior NSU "
+                                f"processado no lote como watermark: {ult_nsu_nfse} → {novo_nsu}")
+                    ult_nsu_nfse = novo_nsu
+                    db.set_last_nsu_nfse(inf, novo_nsu)
+                else:
+                    logger.info(f"🛑 [{inf}] NFS-e: NSU não mudou ({ult_nsu_nfse}), finalizando")
+                    break
             else:
-                logger.warning(f"⚠️ [{inf}] NFS-e: Sem ultNSU na resposta")
+                logger.warning(f"⚠️ [{inf}] NFS-e: Sem ultNSU na resposta e nenhum documento processado")
                 break
         
         if iteration_count >= max_iterations:
@@ -5090,6 +5189,8 @@ def processar_nfse(cert_data, db):
     except Exception as e:
         logger.error(f"❌ [{inf}] ERRO CRÍTICO ao processar NFS-e: {e}")
         logger.exception(f"Erro ao processar NFS-e para {inf}: {e}")
+        from modules.log_categorias import log_falha
+        log_falha('nfse', documento="processar_nfse (Padrão Nacional)", cnpj=inf, erro=e)
 
 
 # ---------------------------------------------------------------------------
@@ -5107,11 +5208,13 @@ def _salvar_nfse_abrasf(xml_nota, informante, numero, db):
     from datetime import datetime as _dt
     import re as _re, sqlite3 as _sq
 
-    ns_ab = {'ab': 'http:/www.abrasf.org.br/nfse.xsd'}
+    ns_ab = {'ab': 'http://www.abrasf.org.br/nfse.xsd'}
 
     def _tx(el, *tags):
         for tag in tags:
-            e = el.find(f'ab:{tag}', ns_ab) or el.find(tag)
+            e = el.find(f'ab:{tag}', ns_ab)
+            if e is None:
+                e = el.find(tag)
             if e is not None and e.text:
                 return e.text.strip()
         return ''
@@ -5126,7 +5229,9 @@ def _salvar_nfse_abrasf(xml_nota, informante, numero, db):
     if isinstance(xml_nota, str):
         xml_nota = xml_nota.encode('utf-8')
     tree = _et.fromstring(xml_nota)
-    inf_el = tree.find('.//ab:InfNfse', ns_ab) or tree.find('.//InfNfse')
+    inf_el = tree.find('.//ab:InfNfse', ns_ab)
+    if inf_el is None:
+        inf_el = tree.find('.//InfNfse')
     if inf_el is None:
         logger.warning(f"[ABRASF] InfNfse não encontrado no XML do número {numero}")
         return False
@@ -5299,12 +5404,16 @@ def processar_nfse_abrasf(cert_data, db):
                         total_novas += 1
                 except Exception as e:
                     logger.error(f"[ABRASF] Erro ao salvar NFS-e {numero}: {e}")
+                    from modules.log_categorias import log_falha
+                    log_falha('nfse', documento=f"ABRASF numero={numero}", cnpj=inf, erro=e)
 
         logger.info(f"[ABRASF] {cnpj}: {total_novas} NFS-e nova(s) salva(s)")
 
     except Exception as e:
         logger.error(f"[ABRASF] ERRO CRÍTICO para {inf}: {e}")
         logger.exception(e)
+        from modules.log_categorias import log_falha
+        log_falha('nfse', documento="processar_nfse_abrasf", cnpj=inf, erro=e)
 
 
 def main():
@@ -5853,10 +5962,25 @@ def run_single_cycle():
         # 1) Distribuição - NFe, CTe E NFSe de TODOS os certificados
         logger.info("📥 Fase 1: Buscando documentos (NFe, CT-e e NFS-e) de todos os certificados...")
         for cnpj, path, senha, inf, cuf in db.get_certificados():
+            # 🔒 Validação do certificado ANTES de qualquer tentativa de conexão:
+            # evita gastar uma rodada inteira de NF-e/CT-e/NFS-e tentando autenticar
+            # com um certificado vencido (erro confuso de TLS) quando o problema real
+            # é simplesmente "está vencido, precisa renovar".
+            from modules.certificate_manager import validar_certificado
+            cert_info = validar_certificado(path, senha)
+            if cert_info["expirado"]:
+                logger.error(f"🔴 [{cnpj}] Certificado VENCIDO ({cert_info['motivo']}) — pulando este certificado neste ciclo (NF-e, CT-e e NFS-e)")
+                continue
+            if not cert_info["valido"]:
+                logger.error(f"🔴 [{cnpj}] Certificado inválido ({cert_info['motivo']}) — pulando este certificado neste ciclo (NF-e, CT-e e NFS-e)")
+                continue
+            if cert_info["motivo"]:  # válido mas perto de vencer
+                logger.warning(f"🟡 [{cnpj}] {cert_info['motivo']}")
+
             # Cria parser específico para este certificado
             parser = XMLProcessor(informante=inf)
             logger.debug(f"Processando certificado: CNPJ={cnpj}, arquivo={path}, informante={inf}, cUF={cuf}")
-            
+
             # 1.1) Busca NFe
             logger.info(f"📄 Iniciando busca de NF-e para {cnpj}")
             
@@ -6192,6 +6316,9 @@ UF: {cuf}
                                                     resumo_docs += f"  Chave: {chave_resumo}\n\n"
                                             except Exception as e:
                                                 logger.error(f"❌ [{cnpj}] Erro na busca automática por chave {chave_resumo}: {e}")
+                                                from modules.log_categorias import log_falha
+                                                _cat = 'database' if ('locked' in str(e).lower() or 'database' in str(e).lower()) else 'nfe'
+                                                log_falha(_cat, documento=f"resNFe NSU={nsu}", chave=chave_resumo, cnpj=cnpj, erro=e)
                                                 logger.exception(e)
                                                 resumo_docs += f"  Tipo: resNFe - erro na busca automática\n"
                                                 resumo_docs += f"  Chave: {chave_resumo}\n\n"
@@ -6205,17 +6332,60 @@ UF: {cuf}
                             
                             # Verifica modelo do documento (55 = NF-e, 65 = NFC-e)
                             ide = infnfe.find('{http://www.portalfiscal.inf.br/nfe}ide')
-                            if ide is not None:
-                                modelo = ide.findtext('{http://www.portalfiscal.inf.br/nfe}mod', '')
-                                if modelo == '65':
-                                    logger.info(f"🛒 [{cnpj}] NFC-e (modelo 65) detectada no NSU={nsu}, pulando (sistema busca apenas NF-e modelo 55)")
-                                    resumo_docs += f"  Tipo: NFC-e (modelo 65) - IGNORADO\n\n"
-                                    continue
-                                elif modelo and modelo != '55':
-                                    logger.warning(f"⚠️ [{cnpj}] Modelo desconhecido '{modelo}' no NSU={nsu}, pulando")
-                                    resumo_docs += f"  Tipo: Modelo {modelo} - IGNORADO\n\n"
-                                    continue
-                            
+                            modelo = ide.findtext('{http://www.portalfiscal.inf.br/nfe}mod', '') if ide is not None else ''
+                            if modelo == '65':
+                                # 🛒 NFC-e (modelo 65): mesma estrutura XML de NF-e, processada
+                                # integralmente (nenhuma NFC-e deve ser ignorada). Reaproveita
+                                # salvar_xml_por_certificado (já detecta mod=65 e separa em
+                                # pasta NFCe própria, gera o DANFE de cupom e indexa em nfce_docs).
+                                chave_nfce = infnfe.attrib.get('Id', '')[-44:]
+                                logger.info(f"🛒 [{cnpj}] NFC-e (modelo 65): Chave extraída = {chave_nfce}")
+                                resumo_docs += f"  Tipo: NFC-e (modelo 65)\n"
+                                resumo_docs += f"  Chave: {chave_nfce}\n"
+
+                                save_debug_soap(inf, f"nfce_NSU{nsu}_chave{chave_nfce[:8]}", xml, prefixo="extraido")
+
+                                nome_cert_nfce = db.get_cert_nome_by_informante(inf)
+
+                                resultado_nfce = salvar_xml_por_certificado(xml, cnpj, pasta_base="xmls", nome_certificado=nome_cert_nfce)
+                                if isinstance(resultado_nfce, tuple):
+                                    caminho_xml_nfce, caminho_pdf_nfce = resultado_nfce
+                                else:
+                                    caminho_xml_nfce, caminho_pdf_nfce = resultado_nfce, None
+
+                                if caminho_xml_nfce:
+                                    db.registrar_xml(chave_nfce, cnpj, caminho_xml_nfce)
+                                else:
+                                    db.registrar_xml(chave_nfce, cnpj)
+                                    logger.warning(f"⚠️ [{cnpj}] NFC-e salva mas caminho não obtido: {chave_nfce}")
+
+                                if caminho_pdf_nfce:
+                                    db.atualizar_pdf_path(chave_nfce, caminho_pdf_nfce)
+
+                                pasta_storage_nfce = db.get_config('storage_pasta_base', 'xmls')
+                                if pasta_storage_nfce and pasta_storage_nfce != 'xmls':
+                                    salvar_xml_por_certificado(xml, cnpj, pasta_base=pasta_storage_nfce, nome_certificado=nome_cert_nfce)
+
+                                nota_nfce = extrair_nfce_detalhado(xml, parser, db, chave_nfce, inf, nsu_documento=nsu)
+                                nota_nfce['informante'] = inf
+                                if not nota_nfce.get('nsu'):
+                                    nota_nfce['nsu'] = nsu
+                                db.salvar_nota_detalhada(nota_nfce)
+
+                                xmls_processados_historico.append({
+                                    'tipo': 'nfce',
+                                    'chave': chave_nfce,
+                                    'numero': nota_nfce.get('numero', 'N/A')
+                                })
+
+                                docs_count += 1
+                                logger.info(f"✅ [{cnpj}] NFC-e: Documento {docs_count} processado (chave={chave_nfce})")
+                                continue
+                            elif modelo and modelo != '55':
+                                logger.warning(f"⚠️ [{cnpj}] Modelo desconhecido '{modelo}' no NSU={nsu}, pulando")
+                                resumo_docs += f"  Tipo: Modelo {modelo} - IGNORADO\n\n"
+                                continue
+
                             chave  = infnfe.attrib.get('Id','')[-44:]
                             logger.info(f"🔑 [{cnpj}] NF-e (modelo 55): Chave extraída = {chave}")
                             
@@ -6279,6 +6449,16 @@ UF: {cuf}
                             logger.info(f"✅ [{cnpj}] NF-e: Documento {docs_count} processado (chave={chave})")
                         except Exception as e:
                             logger.exception(f"❌ [{cnpj}] NF-e: Erro ao processar docZip NSU={nsu}: {e}")
+                            from modules.log_categorias import log_falha
+                            if 'locked' in str(e).lower() or 'database' in str(e).lower():
+                                _categoria_doc = 'database'
+                            elif locals().get('modelo') == '65':
+                                _categoria_doc = 'nfce'
+                            else:
+                                _categoria_doc = 'nfe'
+                            log_falha(_categoria_doc, documento=f"NSU={nsu}",
+                                      chave=locals().get('chave_nfce') or locals().get('chave'),
+                                      cnpj=cnpj, erro=e)
                     
                     # 🔍 DEBUG: Salva resumo completo dos documentos processados
                     resumo_docs += f"\n=== RESUMO FINAL ===\n"

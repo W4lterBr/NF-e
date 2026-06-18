@@ -16,7 +16,12 @@ except ImportError:
         CRYPTO_AVAILABLE = True
     except ImportError:
         CRYPTO_AVAILABLE = False
-        print("⚠️ Módulo de criptografia não disponível")
+        try:
+            print("⚠️ Módulo de criptografia não disponível")
+        except UnicodeEncodeError:
+            # stdout redirecionado (sem console real) pode não suportar o emoji —
+            # já travou a inicialização do app em produção por isso.
+            print("[AVISO] Modulo de criptografia nao disponivel")
 
 
 class DatabaseManager:
@@ -234,8 +239,18 @@ class DatabaseManager:
                         print("[MIGRAÇÃO] ✅ nome_destinatario preenchido para NFS-e ADN existentes")
                 except Exception as _e:
                     print(f"[MIGRAÇÃO] Aviso ao reparar nome_destinatario: {_e}")
+                    try:
+                        from modules.log_categorias import log_falha
+                        log_falha('database', documento="migração nome_destinatario (NFS-e)", erro=_e, nivel='WARNING')
+                    except Exception:
+                        pass
             except Exception as e:
                 print(f"[MIGRAÇÃO] Erro ao adicionar colunas: {e}")
+                try:
+                    from modules.log_categorias import log_falha
+                    log_falha('database', documento="migração adicionar colunas", erro=e, nivel='WARNING')
+                except Exception:
+                    pass
 
             # ------------------------------------------------------------------
             # Tabela nfe_docs — campos completos extraídos do XML NF-e
@@ -1284,6 +1299,8 @@ class DatabaseManager:
             return True
         except Exception as e:
             print(f"[DB] Erro upsert_nfe_doc: {e}")
+            from modules.log_categorias import log_falha
+            log_falha('database', documento="upsert_nfe_doc", chave=data.get('chave'), cnpj=data.get('emit_cnpj'), erro=e)
             return False
 
     def upsert_cte_doc(self, data: Dict[str, Any]) -> bool:
@@ -1321,6 +1338,8 @@ class DatabaseManager:
             return True
         except Exception as e:
             print(f"[DB] Erro upsert_cte_doc: {e}")
+            from modules.log_categorias import log_falha
+            log_falha('database', documento="upsert_cte_doc", chave=data.get('chave'), cnpj=data.get('emit_cnpj'), erro=e)
             return False
 
     def upsert_nfse_doc(self, data: Dict[str, Any]) -> bool:
@@ -1353,6 +1372,8 @@ class DatabaseManager:
             return True
         except Exception as e:
             print(f"[DB] Erro upsert_nfse_doc: {e}")
+            from modules.log_categorias import log_falha
+            log_falha('database', documento="upsert_nfse_doc", chave=data.get('chave'), cnpj=data.get('prest_cnpj'), erro=e)
             return False
 
     def upsert_nfce_doc(self, data: Dict[str, Any]) -> bool:
@@ -1386,6 +1407,8 @@ class DatabaseManager:
             return True
         except Exception as e:
             print(f"[DB] Erro upsert_nfce_doc: {e}")
+            from modules.log_categorias import log_falha
+            log_falha('database', documento="upsert_nfce_doc", chave=data.get('chave'), cnpj=data.get('emit_cnpj'), erro=e)
             return False
 
     def atualizar_caminho_pdf_doc(self, chave: str, caminho_pdf: str, tipo_doc: str) -> bool:

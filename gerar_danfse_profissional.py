@@ -324,6 +324,10 @@ _DANFSE_HTML_TEMPLATE = """<!DOCTYPE html>
   <div class="footer-text">
     <div class="chave-label">CHAVE DE ACESSO ({{ chave | length }} dígitos)</div>
     <div class="chave-value">{{ chave }}</div>
+    {% if cod_verificacao %}
+    <div class="chave-label" style="margin-top:1.5mm">CÓDIGO DE VERIFICAÇÃO</div>
+    <div class="chave-value">{{ cod_verificacao }}</div>
+    {% endif %}
     <div class="footer-note">
       Para verificar a autenticidade desta NFS-e acesse:
       <strong>https://adn.nfse.gov.br</strong>
@@ -380,7 +384,7 @@ def _fmt_cnpj(value):
 
 def _extrair_dados_abrasf(tree):
     """Extrai campos DANFSe de XML no formato ABRASF (DominioWeb / municipal)."""
-    ns_ab = {'ab': 'http:/www.abrasf.org.br/nfse.xsd'}
+    ns_ab = {'ab': 'http://www.abrasf.org.br/nfse.xsd'}
 
     def tab(parent, *tags):
         """Busca texto em parent com ns ABRASF e, em seguida, sem namespace."""
@@ -407,6 +411,7 @@ def _extrair_dados_abrasf(tree):
 
     numero = tab(inf, 'Numero') or 'N/A'
     chave_id = inf.get('Id', '') if inf is not None else ''
+    cod_verificacao = tab(inf, 'CodigoVerificacao')
 
     dh_raw = tab(inf, 'DataEmissao')
     dh_emissao = dh_raw
@@ -442,6 +447,7 @@ def _extrair_dados_abrasf(tree):
     _et = elab(toma, 'Endereco'); end_toma = _et if _et is not None else etree.Element('_')
 
     toma_cnpj = tab(cpfcnpj, 'Cnpj') or tab(cpfcnpj, 'Cpf')
+    toma_im   = tab(id_toma, 'InscricaoMunicipal')
     toma_nome = tab(toma, 'RazaoSocial', 'NomeFantasia')
     toma_lgr  = tab(end_toma, 'Endereco', 'Logradouro')
     toma_nro  = tab(end_toma, 'Numero')
@@ -471,13 +477,13 @@ def _extrair_dados_abrasf(tree):
         dh_emissao=dh_emissao, competencia=competencia,
         prest_cnpj=prest_cnpj, prest_nome=prest_nome, prest_im=prest_im,
         prest_end=prest_end, prest_mun=prest_mun, prest_uf=prest_uf, prest_cep=prest_cep,
-        toma_cnpj=toma_cnpj, toma_nome=toma_nome, toma_im='',
+        toma_cnpj=toma_cnpj, toma_nome=toma_nome, toma_im=toma_im,
         toma_end=toma_end, toma_mun=toma_mun, toma_uf=toma_uf,
         cod_serv=cod_serv, item_lista='', desc_serv=desc_serv,
         v_serv=v_serv, v_bc=v_bc, p_aliq=p_aliq,
         v_issqn=v_issqn, v_desc=v_desc, v_ret=v_ret,
         iss_retido=iss_retido, v_liq=v_liq,
-        qr_base64='',
+        qr_base64='', cod_verificacao=cod_verificacao,
     )
 
 
@@ -515,7 +521,7 @@ def _extrair_dados_xml(xml_content):
     is_abrasf = 'abrasf.org.br' in raw_tag or tree.find('.//InfNfse') is not None
     if not is_abrasf:
         # Tenta namespace ABRASF explícito
-        ns_ab = {'ab': 'http:/www.abrasf.org.br/nfse.xsd'}
+        ns_ab = {'ab': 'http://www.abrasf.org.br/nfse.xsd'}
         is_abrasf = tree.find('.//ab:InfNfse', ns_ab) is not None
 
     if is_abrasf:
@@ -531,7 +537,9 @@ def _extrair_dados_xml(xml_content):
     inf_nfse = tree.find('.//n:infNFSe', namespaces=ns)
     if inf_nfse is None:
         inf_nfse = tree.find('.//infNFSe')
-    chave = inf_nfse.get('Id', '')[3:] if inf_nfse is not None else ''
+    chave = inf_nfse.get('Id', '') if inf_nfse is not None else ''
+    if chave.startswith('NFS'):
+        chave = chave[3:]
 
     # --- Datas ---
     dh_raw = t('.//n:DPS/n:infDPS/n:dhEmi', './/n:DPS/n:infDPS/n:dCompet')
@@ -612,6 +620,7 @@ def _extrair_dados_xml(xml_content):
         v_issqn=v_issqn, v_desc=v_desc, v_ret=v_ret,
         iss_retido=iss_retido, v_liq=v_liq,
         qr_base64='',  # preenchido depois se possível
+        cod_verificacao='',  # padrão ADN não usa código de verificação separado (chave + QR)
     )
 
 
@@ -682,6 +691,7 @@ def _gerar_com_reportlab(dados, pdf_path):
     toma_nome  = dados['toma_nome']
     toma_cnpj  = dados['toma_cnpj']
     toma_end   = dados['toma_end']
+    cod_verificacao = dados.get('cod_verificacao', '')
     desc_serv  = dados['desc_serv']
     v_serv     = dados['v_serv']
     v_bc       = dados['v_bc']
@@ -798,6 +808,9 @@ def _gerar_com_reportlab(dados, pdf_path):
     if chave:
         c.setFont("Helvetica", 6)
         c.drawCentredString(width / 2, ry - 4 * mm, f"Chave: {chave}")
+    if cod_verificacao:
+        c.setFont("Helvetica", 6)
+        c.drawCentredString(width / 2, ry - 8 * mm, f"Código de Verificação: {cod_verificacao}")
 
     c.save()
     return True
@@ -864,6 +877,12 @@ def gerar_danfse_profissional(xml_content, pdf_path):
     except Exception as exc:
         import traceback
         _debug_prof(f"❌ reportlab também falhou: {exc}\n{traceback.format_exc()}")
+        try:
+            from modules.log_categorias import log_falha
+            log_falha('pdf', documento=f"DANFSe numero={dados.get('numero')}",
+                       chave=dados.get('chave'), cnpj=dados.get('prest_cnpj'), erro=exc)
+        except Exception:
+            pass
         return False
 
 

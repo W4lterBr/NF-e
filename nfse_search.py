@@ -715,9 +715,15 @@ class NFSeService:
                 url_recepcao = f"{url_base}/DFe"
             
             logger.info(f"📤 POST {url_recepcao}")
-            
+
             import requests_pkcs12
-            
+            from modules.certificate_manager import determinar_verify_para_host
+
+            # 🔒 Verificação do certificado do servidor habilitada por padrão; só
+            # desabilita (com log em logs/certificado_seguranca.log) para hosts
+            # com cadeia de certificado mal configurada.
+            verificar_servidor = determinar_verify_para_host(url_recepcao, self.certificado_path, self.senha)
+
             response = requests_pkcs12.post(
                 url_recepcao,
                 json=payload,
@@ -727,7 +733,7 @@ class NFSeService:
                 },
                 pkcs12_filename=self.certificado_path,
                 pkcs12_password=self.senha,
-                verify=False,
+                verify=verificar_servidor,
                 timeout=30
             )
             
@@ -974,7 +980,13 @@ class NFSeService:
                 try:
                     # Requisição com certificado
                     import requests_pkcs12
-                    
+                    from modules.certificate_manager import determinar_verify_para_host
+
+                    # 🔒 Verificação do certificado do servidor habilitada por padrão; só
+                    # desabilita (com log em logs/certificado_seguranca.log) para hosts
+                    # municipais com cadeia de certificado mal configurada.
+                    verificar_servidor = determinar_verify_para_host(url, self.certificado_path, self.senha)
+
                     response = requests_pkcs12.post(
                         url,
                         data=xml_consulta.encode('utf-8'),
@@ -984,7 +996,7 @@ class NFSeService:
                         },
                         pkcs12_filename=self.certificado_path,
                         pkcs12_password=self.senha,
-                        verify=False,
+                        verify=verificar_servidor,
                         timeout=15
                     )
                     

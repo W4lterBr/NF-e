@@ -2,6 +2,24 @@
 
 import os
 import sys
+
+# 🔧 Garante stdout/stderr em UTF-8 ANTES de qualquer outro import/print.
+# Sem isso, quando o app roda sem console real (stdout redirecionado para
+# arquivo/pipe — comum em produção: tarefa agendada, lançador, .exe sem
+# console), o Windows usa cp1252 por padrão, que não representa emojis usados
+# em prints (✅⚠️❌ etc.) em todo o código — e o app INTEIRO crasha na
+# inicialização com UnicodeEncodeError antes mesmo de abrir a janela.
+# sys.stdout/stderr podem ser None em build .exe sem console (--noconsole).
+if sys.platform == "win32":
+    import io as _io_utf8_guard
+    try:
+        if sys.stdout is not None and hasattr(sys.stdout, "buffer"):
+            sys.stdout = _io_utf8_guard.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+        if sys.stderr is not None and hasattr(sys.stderr, "buffer"):
+            sys.stderr = _io_utf8_guard.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
+    except Exception:
+        pass  # nunca deixa a tentativa de corrigir encoding impedir o app de iniciar
+
 import json
 import subprocess
 import logging
@@ -258,11 +276,20 @@ def resolve_xml_text(item: Dict[str, Any]) -> Optional[str]:
         
         import sqlite3
         import time
-        
+
+        # 🆕 CORREÇÃO NFS-e: Detecta tipo de documento ANTES do gate de status.
+        # NFS-e nunca é criada com xml_status='RESUMO' pelo sistema (sempre COMPLETO,
+        # pois a API de NFS-e só retorna documentos completos) — um RESUMO eventual
+        # é sempre dado importado/legado/stale. Para NF-e/CT-e, RESUMO é um estado
+        # real e válido (significa "ainda não baixamos o XML completo"), então o
+        # curto-circuito abaixo continua valendo para eles.
+        tipo = str(item.get('tipo', '')).upper()
+        is_nfse = 'NFS' in tipo
+
         with sqlite3.connect(str(DB_PATH)) as conn:
             # VERIFICAÇÃO RÁPIDA: Se a nota é RESUMO, não tem XML completo
             xml_status_row = conn.execute("SELECT xml_status FROM notas_detalhadas WHERE chave = ?", (chave,)).fetchone()
-            if xml_status_row and xml_status_row[0] == 'RESUMO':
+            if xml_status_row and xml_status_row[0] == 'RESUMO' and not is_nfse:
                 print(f"[DEBUG XML] ⚠️ Nota marcada como RESUMO - sem XML completo disponível")
                 return None
             if xml_status_row and xml_status_row[0] == 'INDISPONIVEL':
@@ -296,11 +323,7 @@ def resolve_xml_text(item: Dict[str, Any]) -> Optional[str]:
                     print(f"[DEBUG XML] ⚠️ Erro ao ler via xmls_caminhos: {e}")
         
         print(f"[DEBUG XML] Buscando XML nas pastas locais para chave: {chave}")
-        
-        # 🆕 CORREÇÃO NFS-e: Detecta tipo de documento para busca correta
-        tipo = str(item.get('tipo', '')).upper()
-        is_nfse = 'NFS' in tipo
-        
+
         # Para NFS-e, busca pelo NÚMERO ao invés da CHAVE
         if is_nfse:
             numero = item.get('nNF') or item.get('numero')  # Campo pode variar
@@ -464,6 +487,125 @@ class SearchDialog(QDialog):
 
     def set_percent(self, p: int):
         self.progress.setValue(max(0, min(100, p)))
+
+
+class _DiagnosticoWorker(QThread):
+    """Roda executar_diagnostico() em thread separada (faz chamadas de rede e
+    de banco — não pode travar a UI)."""
+    progresso = pyqtSignal(int, int, str)
+    concluido = pyqtSignal(list)
+    erro = pyqtSignal(str)
+
+    def run(self):
+        try:
+            from modules.diagnostico_sistema import executar_diagnostico
+            resultados = executar_diagnostico(
+                progresso=lambda i, t, nome: self.progresso.emit(i, t, nome)
+            )
+            self.concluido.emit(resultados)
+        except Exception as e:
+            import traceback
+            self.erro.emit(f"{e}\n{traceback.format_exc()}")
+
+
+class DiagnosticoSistemaDialog(QDialog):
+    """Tela de Diagnóstico do Sistema (Problema crítico 8): roda um conjunto de
+    checagens de saúde (banco, certificados, storage, XML/PDF, conectividade
+    com SEFAZ/ADN/municípios) e exibe o resultado com semáforo 🟢/🟡/🔴."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("🩺 Diagnóstico do Sistema")
+        self.resize(800, 520)
+        self._worker: Optional[_DiagnosticoWorker] = None
+
+        layout = QVBoxLayout(self)
+
+        self.status_label = QLabel("Clique em \"Executar Diagnóstico\" para verificar a saúde do sistema.")
+        self.status_label.setStyleSheet("font-size: 13pt; font-weight: bold; padding: 6px;")
+        layout.addWidget(self.status_label)
+
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 1)
+        self.progress.setValue(0)
+        layout.addWidget(self.progress)
+
+        self.table = QTableWidget()
+        self.table.setColumnCount(3)
+        self.table.setHorizontalHeaderLabels(["Status", "Verificação", "Detalhe"])
+        self.table.horizontalHeader().setStretchLastSection(True)
+        self.table.setColumnWidth(0, 60)
+        self.table.setColumnWidth(1, 220)
+        self.table.setEditTriggers(QTableWidget.NoEditTriggers)
+        layout.addWidget(self.table)
+
+        btn_row = QHBoxLayout()
+        self.btn_executar = QPushButton("🔄 Executar Diagnóstico")
+        self.btn_executar.clicked.connect(self.executar)
+        btn_row.addWidget(self.btn_executar)
+        btn_row.addStretch()
+        btn_fechar = QPushButton("Fechar")
+        btn_fechar.clicked.connect(self.close)
+        btn_row.addWidget(btn_fechar)
+        layout.addLayout(btn_row)
+
+        # Executa automaticamente ao abrir
+        self.executar()
+
+    def executar(self):
+        if self._worker is not None and self._worker.isRunning():
+            return
+        self.btn_executar.setEnabled(False)
+        self.status_label.setText("⏳ Executando diagnóstico...")
+        self.status_label.setStyleSheet("font-size: 13pt; font-weight: bold; padding: 6px; color: #555;")
+        self.table.setRowCount(0)
+        self.progress.setRange(0, 9)
+        self.progress.setValue(0)
+
+        self._worker = _DiagnosticoWorker()
+        self._worker.progresso.connect(self._on_progresso)
+        self._worker.concluido.connect(self._on_concluido)
+        self._worker.erro.connect(self._on_erro)
+        self._worker.start()
+
+    def _on_progresso(self, indice: int, total: int, nome: str):
+        self.progress.setRange(0, total)
+        self.progress.setValue(indice)
+        self.status_label.setText(f"⏳ [{indice}/{total}] Verificando: {nome}...")
+
+    def _on_concluido(self, resultados: list):
+        from modules.diagnostico_sistema import status_geral, ICONE
+        self.table.setRowCount(len(resultados))
+        cores = {"OK": QColor("#1a7a1a"), "ATENCAO": QColor("#9a7600"), "ERRO": QColor("#b00020")}
+
+        for row, r in enumerate(resultados):
+            item_icone = QTableWidgetItem(r["icone"])
+            item_icone.setTextAlignment(Qt.AlignCenter)
+            item_nome = QTableWidgetItem(r["nome"])
+            item_detalhe = QTableWidgetItem(r["detalhe"])
+            cor = cores.get(r["status"])
+            if cor:
+                for item in (item_icone, item_nome, item_detalhe):
+                    item.setForeground(QBrush(cor))
+            self.table.setItem(row, 0, item_icone)
+            self.table.setItem(row, 1, item_nome)
+            self.table.setItem(row, 2, item_detalhe)
+
+        self.table.resizeRowsToContents()
+
+        geral = status_geral(resultados)
+        textos = {"OK": "✅ Sistema operando normalmente", "ATENCAO": "⚠️ Sistema operando com avisos",
+                  "ERRO": "❌ Sistema com problemas que requerem atenção"}
+        cores_label = {"OK": "#1a7a1a", "ATENCAO": "#9a7600", "ERRO": "#b00020"}
+        self.status_label.setText(f"{ICONE[geral]} {textos[geral]}")
+        self.status_label.setStyleSheet(f"font-size: 13pt; font-weight: bold; padding: 6px; color: {cores_label[geral]};")
+        self.btn_executar.setEnabled(True)
+
+    def _on_erro(self, mensagem: str):
+        self.status_label.setText("❌ Erro ao executar diagnóstico")
+        self.status_label.setStyleSheet("font-size: 13pt; font-weight: bold; padding: 6px; color: #b00020;")
+        QMessageBox.critical(self, "Erro no Diagnóstico", f"Falha ao executar o diagnóstico:\n\n{mensagem}")
+        self.btn_executar.setEnabled(True)
 
 
 class BrasilNFeConfigDialog(QDialog):
@@ -758,7 +900,7 @@ class MainWindow(QMainWindow):
         
         self.status_dd = QComboBox(); self.status_dd.addItems(["Todos","Autorizado","Cancelado","Denegado"])
         self.status_dd.currentTextChanged.connect(self._on_filter_changed)
-        self.tipo_dd = QComboBox(); self.tipo_dd.addItems(["Todos","NFe","CTe","NFS-e"])
+        self.tipo_dd = QComboBox(); self.tipo_dd.addItems(["Todos","NFe","CTe","NFS-e","NFC-e"])
         self.tipo_dd.currentTextChanged.connect(self._on_filter_changed)
         
         # Seletor de quantidade de linhas exibidas
@@ -1137,7 +1279,9 @@ class MainWindow(QMainWindow):
         # isRunning() tem race condition — pode retornar False logo após start()
         if self._pdf_gerador_ativo:
             return
-        
+
+        _db_ref = self.db  # captura para uso no closure do worker (registro de pdf_path)
+
         class PDFGeneratorWorker(QThread):
             finished_signal = pyqtSignal(int)
             
@@ -1175,25 +1319,65 @@ class MainWindow(QMainWindow):
                             
                             try:
                                 xml_text = xml_file.read_text(encoding='utf-8')
-                                
+
                                 # ⛔ APENAS DOCUMENTOS COMPLETOS: Pula eventos, resumos, etc
-                                # Só gera PDF se for nfeProc ou cteProc (documentos completos)
-                                if '<nfeProc' not in xml_text and '<cteProc' not in xml_text:
+                                # NF-e/CT-e completas usam nfeProc/cteProc. NFS-e usa estrutura
+                                # própria (SPED/ADN ou ABRASF) e NUNCA tem essas tags — por isso
+                                # NFS-e ficava 100% fora desta rede de segurança antes desta correção.
+                                is_nfe_cte_completo = '<nfeProc' in xml_text or '<cteProc' in xml_text
+                                is_nfse_completo = (
+                                    'sped.fazenda.gov.br/nfse' in xml_text or
+                                    'abrasf.org.br' in xml_text or
+                                    'ListaNotaFiscal' in xml_text
+                                )
+                                if not is_nfe_cte_completo and not is_nfse_completo:
                                     continue
-                                
+
                                 # Verifica mais uma vez antes de gerar PDF (operação lenta)
                                 if self.isInterruptionRequested():
                                     print("[INFO] Geração de PDFs interrompida")
                                     break
-                                
-                                # Detecta tipo do documento
-                                tipo = "CTe" if "<CTe" in xml_text or "<cte" in xml_text else "NFe"
-                                
+
+                                # Detecta tipo do documento (NFe/CTe/NFS-e/NFC-e)
+                                if '<cteProc' in xml_text:
+                                    tipo = "CTe"
+                                elif is_nfse_completo:
+                                    tipo = "NFS-e"
+                                elif '<mod>65</mod>' in xml_text:
+                                    tipo = "NFCe"
+                                else:
+                                    tipo = "NFe"
+
                                 from modules.pdf_simple import generate_danfe_pdf
-                                success = generate_danfe_pdf(xml_text, str(pdf_file), tipo)
+                                result_pdf = generate_danfe_pdf(xml_text, str(pdf_file), tipo, xml_source_path=str(xml_file))
+                                success = result_pdf.get("ok") if isinstance(result_pdf, dict) else bool(result_pdf)
                                 if success:
                                     count += 1
                                     print(f"[PDF GERADO] {pdf_file.name}")
+
+                                    # 📝 Registra pdf_path/pdf_tipo no banco — sem isso, o PDF
+                                    # gerado aqui não é encontrado pelo cache (notas_detalhadas)
+                                    try:
+                                        from modules.xml_indexer import parse_nfe, parse_cte, parse_nfse, parse_nfse_abrasf, parse_nfce
+                                        chave_doc = None
+                                        if tipo == "CTe":
+                                            chave_doc = parse_cte(str(xml_file)).get("chave")
+                                        elif tipo == "NFS-e":
+                                            if 'abrasf.org.br' in xml_text or 'ListaNotaFiscal' in xml_text:
+                                                _r = parse_nfse_abrasf(str(xml_file))
+                                                chave_doc = _r[0].get("chave") if _r else None
+                                            else:
+                                                chave_doc = parse_nfse(str(xml_file)).get("chave")
+                                        elif tipo == "NFCe":
+                                            chave_doc = parse_nfce(str(xml_file)).get("chave")
+                                        else:
+                                            chave_doc = parse_nfe(str(xml_file)).get("chave")
+
+                                        if chave_doc:
+                                            pdf_tipo_doc = result_pdf.get("pdf_tipo") if isinstance(result_pdf, dict) else None
+                                            _db_ref.atualizar_pdf_path(chave_doc, str(pdf_file.resolve()), pdf_tipo_doc)
+                                    except Exception as e_reg:
+                                        print(f"[AVISO] Erro ao registrar pdf_path no banco para {pdf_file.name}: {e_reg}")
                             except Exception as e:
                                 print(f"[ERRO PDF] {xml_file.name}: {e}")
                     
@@ -2363,6 +2547,8 @@ class MainWindow(QMainWindow):
         tarefas.addSeparator()
         add_action(tarefas, "Abrir XMLs", self.open_xmls_folder, "Ctrl+Shift+X", qstyle_icon=QStyle.SP_DirIcon)
         add_action(tarefas, "Abrir logs", self.open_logs_folder, "Ctrl+L", qstyle_icon=QStyle.SP_FileDialogInfoView)
+        tarefas.addSeparator()
+        add_action(tarefas, "🩺 Diagnóstico do Sistema", self.abrir_diagnostico_sistema, "Ctrl+Shift+D", qstyle_icon=QStyle.SP_MessageBoxInformation)
 
         # Alternativa: alternar 'PDF simples' (guarda em QSettings). Útil para modo seguro.
         try:
@@ -2641,15 +2827,33 @@ class MainWindow(QMainWindow):
                     break
                 
                 try:
-                    # Descriptografa a senha se necessário
+                    # Descriptografa a senha se necessário.
+                    # IMPORTANTE: crypto.decrypt() do PortableCryptoManager NUNCA levanta
+                    # exceção (engole o erro internamente e retorna o valor original) —
+                    # por isso um try/except em volta do decrypt() não detecta texto plano.
+                    # Usa is_encrypted() explicitamente, mesmo padrão de
+                    # modules/database.py:load_certificates, e corrige na hora.
                     senha = senha_encriptada
                     if CRYPTO_AVAILABLE and senha_encriptada:
-                        try:
+                        if crypto.is_encrypted(senha_encriptada):
                             senha = crypto.decrypt(senha_encriptada)
-                        except Exception as e:
-                            # Se falhar ao descriptografar, assume que é texto plano
-                            print(f"⚠️ Usando senha em texto plano (não descriptografada): {e}")
+                        else:
+                            # Senha em texto plano no banco — criptografa e persiste
+                            # imediatamente para eliminar o texto plano de forma definitiva.
+                            logger.warning(
+                                f"Senha do certificado {cnpj_cert} estava em texto plano no banco — criptografando agora"
+                            )
                             senha = senha_encriptada
+                            try:
+                                senha_criptografada = crypto.encrypt(senha)
+                                with sqlite3.connect(str(DB_PATH)) as conn_fix:
+                                    conn_fix.execute(
+                                        "UPDATE certificados SET senha = ? WHERE cnpj_cpf = ?",
+                                        (senha_criptografada, cnpj_cert)
+                                    )
+                                    conn_fix.commit()
+                            except Exception as e_fix:
+                                logger.error(f"Falha ao re-criptografar senha do certificado {cnpj_cert}: {e_fix}")
                     
                     progress.setLabelText(
                         f"Baixando XML {idx + 1}/{total_faltantes}\n"
@@ -3706,7 +3910,9 @@ class MainWindow(QMainWindow):
                     continue
                 if tp == "nfse" and raw not in ("NFSE", "NFS-E"):
                     continue
-            
+                if tp == "nfce" and raw not in ("NFCE", "NFC-E"):
+                    continue
+
             # Filtro de data - permite NULL (RESUMO)
             if date_inicio_filter and date_fim_filter:
                 data_emissao = (it.get("data_emissao") or "")[:10]  # YYYY-MM-DD
@@ -3879,7 +4085,9 @@ class MainWindow(QMainWindow):
                         tipo_patterns = ["CTE", "CT-E"]
                     elif tp == "nfse":
                         tipo_patterns = ["NFSE", "NFS-E"]
-                    
+                    elif tp == "nfce":
+                        tipo_patterns = ["NFCE", "NFC-E"]
+
                     if tipo_patterns:
                         tipo_clauses = " OR ".join(["UPPER(REPLACE(REPLACE(tipo, '_', ''), ' ', '')) = ?" for _ in tipo_patterns])
                         where_clauses.append(f"({tipo_clauses})")
@@ -10060,7 +10268,13 @@ class MainWindow(QMainWindow):
             elif pdf_file_db.exists():
                 should_use_db_cache = True
             else:
-                print(f"[DEBUG PDF] ⚠️ PDF path do banco inválido (arquivo não existe mais)")
+                print(f"[DEBUG PDF] ⚠️ PDF path do banco inválido (arquivo não existe mais) - limpando cache")
+                # 🔧 Limpa o cache inválido no banco: sem isso, a mesma checagem falha
+                # silenciosamente em TODO clique futuro, sem nunca se autocorrigir.
+                try:
+                    self.db.atualizar_pdf_path(chave, None, None)
+                except Exception as e_clear:
+                    print(f"[DEBUG PDF] ⚠️ Erro ao limpar pdf_path inválido: {e_clear}")
         else:
             print(f"[DEBUG PDF] Etapa 0: PDF path não está no banco")
         
@@ -13372,9 +13586,9 @@ class MainWindow(QMainWindow):
                         valor = tree.findtext('.//cte:vPrest/cte:vTPrest', namespaces=NS) or '0'
 
                     # Tenta NFS-e formato ABRASF (DominioWeb / sistemas municipais)
-                    elif tree.find('.//ab:InfNfse', namespaces={'ab': 'http:/www.abrasf.org.br/nfse.xsd'}) is not None \
+                    elif tree.find('.//ab:InfNfse', namespaces={'ab': 'http://www.abrasf.org.br/nfse.xsd'}) is not None \
                             or tree.find('.//InfNfse') is not None:
-                        ns_ab = {'ab': 'http:/www.abrasf.org.br/nfse.xsd'}
+                        ns_ab = {'ab': 'http://www.abrasf.org.br/nfse.xsd'}
                         tipo = 'NFS-e'
 
                         def _abrasf_text(parent, tag):
@@ -15638,6 +15852,12 @@ class MainWindow(QMainWindow):
                 subprocess.Popen(["xdg-open", path])
         except Exception as e:
             QMessageBox.critical(self, "Logs", f"Erro ao abrir pasta de logs: {e}")
+
+    def abrir_diagnostico_sistema(self):
+        """Abre a tela de Diagnóstico do Sistema (banco, certificados, storage,
+        XML/PDF, conectividade SEFAZ/ADN/municípios)."""
+        dlg = DiagnosticoSistemaDialog(self)
+        dlg.exec_()
 
     def check_updates(self):
         """Verifica e aplica atualizações do GitHub com auto-update TRUE."""
